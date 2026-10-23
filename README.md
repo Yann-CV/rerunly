@@ -8,7 +8,20 @@ interface (`agent_dashboard/sources/base.py`), so other agents can be added late
 
 ## What you get
 
-- **The prompt list**, newest first, searchable and filterable by project or tag.
+- **The Prompts page**:
+  - a summary band follows your filters: number of prompts, total cost, cost per prompt, and
+    agent time;
+  - a toolbar that stays visible while scrolling offers search, pill menus for the project and
+    the tag (searchable, grouped by category), a period (today, 7 days, 30 days, all time), and
+    a sort (newest, most expensive, longest, most tokens). Clicking a tag on any prompt filters
+    by it. Active filters appear as removable chips, and they are kept in the URL so a view can
+    be bookmarked or shared;
+  - **List** layout: prompts grouped by day with each day's total. Each row shows the cost with
+    a bar relative to the most expensive prompt shown, plus tokens, time and subagents. The
+    whole row opens the prompt;
+  - **By tag** layout: choose human tags, project, skill, model or other AI tags. Each group
+    shows its run count, total and median cost, trend and sparkline, and only its latest run.
+    "Show N more runs" lists the others, and Expand all / Collapse all act on every group.
 - **Sessions**: every session with its totals, and a page per session showing:
   - the cost from the price table next to the total Claude Code stores in the transcript;
   - tokens, active time, API calls and tool calls;
@@ -56,6 +69,12 @@ interface (`agent_dashboard/sources/base.py`), so other agents can be added late
   - clicking a card (or pressing Enter on it) opens a panel under its row with the tag's
     charts and latest prompts, plus a link to its full page; Escape closes it.
   - your layout, sort and filters are remembered in the browser.
+- **A tag's page**: a header in the tag's color, its keyword rules (human tags) shown as
+  removable chips with an "Add keywords" form, a summary band (runs, total cost, median cost
+  with its trend, median time) and the cost, duration and token charts. Below, its runs with
+  the same toolbar as the Prompts page (search, project, period, sort, List or By tag
+  layout); the band and charts follow the filters, which are kept in the URL. Clicking another
+  tag on a run opens that tag's page.
 - **Keywords on human tags**: when you add a tag on a prompt page, or later from the tag's page,
   you can give keywords. Every prompt containing all (or any) of them gets the tag, past ones
   right away and new ones on import. A live count shows how many prompts would match.
@@ -105,6 +124,13 @@ To compare runs of the same task reliably, give them the same human tag, then ch
 tagged …" on a prompt page. Add the tag by hand on the prompt page, or with an auto-tag rule
 such as `{"pattern": "review .*paper", "tag": "task:paper-review"}`. Choose "Similar prompts
 tagged …" instead when one tag covers several kinds of prompts, such as a project-wide tag.
+
+Switch between the two costs at any time with **Official / Price table** in the top bar.
+- **Official** shows Claude Code's own cost for every prompt telemetry fully covers, and the
+  price-table estimate for the rest.
+- **Price table** always shows the estimate.
+
+Each prompt's cost shows the other figure underneath for comparison.
 
 As a sanity check, Claude Code stores a session-level `cost-state` total. Price-table estimates
 land within a few percent of it. On a test prompt, telemetry and the price table agreed exactly.

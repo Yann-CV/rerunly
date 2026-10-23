@@ -245,10 +245,26 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             )
         ]
 
+    PROMPT_SORTS = {
+        "recent": "p.started_at DESC",
+        "cost": "p.total_cost_usd DESC",
+        "duration": "COALESCE(p.active_ms, p.wall_ms) DESC",
+        "tokens": "p.total_tokens DESC",
+    }
+
     @app.get("/api/prompts")
-    def list_prompts(q: str = "", tag: str = "", project: str = "", limit: int = 100, offset: int = 0):
+    def list_prompts(
+        q: str = "", tag: str = "", project: str = "", since: str = "", sort: str = "recent",
+        limit: int = 100, offset: int = 0,
+    ):
+        """Prompts matching the filters, plus `summary`: totals over all of them (not just this page)."""
+        if sort not in PROMPT_SORTS:
+            raise HTTPException(400, f"sort must be one of {list(PROMPT_SORTS)}")
         c = conn()
         where, args = [], []
+        if since:
+            where.append("p.started_at >= ?")
+            args.append(since)
         if q:
             where.append("p.text LIKE ?")
             args.append(f"%{q}%")
@@ -261,12 +277,16 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         sql = f"SELECT {LIST_COLS} FROM pv p"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        total = c.execute(f"SELECT COUNT(*) FROM ({sql})", args).fetchone()[0]
-        rows = [_row(r) for r in c.execute(sql + " ORDER BY p.started_at DESC LIMIT ? OFFSET ?", [*args, limit, offset])]
+        summary = dict(c.execute(
+            "SELECT COUNT(*) count, SUM(total_cost_usd) cost_usd, SUM(total_tokens) tokens, "
+            f"SUM(COALESCE(active_ms, wall_ms)) duration_ms, MAX(total_cost_usd) max_cost_usd FROM ({sql})",
+            args,
+        ).fetchone())
+        rows = [_row(r) for r in c.execute(f"{sql} ORDER BY {PROMPT_SORTS[sort]} LIMIT ? OFFSET ?", [*args, limit, offset])]
         tags = tags_for(c, [r["id"] for r in rows])
         for r in rows:
             r["tags"] = tags[r["id"]]
-        return {"total": total, "items": rows}
+        return {"total": summary["count"], "summary": summary, "items": rows}
 
     @app.get("/api/prompts/{prompt_id}")
     def get_prompt(prompt_id: str, compare: str = "similar", tag: str = ""):

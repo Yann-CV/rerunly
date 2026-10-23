@@ -128,11 +128,11 @@ function agentName(type, persona) {
   return `<strong>${esc(type)}</strong>${persona ? ` <span class="persona" title="Persona from the start of the subagent's prompt">as ${esc(persona)}</span>` : ""}`;
 }
 
+/** Where the shown cost comes from, with the other figure when there is one to compare. */
 function costNote(r) {
-  if (r.cost_source === "claude-code") {
-    return `from Claude Code · price table ${fmtCost(r.estimated_cost_usd)}`;
-  }
-  return r.official_cost_usd != null ? "price table (telemetry incomplete)" : "price-table estimate";
+  if (r.cost_source === "claude-code") return `official · price table ${fmtCost(r.estimated_cost_usd)}`;
+  if (r.official_cost_usd != null) return `price table · official ${fmtCost(r.official_cost_usd)}`;
+  return r.api_ms != null ? "price table (telemetry incomplete)" : "price table (no telemetry)";
 }
 
 /** Claude Code's own cost (OpenTelemetry), per caller and model. */
@@ -283,39 +283,329 @@ function bindRowClicks() {
 
 // ---- views -----------------------------------------------------------------
 
-const listState = { q: "", tag: "", project: "", offset: 0, limit: 50 };
+// ---- Prompts page ----------------------------------------------------------------
 
-async function viewPrompts() {
-  const [projects, tags] = await Promise.all([api("/api/projects"), api("/api/tags")]);
-  const params = new URLSearchParams({ ...listState });
-  const data = await api(`/api/prompts?${params}`);
-  app.innerHTML = `
-    <h1>Prompts <span class="muted">(${data.total})</span></h1>
-    <div class="filters">
-      <input type="search" id="q" placeholder="Search prompt text…" value="${esc(listState.q)}">
-      <select id="project"><option value="">All projects</option>${projects.map((p) => `<option ${p === listState.project ? "selected" : ""}>${esc(p)}</option>`).join("")}</select>
-      <select id="tag"><option value="">All tags</option>${TAG_CATEGORIES.map(([cat, label]) =>
-        `<optgroup label="${label}">${tags.filter((t) => tagCategory(t) === cat).map((t) => `<option value="${esc(t.tag)}" ${t.tag === listState.tag ? "selected" : ""}>${esc(t.tag)} (${t.prompts})</option>`).join("")}</optgroup>`).join("")}</select>
+const RANGES = {
+  all: ["All time", null],
+  today: ["Today", () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }],
+  "7d": ["7 days", () => new Date(Date.now() - 7 * 864e5)],
+  "30d": ["30 days", () => new Date(Date.now() - 30 * 864e5)],
+};
+const PROMPT_SORTS = { recent: "Newest", cost: "Most expensive", duration: "Longest", tokens: "Most tokens" };
+const GROUP_BY = { human: "Human tags", project: "Project", skill: "Skill", model: "Model", ai: "Other AI" };
+const GROUP_NOUN = { human: "human", project: "project", skill: "skill", model: "model", ai: "other AI" };
+const LIST_PAGE = 100;
+
+function loadPromptPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem("prompts-prefs") || "{}");
+    return { layout: p.layout === "grouped" ? "grouped" : "list", groupBy: GROUP_BY[p.groupBy] ? p.groupBy : "human" };
+  } catch { return { layout: "list", groupBy: "human" }; }
+}
+
+function savePromptPrefs() {
+  try {
+    localStorage.setItem("prompts-prefs", JSON.stringify({ layout: listState.layout, groupBy: listState.groupBy }));
+  } catch { /* storage unavailable: preferences last for this visit */ }
+}
+
+// filters live in the URL (shareable); layout preferences in the browser
+// on a tag page `lockTag` pins the tag filter
+const listState = { q: "", tag: "", project: "", range: "all", sort: "recent", lockTag: "", ...loadPromptPrefs(), items: [], summary: null, tags: [] };
+
+function filtersFromQuery(query) {
+  listState.q = query.get("q") || "";
+  listState.tag = query.get("tag") || "";
+  listState.project = query.get("project") || "";
+  listState.range = RANGES[query.get("range")] ? query.get("range") : "all";
+  listState.sort = PROMPT_SORTS[query.get("sort")] ? query.get("sort") : "recent";
+}
+
+function syncFiltersToUrl() {
+  const q = new URLSearchParams();
+  for (const key of listState.lockTag ? ["q", "project"] : ["q", "tag", "project"]) if (listState[key]) q.set(key, listState[key]);
+  if (listState.range !== "all") q.set("range", listState.range);
+  if (listState.sort !== "recent") q.set("sort", listState.sort);
+  const base = listState.lockTag ? `#/tag/${encodeURIComponent(listState.lockTag)}` : "#/";
+  const hash = `${base}${q.toString() ? `?${q}` : ""}`;
+  if (location.hash !== hash) history.replaceState(null, "", hash); // no hashchange: the page updates itself
+}
+
+function promptQuery(extra = {}) {
+  const since = RANGES[listState.range][1];
+  const q = { q: listState.q, tag: listState.tag, project: listState.project, sort: listState.sort, ...extra };
+  if (since) q.since = since().toISOString();
+  return new URLSearchParams(q);
+}
+
+function dayLabel(iso) {
+  const d = new Date(iso), today = new Date();
+  const diff = Math.round((new Date(today.toDateString()) - new Date(d.toDateString())) / 864e5);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+}
+
+/** Tag chips inside a prompt row: buttons that filter the list by that tag (on a tag page: open that tag). */
+function rowChips(tags) {
+  const sorted = tags.filter((t) => t.tag !== listState.lockTag).sort((a, b) => CATEGORY_ORDER[tagCategory(a)] - CATEGORY_ORDER[tagCategory(b)] || a.tag.localeCompare(b.tag));
+  return sorted.map((t) => `<button type="button" class="chip cat-${tagCategory(t)}" data-filter-tag="${esc(t.tag)}"
+    title="${listState.lockTag ? "Open the tag page of" : "Show only prompts tagged"} ${esc(t.tag)}">${esc(t.tag)}</button>`).join("");
+}
+
+function promptRow(p, maxCost, { compact = false } = {}) {
+  const pct = maxCost ? Math.max(2, Math.round(((p.total_cost_usd || 0) / maxCost) * 100)) : 0;
+  const time = new Date(p.started_at);
+  const when = listState.sort === "recent" && !compact
+    ? time.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : fmtDate(p.started_at);
+  const meta = [fmtTokens(p.total_tokens) + " tok", fmtMs(duration(p)), p.agent_count ? `${p.agent_count} subagent${p.agent_count > 1 ? "s" : ""}` : ""]
+    .filter(Boolean).join(" · ");
+  return `<article class="prow ${compact ? "compact" : ""}">
+    <time datetime="${esc(p.started_at)}">${when}</time>
+    <div class="pbody">
+      <a class="plink" href="#/prompt/${encodeURIComponent(p.id)}">${p.command ? `<span class="pcmd">/${esc(p.command)}</span> ` : ""}${esc(p.command ? p.text.replace(/^\/\S+\s*/, "") : p.text)}</a>
+      ${compact ? "" : `<div class="pchips">${p.project ? `<span class="pproject">${esc(p.project)}</span>` : ""}${rowChips((p.tags || []).filter((t) => tagCategory(t) !== "project"))}</div>`}
     </div>
-    ${data.items.length ? promptTable(data.items) : `<div class="card muted">No prompts yet. Check the <a href="#/setup">Setup</a> page, then press Refresh.</div>`}
-    <div class="pager">
-      <button class="btn" id="prev" ${listState.offset === 0 ? "disabled" : ""}>← Newer</button>
-      <span class="muted">${data.total ? listState.offset + 1 : 0}–${Math.min(listState.offset + listState.limit, data.total)} of ${data.total}</span>
-      <button class="btn" id="next" ${listState.offset + listState.limit >= data.total ? "disabled" : ""}>Older →</button>
-    </div>`;
-  bindRowClicks();
-  let timer;
-  document.getElementById("q").addEventListener("input", (e) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => { listState.q = e.target.value; listState.offset = 0; viewPrompts().then(() => {
-      const q = document.getElementById("q"); q.focus(); q.setSelectionRange(q.value.length, q.value.length);
-    }); }, 250);
-  });
-  for (const key of ["project", "tag"]) {
-    document.getElementById(key).addEventListener("change", (e) => { listState[key] = e.target.value; listState.offset = 0; viewPrompts(); });
+    <div class="pmetrics">
+      <span class="pcost">${fmtCost(p.total_cost_usd)}</span>
+      <span class="cost-bar" title="Cost relative to the most expensive prompt shown"><i style="width:${pct}%"></i></span>
+      <span class="pmeta">${meta}</span>
+    </div>
+  </article>`;
+}
+
+function listHtml(items, maxCost) {
+  if (listState.sort !== "recent") return `<div class="prow-list">${items.map((p) => promptRow(p, maxCost)).join("")}</div>`;
+  const days = new Map();
+  for (const p of items) {
+    const key = new Date(p.started_at).toDateString();
+    if (!days.has(key)) days.set(key, []);
+    days.get(key).push(p);
   }
-  document.getElementById("prev").onclick = () => { listState.offset = Math.max(0, listState.offset - listState.limit); viewPrompts(); };
-  document.getElementById("next").onclick = () => { listState.offset += listState.limit; viewPrompts(); };
+  return [...days.values()].map((list) => {
+    const cost = list.reduce((s, p) => s + (p.total_cost_usd || 0), 0);
+    return `<section class="day"><h2 class="day-head"><span>${dayLabel(list[0].started_at)}</span>
+      <span class="sec-meta">${list.length} prompt${list.length === 1 ? "" : "s"} · ${fmtCost(cost)}</span></h2>
+      <div class="prow-list">${list.map((p) => promptRow(p, maxCost)).join("")}</div></section>`;
+  }).join("");
+}
+
+function groupedPromptsHtml(items, maxCost) {
+  const groups = new Map();
+  const loose = [];
+  for (const p of items) {
+    const keys = (p.tags || []).filter((t) => tagCategory(t) === listState.groupBy && t.tag !== listState.lockTag).map((t) => t.tag);
+    if (!keys.length) loose.push(p);
+    for (const k of keys) {
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(p);
+    }
+  }
+  const byRecent = (a, b) => b.started_at.localeCompare(a.started_at);
+  const ordered = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const card = (key, list, isTag) => {
+    list.sort(byRecent);
+    const [first, ...rest] = list;
+    const costs = [...list].reverse().map((p) => p.total_cost_usd || 0);
+    const total = costs.reduce((s, c) => s + c, 0);
+    const cat = isTag ? tagCategory({ tag: key, kind: listState.groupBy === "human" ? "human" : "ai" }) : "ai";
+    return `<section class="pgroup cat-${cat}">
+      <header class="pgroup-head">
+        <div class="pgroup-title">${isTag ? `<span class="tag-dot"></span><a href="#/tag/${encodeURIComponent(key)}" title="Open the tag page">${esc(key)}</a>` : esc(key)}
+          <span class="sec-meta">${list.length} run${list.length === 1 ? "" : "s"} · ${fmtCost(total)} · median ${fmtCost(median(costs))}</span>
+          ${trendBadge(costs)}</div>
+        <div class="pgroup-spark">${list.length > 1 ? sparkline(costs.slice(-24)) : ""}</div>
+      </header>
+      ${promptRow(first, maxCost)}
+      ${rest.length ? `<details class="more-runs"><summary><span class="closed">Show ${rest.length} more run${rest.length === 1 ? "" : "s"}</span><span class="opened">Hide earlier runs</span></summary>
+        <div class="prow-list">${rest.map((p) => promptRow(p, maxCost, { compact: true })).join("")}</div></details>` : ""}
+    </section>`;
+  };
+  return `<div class="group-actions"><span class="muted">${groups.size} ${GROUP_NOUN[listState.groupBy]} tag${groups.size === 1 ? "" : "s"} · each shows its latest run</span>
+      <span class="toolbar-spacer"></span>
+      <button class="btn" type="button" data-expand="1">Expand all</button><button class="btn" type="button" data-expand="0">Collapse all</button></div>
+    ${ordered.map(([key, list]) => card(key, list, true)).join("")}
+    ${loose.length ? card(`Without ${listState.lockTag && groups.size ? "another" : "a"} ${GROUP_NOUN[listState.groupBy]} tag`, loose, false) : ""}`;
+}
+
+function promptSummaryHtml(s) {
+  const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
+  return `<div class="tags-hero">
+    ${fact("Prompts", s.count || 0, RANGES[listState.range][0].toLowerCase())}
+    ${fact("Total cost", fmtCost(s.cost_usd || 0), `${fmtTokens(s.tokens || 0)} tokens`)}
+    ${fact("Per prompt", fmtCost(s.count ? s.cost_usd / s.count : null), "average")}
+    ${fact("Agent time", fmtMs(s.duration_ms || 0), "active time, summed")}
+  </div>`;
+}
+
+function activeFiltersHtml() {
+  const chips = [];
+  if (listState.q) chips.push(["q", `“${listState.q}”`]);
+  if (listState.project) chips.push(["project", `Project: ${listState.project}`]);
+  if (listState.tag && !listState.lockTag) chips.push(["tag", `Tag: ${listState.tag}`]);
+  if (listState.range !== "all") chips.push(["range", RANGES[listState.range][0]]);
+  if (!chips.length) return "";
+  return `<div class="active-filters" aria-label="Active filters">${chips.map(([key, label]) =>
+    `<button type="button" class="filter-chip" data-clear="${key}" title="Remove this filter">${esc(label)}<span aria-hidden="true">✕</span></button>`).join("")}
+    <button type="button" class="link-btn" data-clear="all">Clear all</button></div>`;
+}
+
+function pillMenu(id, label, value, body) {
+  return `<details class="pop" id="${id}"><summary class="pill ${value ? "set" : ""}">${label}${value ? `: <strong>${esc(value)}</strong>` : ""}<span class="caret-d">▾</span></summary>
+    <div class="pop-panel">${body}</div></details>`;
+}
+
+function promptToolbarHtml(projects) {
+  const projectMenu = `<button type="button" class="menu-item ${!listState.project ? "on" : ""}" data-set-project="">All projects</button>
+    ${projects.map((p) => `<button type="button" class="menu-item ${p === listState.project ? "on" : ""}" data-set-project="${esc(p)}">${esc(p)}</button>`).join("")}`;
+  const tagMenu = `<input type="search" class="menu-search" placeholder="Find a tag…" aria-label="Find a tag">
+    <div class="menu-list">${TAG_CATEGORIES.map(([cat, label]) => {
+      const list = listState.tags.filter((t) => tagCategory(t) === cat);
+      return list.length ? `<div class="menu-group" data-group="${cat}">${label}</div>${list.map((t) =>
+        `<button type="button" class="menu-item ${t.tag === listState.tag ? "on" : ""}" data-set-tag="${esc(t.tag)}" data-cat="${cat}">
+          <span class="tag-dot cat-dot-${cat}"></span><span class="mi-text">${esc(t.tag)}</span><span class="mi-count">${t.prompts}</span></button>`).join("")}` : "";
+    }).join("")}</div>`;
+  return `<search class="tags-toolbar prompts-toolbar">
+    <label class="search-box"><span aria-hidden="true">⌕</span>
+      <input type="search" id="prompt-search" placeholder="${listState.lockTag ? "Search these runs…" : "Search prompts…"}" value="${esc(listState.q)}" aria-label="Search prompts"></label>
+    ${pillMenu("pop-project", "Project", listState.project, projectMenu)}
+    ${listState.lockTag ? "" : pillMenu("pop-tag", "Tag", listState.tag, tagMenu)}
+    <div class="segmented" role="group" aria-label="Period">${Object.entries(RANGES).map(([key, [label]]) =>
+      `<button type="button" data-range="${key}" aria-pressed="${key === listState.range}">${label}</button>`).join("")}</div>
+    <span class="toolbar-spacer"></span>
+    <label class="sort-box">Sort <select id="prompt-sort">${Object.entries(PROMPT_SORTS).map(([key, label]) =>
+      `<option value="${key}" ${key === listState.sort ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    <div class="segmented" role="group" aria-label="Layout">
+      <button type="button" data-layout="list" aria-pressed="${listState.layout === "list"}">List</button>
+      <button type="button" data-layout="grouped" aria-pressed="${listState.layout === "grouped"}">By tag</button>
+    </div>
+    ${listState.layout === "grouped" ? `<label class="sort-box">Group by <select id="prompt-groupby">${Object.entries(GROUP_BY).map(([key, label]) =>
+      `<option value="${key}" ${key === listState.groupBy ? "selected" : ""}>${label}</option>`).join("")}</select></label>` : ""}
+  </search>`;
+}
+
+async function loadPrompts() {
+  // grouped layouts and tag pages (charts, medians) need every matching prompt
+  const all = listState.layout === "grouped" || listState.lockTag;
+  const data = await api(`/api/prompts?${promptQuery({ limit: all ? 100000 : LIST_PAGE, offset: 0 })}`);
+  listState.items = data.items;
+  listState.summary = data.summary;
+}
+
+async function renderPrompts({ reload = true } = {}) {
+  syncFiltersToUrl();
+  if (reload) await loadPrompts();
+  const { items, summary } = listState;
+  const maxCost = summary.max_cost_usd || 0;
+  document.getElementById("prompt-summary").innerHTML = listState.lockTag ? tagSummaryHtml(items, summary) : promptSummaryHtml(summary);
+  if (listState.lockTag) {
+    destroyCharts();
+    const block = chartsBlock(items, null, "Runs", "tagchart");
+    document.getElementById("tag-charts").innerHTML = items.length ? block.html : "";
+    if (items.length) block.mount();
+  }
+  document.getElementById("active-filters").innerHTML = activeFiltersHtml();
+  const results = document.getElementById("prompt-results");
+  if (!items.length) {
+    results.innerHTML = `<div class="empty-state"><div class="empty-icon">⌕</div><p>${activeFiltersHtml() || !listState.lockTag ? "No prompt matches these filters." : "No prompt carries this tag yet."}</p>
+      ${activeFiltersHtml() ? '<button class="btn" type="button" data-clear="all">Clear all filters</button>' : '<p>Check the <a href="#/setup">Setup</a> page, then press Refresh.</p>'}</div>`;
+  } else if (listState.layout === "grouped") {
+    results.innerHTML = groupedPromptsHtml(items, maxCost);
+  } else {
+    const more = summary.count - items.length;
+    results.innerHTML = listHtml(items, maxCost) + (more > 0
+      ? `<div class="load-more"><button class="btn" type="button" id="load-more">Show ${Math.min(more, LIST_PAGE)} more <span class="muted">(${more} left)</span></button></div>` : "");
+  }
+  bindPromptResults();
+}
+
+function bindPromptResults() {
+  const results = document.getElementById("prompt-results");
+  results.querySelectorAll("[data-filter-tag]").forEach((b) => b.onclick = () => {
+    if (listState.lockTag) { location.hash = `#/tag/${encodeURIComponent(b.dataset.filterTag)}`; return; }
+    listState.tag = b.dataset.filterTag;
+    rerenderToolbar();
+    renderPrompts();
+    scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  });
+  results.querySelectorAll("[data-expand]").forEach((b) => b.onclick = () =>
+    results.querySelectorAll("details.more-runs").forEach((d) => { d.open = b.dataset.expand === "1"; }));
+  const more = document.getElementById("load-more");
+  if (more) more.onclick = async () => {
+    more.disabled = true;
+    const data = await api(`/api/prompts?${promptQuery({ limit: LIST_PAGE, offset: listState.items.length })}`);
+    listState.items.push(...data.items);
+    renderPrompts({ reload: false });
+  };
+  app.querySelectorAll("[data-clear]").forEach((b) => b.onclick = () => {
+    const key = b.dataset.clear;
+    if (key === "all") Object.assign(listState, { q: "", tag: listState.lockTag, project: "", range: "all" });
+    else listState[key] = key === "range" ? "all" : "";
+    rerenderToolbar();
+    renderPrompts();
+  });
+}
+
+let promptProjects = [];
+
+function rerenderToolbar() {
+  document.getElementById("prompt-toolbar").innerHTML = promptToolbarHtml(promptProjects);
+  bindPromptToolbar();
+}
+
+function bindPromptToolbar() {
+  const bar = document.getElementById("prompt-toolbar");
+  let timer;
+  bar.querySelector("#prompt-search").addEventListener("input", (e) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { listState.q = e.target.value; renderPrompts(); }, 250);
+  });
+  bar.querySelectorAll("[data-set-project]").forEach((b) => b.onclick = () => { listState.project = b.dataset.setProject; rerenderToolbar(); renderPrompts(); });
+  bar.querySelectorAll("[data-set-tag]").forEach((b) => b.onclick = () => {
+    listState.tag = b.dataset.setTag === listState.tag ? "" : b.dataset.setTag; rerenderToolbar(); renderPrompts();
+  });
+  const find = bar.querySelector(".menu-search");
+  if (find) find.addEventListener("input", () => {
+    const q = find.value.toLowerCase();
+    bar.querySelectorAll("#pop-tag [data-set-tag]").forEach((b) => { b.hidden = !b.dataset.setTag.toLowerCase().includes(q); });
+    bar.querySelectorAll("#pop-tag [data-group]").forEach((g) => {
+      g.hidden = !bar.querySelector(`#pop-tag [data-cat="${g.dataset.group}"]:not([hidden])`);
+    });
+  });
+  bar.querySelector("#pop-tag")?.addEventListener("toggle", (e) => { if (e.target.open) find.focus(); });
+  bar.querySelectorAll("[data-range]").forEach((b) => b.onclick = () => { listState.range = b.dataset.range; rerenderToolbar(); renderPrompts(); });
+  bar.querySelectorAll("[data-layout]").forEach((b) => b.onclick = () => {
+    listState.layout = b.dataset.layout; savePromptPrefs(); rerenderToolbar(); renderPrompts();
+  });
+  bar.querySelector("#prompt-sort").onchange = (e) => { listState.sort = e.target.value; renderPrompts(); };
+  const groupBy = bar.querySelector("#prompt-groupby");
+  if (groupBy) groupBy.onchange = (e) => { listState.groupBy = e.target.value; savePromptPrefs(); renderPrompts({ reload: false }); };
+}
+
+// pill menus close when clicking elsewhere or pressing Escape, like native menus
+document.addEventListener("click", (e) => {
+  document.querySelectorAll("details.pop[open]").forEach((d) => { if (!d.contains(e.target)) d.open = false; });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") document.querySelectorAll("details.pop[open]").forEach((d) => { d.open = false; d.querySelector("summary").focus(); });
+});
+
+async function viewPrompts(query = new URLSearchParams()) {
+  filtersFromQuery(query);
+  listState.lockTag = "";
+  [promptProjects, listState.tags] = await Promise.all([api("/api/projects"), api("/api/tags")]);
+  app.innerHTML = `
+    <div class="prompts-page">
+      <div class="tags-intro"><h1>Prompts</h1>
+        <p>Every prompt you gave Claude, newest first, with what it cost and how long it took. Group them by tag to follow how a task evolves.</p></div>
+      <div id="prompt-summary"></div>
+      <div id="prompt-toolbar"></div>
+      <div id="active-filters"></div>
+      <div id="prompt-results"></div>
+    </div>`;
+  rerenderToolbar();
+  await renderPrompts();
 }
 
 function usageRow(name, r, extra = "") {
@@ -747,46 +1037,76 @@ async function viewTags() {
   });
 }
 
-async function viewTag(tag) {
+function tagHeadHtml(info, rules) {
+  const cat = tagCategory(info);
+  const [prefix, ...rest] = info.tag.split(":");
+  const name = rest.length ? `<span class="tag-prefix">${esc(prefix)}:</span>${esc(rest.join(":"))}` : esc(info.tag);
+  const help = CATEGORY_INFO[cat].help;
+  const meta = info.prompts ? [
+    `Created ${esc(fmtDate(info.created_at))}`,
+    `last used <span title="${esc(fmtDate(info.last_used))}">${fmtAgo(info.last_used)}</span>`,
+  ] : ["No prompt carries this tag yet"];
+  const rulesHtml = cat !== "human" ? "" : `<section class="rules-card" aria-labelledby="rules-title">
+      <div class="rules-head"><h2 id="rules-title">Auto-assign</h2>
+        <span class="muted">${rules.length ? "Every prompt, past and future, containing these keywords gets the tag:" : "No keywords yet: only prompts you tagged by hand carry it."}</span></div>
+      ${rules.length ? `<div class="rule-chips">${rules.map((r) => `<span class="rule-chip">${ruleText(r)}
+        <button type="button" data-delete-rule="${r.index}" title="Stop assigning the tag with these keywords" aria-label="Remove this rule">✕</button></span>`).join("")}</div>` : ""}
+      <details class="add-rule"><summary class="btn">+ Add keywords</summary>
+        <form id="rule-form" class="inline-form">${keywordFields("rule")}<button class="btn primary">Add</button></form></details>
+    </section>`;
+  return `<header class="tag-head cat-${cat}">
+      <div class="tag-head-title"><span class="tag-dot"></span><h1>${name}</h1>
+        ${cat === "human" ? '<span class="by-you">yours</span>' : `<span class="by-ai">${CATEGORY_INFO[cat].label}</span>`}</div>
+      <p class="tag-head-sub">${esc(help[0].toUpperCase() + help.slice(1))}</p>
+      <div class="tag-head-meta">${meta.map((m) => `<span>${m}</span>`).join("")}</div>
+    </header>${rulesHtml}`;
+}
+
+function tagSummaryHtml(items, s) {
+  const costs = [...items].reverse().map((p) => p.total_cost_usd || 0);
+  const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
+  return `<div class="tags-hero">
+    ${fact("Runs", s.count || 0, RANGES[listState.range][0].toLowerCase())}
+    ${fact("Total cost", fmtCost(s.cost_usd || 0), `${fmtTokens(s.tokens || 0)} tokens`)}
+    ${fact("Median cost", fmtCost(median(costs)), trendBadge(costs) || "per run")}
+    ${fact("Median time", fmtMs(median(items.map(duration))), "per run, active time")}
+  </div>`;
+}
+
+async function viewTag(tag, query = new URLSearchParams()) {
+  filtersFromQuery(query);
+  Object.assign(listState, { lockTag: tag, tag });
   const enc = encodeURIComponent(tag);
-  const [rows, tags, rules] = await Promise.all([api(`/api/tags/${enc}/prompts`), api("/api/tags"), api(`/api/tags/${enc}/rules`)]);
+  const [projects, tags, rules] = await Promise.all([api("/api/projects"), api("/api/tags"), api(`/api/tags/${enc}/rules`)]);
+  promptProjects = projects;
+  listState.tags = tags;
   const info = tags.find((t) => t.tag === tag) || { tag, kind: "ai" };
-  const human = tagCategory(info) === "human";
-  const total = rows.reduce((s, r) => s + (r.total_cost_usd || 0), 0);
-  const block = chartsBlock(rows, null);
   app.innerHTML = `
-    <div class="muted"><a href="#/tags">← Tags</a></div>
-    <h1><span class="chip cat-${tagCategory(info)}" style="font-size:16px"><a>${esc(tag)}</a></span>
-      <span class="muted" style="font-size:13px; font-weight:400">${CATEGORY_INFO[tagCategory(info)].label} tag</span></h1>
-    <div class="tiles">
-      <div class="tile"><div class="label">Prompts</div><div class="value">${rows.length}</div></div>
-      <div class="tile"><div class="label">Total cost</div><div class="value">${fmtCost(total)}</div></div>
-      <div class="tile"><div class="label">Median cost</div><div class="value">${fmtCost(median(rows.map((r) => r.total_cost_usd)))}</div></div>
-      <div class="tile"><div class="label">Median duration</div><div class="value">${fmtMs(median(rows.map(duration)))}</div></div>
-    </div>
-    ${human ? `<h2>Assigned automatically to prompts containing</h2>
-      <div class="card">
-        ${rules.length ? rules.map((r) => `<div class="rule-row"><span>${ruleText(r)}</span>
-          <button class="btn" data-delete-rule="${r.index}" title="Stop assigning the tag with these keywords">Remove</button></div>`).join("")
-          : '<div class="muted">No keywords yet: only prompts tagged by hand carry this tag.</div>'}
-        <form id="rule-form" class="inline-form" style="margin-top:8px">${keywordFields("rule")}<button class="btn">Add keywords</button></form>
-      </div>` : ""}
-    <h2>Evolution over time</h2>${block.html}
-    <h2>Prompts</h2>${promptTable([...rows].reverse())}`;
-  block.mount();
-  bindRowClicks();
-  if (!human) return;
+    <div class="prompts-page tag-page">
+      <a class="crumb" href="#/tags">← All tags</a>
+      ${tagHeadHtml(info, rules)}
+      <div id="prompt-summary"></div>
+      <section class="tag-evolution" aria-labelledby="evo-title"><h2 id="evo-title" class="page-sec">How it evolves</h2><div id="tag-charts"></div></section>
+      <h2 class="page-sec">Runs</h2>
+      <div id="prompt-toolbar"></div>
+      <div id="active-filters"></div>
+      <div id="prompt-results"></div>
+    </div>`;
+  rerenderToolbar();
+  await renderPrompts();
+  if (tagCategory(info) !== "human") return;
   bindKeywordPreview("rule");
+  app.querySelector(".add-rule").addEventListener("toggle", (e) => { if (e.target.open) document.getElementById("rule-keywords").focus(); });
   document.getElementById("rule-form").onsubmit = async (e) => {
     e.preventDefault();
     const values = keywordValues("rule");
     if (!values.keywords.length) return;
     await api(`/api/tags/${enc}/rules`, { method: "POST", body: values });
-    viewTag(tag);
+    route();
   };
   app.querySelectorAll("[data-delete-rule]").forEach((b) => b.onclick = async () => {
     await api(`/api/tags/${enc}/rules/${b.dataset.deleteRule}`, { method: "DELETE" });
-    viewTag(tag);
+    route();
   });
 }
 
@@ -942,9 +1262,9 @@ async function route() {
     else if (view === "tags") await viewTags();
     else if (view === "sessions") await viewSessions();
     else if (view === "session") await viewSession(decodeURIComponent(arg));
-    else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)));
+    else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)), query);
     else if (view === "setup") await viewSetup();
-    else await viewPrompts();
+    else await viewPrompts(query);
   } catch (e) {
     app.innerHTML = `<div class="card status-warn">${esc(e.message)}</div>`;
   }
