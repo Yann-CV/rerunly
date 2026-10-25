@@ -292,26 +292,41 @@ const RANGES = {
   "30d": ["30 days", () => new Date(Date.now() - 30 * 864e5)],
 };
 const PROMPT_SORTS = { recent: "Newest", cost: "Most expensive", duration: "Longest", tokens: "Most tokens" };
-const GROUP_BY = { human: "Human tags", project: "Project", skill: "Skill", model: "Model", ai: "Other AI" };
-const GROUP_NOUN = { human: "human", project: "project", skill: "skill", model: "model", ai: "other AI" };
+// card order in the "By tag" layout, in two menu sections; a group is { info, list } with its prompts in `list`
+const latestStart = (g) => g.list.reduce((m, p) => (p.started_at > m ? p.started_at : m), "");
+const sumOf = (g, f) => g.list.reduce((sum, p) => sum + (f(p) || 0), 0);
+const medianOf = (g, f) => median(g.list.map((p) => f(p) || 0));
+const createdAt = (g) => listState.tags.find((t) => t.tag === g.info.tag)?.created_at || "";
+const promptCost = (p) => p.total_cost_usd;
+const GROUP_SORTS = {
+  used: ["Tags", "Most used", (a, b) => b.list.length - a.list.length],
+  recent: ["Tags", "Recently used", (a, b) => latestStart(b).localeCompare(latestStart(a))],
+  created: ["Tags", "Newest tags", (a, b) => createdAt(b).localeCompare(createdAt(a))],
+  name: ["Tags", "A to Z", () => 0],
+  median: ["Timing, cost & usage", "Priciest per run", (a, b) => medianOf(b, promptCost) - medianOf(a, promptCost)],
+  cost: ["Timing, cost & usage", "Most expensive in total", (a, b) => sumOf(b, promptCost) - sumOf(a, promptCost)],
+  duration: ["Timing, cost & usage", "Longest per run", (a, b) => medianOf(b, duration) - medianOf(a, duration)],
+  time: ["Timing, cost & usage", "Most time in total", (a, b) => sumOf(b, duration) - sumOf(a, duration)],
+  tokens: ["Timing, cost & usage", "Most tokens per run", (a, b) => medianOf(b, (p) => p.total_tokens) - medianOf(a, (p) => p.total_tokens)],
+};
 const LIST_PAGE = 100;
 
 function loadPromptPrefs() {
   try {
     const p = JSON.parse(localStorage.getItem("prompts-prefs") || "{}");
-    return { layout: p.layout === "grouped" ? "grouped" : "list", groupBy: GROUP_BY[p.groupBy] ? p.groupBy : "human" };
-  } catch { return { layout: "list", groupBy: "human" }; }
+    return { layout: p.layout === "grouped" ? "grouped" : "list" };
+  } catch { return { layout: "list" }; }
 }
 
 function savePromptPrefs() {
   try {
-    localStorage.setItem("prompts-prefs", JSON.stringify({ layout: listState.layout, groupBy: listState.groupBy }));
+    localStorage.setItem("prompts-prefs", JSON.stringify({ layout: listState.layout }));
   } catch { /* storage unavailable: preferences last for this visit */ }
 }
 
 // filters live in the URL (shareable); layout preferences in the browser
 // on a tag page `lockTag` pins the tag filter
-const listState = { q: "", tag: "", project: "", range: "all", sort: "recent", lockTag: "", ...loadPromptPrefs(), items: [], summary: null, tags: [] };
+const listState = { q: "", tag: "", project: "", range: "all", sort: "recent", order: "used", lockTag: "", ...loadPromptPrefs(), items: [], summary: null, tags: [] };
 
 function filtersFromQuery(query) {
   listState.q = query.get("q") || "";
@@ -319,6 +334,7 @@ function filtersFromQuery(query) {
   listState.project = query.get("project") || "";
   listState.range = RANGES[query.get("range")] ? query.get("range") : "all";
   listState.sort = PROMPT_SORTS[query.get("sort")] ? query.get("sort") : "recent";
+  listState.order = GROUP_SORTS[query.get("order")] ? query.get("order") : "used";
 }
 
 function syncFiltersToUrl() {
@@ -326,6 +342,7 @@ function syncFiltersToUrl() {
   for (const key of listState.lockTag ? ["q", "project"] : ["q", "tag", "project"]) if (listState[key]) q.set(key, listState[key]);
   if (listState.range !== "all") q.set("range", listState.range);
   if (listState.sort !== "recent") q.set("sort", listState.sort);
+  if (listState.layout === "grouped" && listState.order !== "used") q.set("order", listState.order);
   const base = listState.lockTag ? `#/tag/${encodeURIComponent(listState.lockTag)}` : "#/";
   const hash = `${base}${q.toString() ? `?${q}` : ""}`;
   if (location.hash !== hash) history.replaceState(null, "", hash); // no hashchange: the page updates itself
@@ -391,42 +408,110 @@ function listHtml(items, maxCost) {
   }).join("");
 }
 
+const FAMILY_LABELS = { project: "Projects", model: "Models", skill: "Skills", cmd: "Slash commands", agent: "Subagent types", persona: "Personas" };
+
+// earlier runs of each group, rendered on first open: the sections can hold thousands of rows
+let groupRuns = [];
+
+/** One section per tag category, then per family (prefix), as on the Tags page; one card per tag. */
 function groupedPromptsHtml(items, maxCost) {
   const groups = new Map();
   const loose = [];
   for (const p of items) {
-    const keys = (p.tags || []).filter((t) => tagCategory(t) === listState.groupBy && t.tag !== listState.lockTag).map((t) => t.tag);
-    if (!keys.length) loose.push(p);
-    for (const k of keys) {
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(p);
+    const tags = (p.tags || []).filter((t) => t.tag !== listState.lockTag);
+    if (!tags.some((t) => t.kind === "human")) loose.push(p);
+    for (const t of tags) {
+      if (!groups.has(t.tag)) groups.set(t.tag, { info: t, list: [] });
+      groups.get(t.tag).list.push(p);
     }
   }
+  groupRuns = [];
   const byRecent = (a, b) => b.started_at.localeCompare(a.started_at);
-  const ordered = [...groups].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
-  const card = (key, list, isTag) => {
+  const card = (label, list, cat, tag) => {
     list.sort(byRecent);
     const [first, ...rest] = list;
     const costs = [...list].reverse().map((p) => p.total_cost_usd || 0);
-    const total = costs.reduce((s, c) => s + c, 0);
-    const cat = isTag ? tagCategory({ tag: key, kind: listState.groupBy === "human" ? "human" : "ai" }) : "ai";
+    const total = costs.reduce((sum, c) => sum + c, 0);
+    groupRuns.push(rest);
+    const [prefix, ...name] = label.split(":");
+    const title = tag && name.length ? `<span class="tag-prefix">${esc(prefix)}:</span>${esc(name.join(":"))}` : esc(label);
     return `<section class="pgroup cat-${cat}">
-      <header class="pgroup-head">
-        <div class="pgroup-title">${isTag ? `<span class="tag-dot"></span><a href="#/tag/${encodeURIComponent(key)}" title="Open the tag page">${esc(key)}</a>` : esc(key)}
-          <span class="sec-meta">${list.length} run${list.length === 1 ? "" : "s"} · ${fmtCost(total)} · median ${fmtCost(median(costs))}</span>
-          ${trendBadge(costs)}</div>
-        <div class="pgroup-spark">${list.length > 1 ? sparkline(costs.slice(-24)) : ""}</div>
-      </header>
-      ${promptRow(first, maxCost)}
-      ${rest.length ? `<details class="more-runs"><summary><span class="closed">Show ${rest.length} more run${rest.length === 1 ? "" : "s"}</span><span class="opened">Hide earlier runs</span></summary>
-        <div class="prow-list">${rest.map((p) => promptRow(p, maxCost, { compact: true })).join("")}</div></details>` : ""}
+      <header class="pgroup-title"><span class="tag-dot"></span>${tag ? `<a href="#/tag/${encodeURIComponent(tag)}" title="Open the tag page">${title}</a>` : title}</header>
+      <div class="tag-metric"><span class="big">${fmtCost(median(costs))}</span><span class="unit">median per run</span>${trendBadge(costs)}</div>
+      ${sparkline(costs.slice(-24))}
+      <div class="pgroup-meta"><span><strong>${list.length}</strong> run${list.length === 1 ? "" : "s"}</span><span>${fmtCost(total)} total</span></div>
+      ${latestRun(first)}
+      ${rest.length ? `<details class="more-runs" data-runs="${groupRuns.length - 1}"><summary><span class="closed">Show ${rest.length} more run${rest.length === 1 ? "" : "s"}</span><span class="opened">Hide earlier runs</span></summary>
+        <div class="prow-list"></div></details>` : ""}
     </section>`;
   };
-  return `<div class="group-actions"><span class="muted">${groups.size} ${GROUP_NOUN[listState.groupBy]} tag${groups.size === 1 ? "" : "s"} · each shows its latest run</span>
+  // one section per family: the tag's prefix (`task:`, `project:`, `cmd:`…), in category order
+  const families = new Map();
+  for (const g of groups.values()) {
+    const prefix = g.info.tag.includes(":") ? g.info.tag.split(":")[0] : "";
+    const key = `${tagCategory(g.info)}|${prefix}`;
+    if (!families.has(key)) families.set(key, { cat: tagCategory(g.info), prefix, groups: [] });
+    families.get(key).groups.push(g);
+  }
+  const ordered = [...families.values()].sort((a, b) =>
+    CATEGORY_ORDER[a.cat] - CATEGORY_ORDER[b.cat] || (a.prefix === "") - (b.prefix === "") || a.prefix.localeCompare(b.prefix));
+  const section = (id, cat, title, meta, help, cards) => `<details class="tag-section psection cat-${cat}" id="${id}" open>
+      <summary><h2><span class="tag-dot"></span>${title}<span class="sec-meta">${meta}</span></h2></summary>
+      <p class="sec-help">${esc(help)}</p>
+      <div class="pgroup-grid">${cards}</div>
+      <button type="button" class="link-btn more-tags" hidden></button>
+    </details>`;
+  const sections = ordered.map((f, i) => {
+    f.groups.sort((a, b) => GROUP_SORTS[listState.order][2](a, b) || a.info.tag.localeCompare(b.info.tag));
+    const runs = new Set(f.groups.flatMap((g) => g.list)).size;
+    const name = f.prefix ? FAMILY_LABELS[f.prefix] || `${f.prefix}:` : "No prefix";
+    const help = `${CATEGORY_INFO[f.cat].label} tag${f.cat === "human" ? "s you created" : "s"}${f.prefix ? `, written ${f.prefix}:…` : ""}`;
+    return { id: `psec-${i}`, cat: f.cat, name, n: f.groups.length, html: section(`psec-${i}`, f.cat, esc(name),
+      `${f.groups.length} tag${f.groups.length === 1 ? "" : "s"} · ${runs} run${runs === 1 ? "" : "s"}`, help,
+      f.groups.map((g) => card(g.info.tag, g.list, f.cat, g.info.tag)).join("")) };
+  });
+  if (loose.length && loose.length < items.length) {
+    const label = `Without ${listState.lockTag && sections.some((x) => x.cat === "human") ? "another" : "a"} human tag`;
+    sections.push({ id: "psec-loose", cat: "ai", name: "Not tagged by you", n: 1, html: section("psec-loose", "ai", "Not tagged by you",
+      `${loose.length} run${loose.length === 1 ? "" : "s"}`, "Prompts with no human tag yet: tag them to follow them", card(label, loose, "ai", null)) });
+  }
+  return `<div class="group-actions">
+      <nav class="jump" aria-label="Jump to a section">${sections.map((x) =>
+        `<a class="chip cat-${x.cat}" href="#${x.id}" data-jump="${x.id}">${esc(x.name)} <span class="mi-count">${x.n}</span></a>`).join("")}</nav>
       <span class="toolbar-spacer"></span>
       <button class="btn" type="button" data-expand="1">Expand all</button><button class="btn" type="button" data-expand="0">Collapse all</button></div>
-    ${ordered.map(([key, list]) => card(key, list, true)).join("")}
-    ${loose.length ? card(`Without ${listState.lockTag && groups.size ? "another" : "a"} ${GROUP_NOUN[listState.groupBy]} tag`, loose, false) : ""}`;
+    <p class="muted group-note">One section per tag family, one card per tag with its latest run; a prompt shows in each of its tags.</p>
+    ${sections.map((x) => x.html).join("")}`;
+}
+
+/** The latest run inside a tag card: its text and cost; the whole block opens the prompt. */
+function latestRun(p) {
+  return `<a class="latest-run" href="#/prompt/${encodeURIComponent(p.id)}" title="Open the latest run">
+    <span class="latest-head"><span>Latest · <time datetime="${esc(p.started_at)}" title="${esc(fmtDate(p.started_at))}">${fmtAgo(p.started_at)}</time></span><strong>${fmtCost(p.total_cost_usd)}</strong></span>
+    <span class="latest-text">${p.command ? `<span class="pcmd">/${esc(p.command)}</span> ` : ""}${esc(p.command ? p.text.replace(/^\/\S+\s*/, "") : p.text)}</span>
+    <span class="pmeta">${fmtTokens(p.total_tokens)} tok · ${fmtMs(duration(p))}</span></a>`;
+}
+
+/** Each family shows one row of cards (as many as fit); its button shows the rest. */
+function clampGrids(root = document) {
+  root.querySelectorAll(".pgroup-grid").forEach((grid) => {
+    const more = grid.nextElementSibling?.classList.contains("more-tags") ? grid.nextElementSibling : null;
+    if (!more) return;
+    const cols = getComputedStyle(grid).gridTemplateColumns.split(" ").length;
+    const cards = [...grid.children];
+    const open = grid.classList.contains("expanded");
+    cards.forEach((c, i) => { c.hidden = !open && i >= cols; });
+    const extra = cards.length - cols;
+    more.hidden = extra <= 0;
+    more.textContent = open ? "Show fewer" : `Show ${extra} more tag${extra === 1 ? "" : "s"}`;
+    more.setAttribute("aria-expanded", String(open));
+  });
+}
+addEventListener("resize", () => clampGrids());
+
+function fillRuns(d, maxCost) {
+  const list = d.querySelector(".prow-list");
+  if (!list.childElementCount) list.innerHTML = groupRuns[d.dataset.runs].map((p) => promptRow(p, maxCost, { compact: true })).join("");
 }
 
 function promptSummaryHtml(s) {
@@ -474,14 +559,16 @@ function promptToolbarHtml(projects) {
     <div class="segmented" role="group" aria-label="Period">${Object.entries(RANGES).map(([key, [label]]) =>
       `<button type="button" data-range="${key}" aria-pressed="${key === listState.range}">${label}</button>`).join("")}</div>
     <span class="toolbar-spacer"></span>
-    <label class="sort-box">Sort <select id="prompt-sort">${Object.entries(PROMPT_SORTS).map(([key, label]) =>
-      `<option value="${key}" ${key === listState.sort ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    ${listState.layout === "grouped"
+      ? pillMenu("pop-order", "Order", GROUP_SORTS[listState.order][1], [...new Set(Object.values(GROUP_SORTS).map(([section]) => section))].map((section) =>
+        `<div class="menu-group">${section}</div>${Object.entries(GROUP_SORTS).filter(([, [sec]]) => sec === section).map(([key, [, label]]) =>
+          `<button type="button" class="menu-item ${key === listState.order ? "on" : ""}" data-set-order="${key}">${label}</button>`).join("")}`).join("")).replace("pill set", "pill") /* always set: not highlighted as a filter */
+      : `<label class="sort-box">Sort <select id="prompt-sort">${Object.entries(PROMPT_SORTS).map(([key, label]) =>
+        `<option value="${key}" ${key === listState.sort ? "selected" : ""}>${label}</option>`).join("")}</select></label>`}
     <div class="segmented" role="group" aria-label="Layout">
       <button type="button" data-layout="list" aria-pressed="${listState.layout === "list"}">List</button>
       <button type="button" data-layout="grouped" aria-pressed="${listState.layout === "grouped"}">By tag</button>
     </div>
-    ${listState.layout === "grouped" ? `<label class="sort-box">Group by <select id="prompt-groupby">${Object.entries(GROUP_BY).map(([key, label]) =>
-      `<option value="${key}" ${key === listState.groupBy ? "selected" : ""}>${label}</option>`).join("")}</select></label>` : ""}
   </search>`;
 }
 
@@ -529,8 +616,27 @@ function bindPromptResults() {
     renderPrompts();
     scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
   });
-  results.querySelectorAll("[data-expand]").forEach((b) => b.onclick = () =>
-    results.querySelectorAll("details.more-runs").forEach((d) => { d.open = b.dataset.expand === "1"; }));
+  const maxCost = listState.summary.max_cost_usd || 0;
+  results.querySelectorAll("details.more-runs").forEach((d) => d.addEventListener("toggle", () => { if (d.open) fillRuns(d, maxCost); }));
+  results.querySelectorAll("[data-expand]").forEach((b) => b.onclick = () => {
+    const open = b.dataset.expand === "1";
+    results.querySelectorAll("details.psection").forEach((d) => { d.open = true; });
+    results.querySelectorAll(".pgroup-grid").forEach((g) => g.classList.toggle("expanded", open));
+    results.querySelectorAll("details.more-runs").forEach((d) => { if (open) fillRuns(d, maxCost); d.open = open; });
+    clampGrids(results);
+  });
+  results.querySelectorAll(".more-tags").forEach((b) => b.onclick = () => {
+    b.previousElementSibling.classList.toggle("expanded");
+    clampGrids(results);
+  });
+  clampGrids(results);
+  // the hash routes pages: jump links scroll instead of navigating
+  results.querySelectorAll("[data-jump]").forEach((a) => a.onclick = (e) => {
+    e.preventDefault();
+    const sec = document.getElementById(a.dataset.jump);
+    sec.open = true;
+    sec.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  });
   const more = document.getElementById("load-more");
   if (more) more.onclick = async () => {
     more.disabled = true;
@@ -578,9 +684,11 @@ function bindPromptToolbar() {
   bar.querySelectorAll("[data-layout]").forEach((b) => b.onclick = () => {
     listState.layout = b.dataset.layout; savePromptPrefs(); rerenderToolbar(); renderPrompts();
   });
-  bar.querySelector("#prompt-sort").onchange = (e) => { listState.sort = e.target.value; renderPrompts(); };
-  const groupBy = bar.querySelector("#prompt-groupby");
-  if (groupBy) groupBy.onchange = (e) => { listState.groupBy = e.target.value; savePromptPrefs(); renderPrompts({ reload: false }); };
+  const sort = bar.querySelector("#prompt-sort");
+  if (sort) sort.onchange = (e) => { listState.sort = e.target.value; renderPrompts(); };
+  bar.querySelectorAll("[data-set-order]").forEach((b) => b.onclick = () => {
+    listState.order = b.dataset.setOrder; rerenderToolbar(); renderPrompts({ reload: false });
+  });
 }
 
 // pill menus close when clicking elsewhere or pressing Escape, like native menus
@@ -1180,6 +1288,10 @@ async function viewSetup() {
         <span class="muted">Without the hook the dashboard re-scans every ${settings.auto_ingest_interval}s while it runs. The hook imports right after each Claude answer.
         It adds this command to <code>${esc(st.claude_settings_path)}</code> (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.hook_command)}</code></div>
         <div><button class="btn" id="hook">${st.hook_installed ? "Remove hook" : "Install hook"}</button></div></div>
+      <div class="setup-row"><div class="${ok(st.autostart.enabled)}"><strong>Start at login</strong><br>
+        <span class="muted">Starts the dashboard in the background when you log in, with an icon in the status bar to open it, import, or quit.
+        It writes <code>${esc(st.autostart.file)}</code>. To start it now without a terminal: <code>uv run rerunly start</code>.</span></div>
+        <div><button class="btn" id="autostart">${st.autostart.enabled ? "Don't start at login" : "Start at login"}</button></div></div>
       <div class="setup-row"><div class="${ok(retentionOk)}"><strong>Transcript retention</strong><br>
         <span class="muted">Claude Code deletes transcripts older than <code>cleanupPeriodDays</code> (default 30). Imported prompts stay in the dashboard database,
         but a longer retention lets you re-import with new prices or rules. Current: ${st.cleanup_period_days ?? "not set (30 days)"}.</span></div>
@@ -1224,6 +1336,9 @@ async function viewSetup() {
         !confirm(`This replaces your current values:\n${conflicts.map(([k, v]) => `${k}=${v}`).join("\n")}`)) return;
     await api("/api/setup/telemetry", { method: "POST", body: { enable: !st.telemetry.configured } });
     viewSetup();
+  });
+  document.getElementById("autostart").onclick = (e) => busy(e.target, async () => {
+    await api("/api/setup/autostart", { method: "POST", body: { enable: !st.autostart.enabled } }); viewSetup();
   });
   document.getElementById("retention").onclick = (e) => busy(e.target, async () => { await api("/api/setup/retention", { method: "POST", body: { days: 3650 } }); viewSetup(); });
   document.getElementById("settings").onsubmit = async (e) => {

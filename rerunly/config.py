@@ -3,10 +3,18 @@ from pathlib import Path
 
 from .pricing import DEFAULT_PRICES
 
-DEFAULT_DB_PATH = Path(
-    os.environ.get("AGENT_DASHBOARD_DB", Path.home() / ".local/share/agent-dashboard/dashboard.db")
-)
+DATA_DIR = Path.home() / ".local/share/rerunly"
+LEGACY_DATA_DIR = Path.home() / ".local/share/agent-dashboard"  # Rerunly's folder before the rename
+DEFAULT_DB_PATH = Path(os.environ.get("RERUNLY_DB") or os.environ.get("AGENT_DASHBOARD_DB") or DATA_DIR / "dashboard.db")
 DEFAULT_PORT = 8765
+
+
+def migrate_legacy_data() -> bool:
+    """Move the data kept under the tool's former name (agent-dashboard) to Rerunly's folder, once."""
+    if LEGACY_DATA_DIR.is_dir() and not DATA_DIR.exists():
+        LEGACY_DATA_DIR.rename(DATA_DIR)
+        return True
+    return False
 
 # Settings stored in the database, editable from the Setup page.
 DEFAULT_SETTINGS = {

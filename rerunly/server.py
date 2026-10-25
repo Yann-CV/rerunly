@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 import shutil
 import threading
@@ -9,16 +10,26 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, otel
+from . import background as bg, db, otel
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .ingest import apply_rules, ingest
 from .tagging import rule_matches, similarity
 
 STATIC = Path(__file__).parent / "static"
 CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
-HOOK_MARKER = "agent-dashboard"
+HOOK_MARKER = "rerunly"
+LEGACY_HOOK_MARKERS = ("agent-dashboard",)  # hooks installed before the rename to Rerunly
 COMPARE_SCOPES = ("similar", "tag", "similar_tag")
 SPARK_POINTS = 24
+
+
+class FreshStaticFiles(StaticFiles):
+    """Browsers revalidate every load (cheap 304s via ETag), so an update shows on the next reload."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def _tag(tag: str, auto: int) -> dict:
@@ -62,7 +73,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             try:
                 run_ingest()
             except Exception as e:  # keep the server alive on a malformed transcript
-                print(f"[agent-dashboard] ingestion failed: {e}")
+                print(f"[rerunly] ingestion failed: {e}")
             c = conn()
             interval = db.get_settings(c)["auto_ingest_interval"]
             c.close()
@@ -75,12 +86,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         yield
         stop.set()
 
-    app = FastAPI(title="Agent Task Dashboard", lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app = FastAPI(title="Rerunly", lifespan=lifespan)
+    app.mount("/static", FreshStaticFiles(directory=STATIC), name="static")
 
     @app.get("/")
     def index():
-        return FileResponse(STATIC / "index.html")
+        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
     # ---- ingestion & settings -------------------------------------------------
 
@@ -127,8 +138,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         CLAUDE_SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
 
+    def is_ours(hook) -> bool:
+        return any(m in json.dumps(hook) for m in (HOOK_MARKER, *LEGACY_HOOK_MARKERS))
+
     def hook_installed(cs: dict) -> bool:
-        return HOOK_MARKER in json.dumps(cs.get("hooks", {}).get("Stop", []))
+        return any(is_ours(h) for h in cs.get("hooks", {}).get("Stop", []))
 
     @app.get("/api/setup/status")
     def setup_status():
@@ -167,6 +181,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "claude_settings_path": str(CLAUDE_SETTINGS),
             "cleanup_period_days": cs.get("cleanupPeriodDays"),
             "hook_installed": hook_installed(cs),
+            "autostart": {"enabled": bg.autostart_enabled(), "file": str(bg.autostart_file())},
             "hook_command": hook_command(),
             "db_path": str(db_path),
             "sessions": counts["s"],
@@ -180,7 +195,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     def install_hook(install: bool = True):
         cs = read_claude_settings()
         stop_hooks = [
-            h for h in cs.setdefault("hooks", {}).get("Stop", []) if HOOK_MARKER not in json.dumps(h)
+            h for h in cs.setdefault("hooks", {}).get("Stop", []) if not is_ours(h)  # replaces a pre-rename hook too
         ]
         if install:
             stop_hooks.append({"hooks": [{"type": "command", "command": hook_command()}]})
@@ -205,6 +220,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if not env:
             cs.pop("env")
         write_claude_settings(cs)
+        return setup_status()
+
+    @app.post("/api/setup/autostart")
+    def setup_autostart(enable: bool = Body(..., embed=True)):
+        bg.set_autostart(enable, db_path, port)
         return setup_status()
 
     @app.post("/api/setup/retention")
@@ -504,7 +524,20 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     return app
 
 
-def serve(db_path: Path, host: str, port: int) -> None:
+def reload_app() -> FastAPI:
+    """App factory for `--reload`: the reloader re-imports the code, so settings come from the environment."""
+    return create_app(Path(os.environ["RERUNLY_DB"]), int(os.environ["RERUNLY_PORT"]))
+
+
+def serve(db_path: Path, host: str, port: int, reload: bool = False) -> None:
     import uvicorn
 
-    uvicorn.run(create_app(db_path, port), host=host, port=port, log_level="warning")
+    if not reload:
+        uvicorn.run(create_app(db_path, port), host=host, port=port, log_level="warning")
+        return
+    # restart on Python changes; static files are sent with no-cache, so a page refresh shows UI changes
+    os.environ.update(RERUNLY_DB=str(db_path), RERUNLY_PORT=str(port))
+    uvicorn.run(
+        "rerunly.server:reload_app", factory=True, host=host, port=port, log_level="warning",
+        reload=True, reload_dirs=[str(Path(__file__).parent)],
+    )
