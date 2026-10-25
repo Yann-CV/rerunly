@@ -48,9 +48,24 @@ def rule_matches(rule: dict, text: str) -> bool:
     return False
 
 
-def rule_tags(text: str, rules: list[dict]) -> set[str]:
-    """Human tags given by the user's auto-tag rules."""
-    return {r["tag"] for r in rules if r.get("tag") and rule_matches(r, text)}
+def rule_scope(rule: dict) -> str:
+    """"prompt" rules tag each matching prompt; "session" rules tag every prompt of a session whose
+    title or prompts match."""
+    return "session" if rule.get("scope") == "session" else "prompt"
+
+
+def split_any(rule: dict) -> list[dict]:
+    """A keyword rule matching "any" of several keywords, as one rule per keyword: they tag the same
+    prompts, and each keyword can then be shown, changed or removed on its own."""
+    keywords = rule.get("keywords") or []
+    if rule.get("match") != "any" or len(keywords) < 2:
+        return [rule]
+    return [{**rule, "keywords": [k], "match": "all"} for k in keywords]
+
+
+def rule_tags(text: str, rules: list[dict], scope: str = "prompt") -> set[str]:
+    """Human tags given by the user's auto-tag rules of `scope` to a prompt's (or a session's) text."""
+    return {r["tag"] for r in rules if r.get("tag") and rule_scope(r) == scope and rule_matches(r, text)}
 
 
 def words(text: str) -> set[str]:

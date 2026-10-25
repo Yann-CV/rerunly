@@ -78,11 +78,12 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
 
--- When the user created a human tag (by hand or with keywords). AI tags have no row: their
--- creation date is their first prompt's.
+-- When the user created a human tag (by hand or with keywords), and what it is for. AI tags have
+-- no row: their creation date is their first prompt's.
 CREATE TABLE IF NOT EXISTS tag_meta (
     tag TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    description TEXT
 );
 
 -- One row per `claude_code.api_request` OpenTelemetry event: Claude Code's own cost figures.
@@ -123,7 +124,7 @@ def connect(path: Path) -> sqlite3.Connection:
 
 # Columns added after the first release: (table, column, type). Appended at the end of the
 # table, so inserts listing values in table order keep working.
-ADDED_COLUMNS = [("agents", "persona", "TEXT"), ("agents", "skill", "TEXT")]
+ADDED_COLUMNS = [("agents", "persona", "TEXT"), ("agents", "skill", "TEXT"), ("tag_meta", "description", "TEXT")]
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

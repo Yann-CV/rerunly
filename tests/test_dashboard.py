@@ -215,6 +215,31 @@ def test_keyword_tags(client):
     assert {p["id"] for p in client.get("/api/tags/task:flaky/prompts").json()} == {"prompt-1"}
 
 
+def test_create_tag(client):
+    r = client.post("/api/tags", json={"tag": "task:release", "description": "Ship a version", "keywords": ["release"]})
+    assert r.json() == {"tag": "task:release", "prompts": 1}
+    assert client.post("/api/tags", json={"tag": "task:release"}).status_code == 409
+    # no keywords: listed with no prompt yet
+    client.post("/api/tags", json={"tag": "task:later", "description": "Not started"})
+    tags = {t["tag"]: t for t in client.get("/api/tags").json()}
+    assert tags["task:release"]["description"] == "Ship a version" and tags["task:release"]["prompts"] == 1
+    assert tags["task:later"]["prompts"] == 0 and tags["task:later"]["kind"] == "human"
+    client.put("/api/tags/task:later/description", json={"description": "Soon"})
+    assert {t["tag"]: t for t in client.get("/api/tags").json()}["task:later"]["description"] == "Soon"
+
+
+def test_session_rule(client):
+    # "release" is only in the last prompt, "Flaky" only in the title: a session rule sees both
+    assert client.get("/api/rules/preview", params={"keywords": "flaky,release", "scope": "session"}).json() == {"matches": 1}
+    assert client.get("/api/rules/preview", params={"keywords": "flaky,release"}).json() == {"matches": 0}
+    client.post("/api/tags", json={"tag": "task:session", "keywords": ["release notes"], "scope": "session"})
+    assert {p["id"] for p in client.get("/api/tags/task:session/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    [rule] = client.get("/api/tags/task:session/rules").json()
+    assert rule["scope"] == "session"
+    assert client.post("/api/tags", json={"tag": "x", "keywords": ["a"], "scope": "nope"}).status_code == 400
+    assert "x" not in {t["tag"] for t in client.get("/api/tags").json()}
+
+
 def test_official_cost(client):
     estimate = client.get("/api/prompts/prompt-1").json()["total_cost_usd"]
     # prompt-1 made 2 API calls: one telemetry event does not cover it, the estimate stays
@@ -252,6 +277,18 @@ def test_session(client):
     assert "persona:senior security reviewer" in tags
 
 
+def test_session_filters(client):
+    data = client.get("/api/sessions").json()
+    assert data["summary"]["count"] == 1 and data["summary"]["prompts"] == 3
+    assert data["items"][0]["first_prompt"].startswith("fix the flaky test")
+    assert data["highlights"]["cost"]["id"] == SESSION
+    assert client.get("/api/sessions", params={"q": "release notes"}).json()["total"] == 1
+    assert client.get("/api/sessions", params={"q": "Flaky"}).json()["total"] == 1  # the title
+    assert client.get("/api/sessions", params={"q": "nothing like it"}).json()["total"] == 0
+    assert client.get("/api/sessions", params={"since": "2026-10-02T00:00:00Z"}).json()["total"] == 0
+    assert client.get("/api/sessions", params={"sort": "nope"}).status_code == 400
+
+
 def test_prompt_filters(client):
     data = client.get("/api/prompts", params={"since": "2026-10-02T00:00:00Z"}).json()
     assert [p["id"] for p in data["items"]] == ["prompt-4", "prompt-3"]
@@ -261,6 +298,38 @@ def test_prompt_filters(client):
     costs = [p["total_cost_usd"] for p in by_cost]
     assert costs == sorted(costs, reverse=True) and len(costs) == 3
     assert client.get("/api/prompts", params={"sort": "nope"}).status_code == 400
+
+
+def test_overview(client):
+    client.post("/api/prompts/prompt-4/tags", json={"tag": "task:release"})
+    o = client.get("/api/overview").json()
+    prompts = client.get("/api/prompts", params={"sort": "cost"}).json()
+    assert o["totals"]["prompts"] == 3 and o["totals"]["sessions"] == 1
+    assert o["totals"]["cost_usd"] == pytest.approx(prompts["summary"]["cost_usd"])
+    assert o["priciest"]["id"] == prompts["items"][0]["id"] and o["priciest"]["tags"]
+    assert o["repeated"] is None and o["priciest_repeated"] is None  # no prompt text was typed twice
+    kinds = {t["tag"]: t["kind"] for t in o["tags"]}
+    assert kinds["task:release"] == "human" and kinds["project:repo"] == "ai"
+    later = client.get("/api/overview", params={"since": "2026-10-03T00:00:00Z"}).json()
+    assert later["totals"]["prompts"] == 1 and later["priciest"]["id"] == "prompt-4"
+    assert {t["tag"] for t in later["tags"]} >= {"task:release"}
+    tagged = client.get("/api/overview", params={"tag": "task:release", "q": "release"}).json()
+    assert tagged["totals"]["prompts"] == 1 and tagged["priciest"]["id"] == "prompt-4"
+    assert client.get("/api/overview", params={"project": "nope"}).json()["priciest"] is None
+
+
+def test_overview_repeated_prompt(projects, tmp_path, monkeypatch):
+    path = next(projects.glob("*/*.jsonl"))
+    lines = path.read_text().splitlines()
+    lines.append(json.dumps(user("p5", "2026-10-04T10:00:00Z", "Write the release notes ", "prompt-5")))
+    lines.append(json.dumps(assistant("m5", "2026-10-04T10:00:04Z", [{"type": "text", "text": "done"}], USAGE)))
+    path.write_text("\n".join(lines) + "\n")
+    conn = db.connect(tmp_path / "r.db")
+    db.save_settings(conn, {"claude_projects_dir": str(projects)})
+    ingest(conn)
+    o = TestClient(create_app(tmp_path / "r.db", background=False)).get("/api/overview").json()
+    assert o["repeated"]["runs"] == 2 and o["repeated"]["id"] == "prompt-5"
+    assert o["priciest_repeated"] == o["repeated"]  # the only repeated text
 
 
 def test_static_files_are_revalidated(tmp_path):
@@ -290,3 +359,94 @@ def test_hook_from_before_the_rename_is_replaced(tmp_path, monkeypatch):
     client.post("/api/setup/hook?install=true")
     stop = json.loads(settings.read_text())["hooks"]["Stop"]
     assert len(stop) == 1 and "# rerunly" in stop[0]["hooks"][0]["command"]
+
+
+def test_tag_with_several_rules(client):
+    rules = [
+        {"keywords": ["release"]},  # one keyword alone
+        {"keywords": ["flaky", "test"], "match": "all"},  # several together
+        {"keywords": ["Flaky"], "scope": "session"},
+        {"keywords": [" "]},  # empty: ignored
+    ]
+    client.post("/api/tags", json={"tag": "task:multi", "rules": rules})
+    got = client.get("/api/tags/task:multi/rules").json()
+    assert [(r["keywords"], r.get("scope", "prompt")) for r in got] == [
+        (["release"], "prompt"), (["flaky", "test"], "prompt"), (["Flaky"], "session")]
+    assert {p["id"] for p in client.get("/api/tags/task:multi/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    # update the session rule into a prompt rule matching nothing
+    session_rule = got[2]["index"]
+    updated = client.put(f"/api/tags/task:multi/rules/{session_rule}", json={"keywords": ["nowhere"]}).json()
+    assert [r["keywords"] for r in updated] == [["release"], ["flaky", "test"], ["nowhere"]]
+    assert {p["id"] for p in client.get("/api/tags/task:multi/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    client.put(f"/api/tags/task:multi/rules/{got[0]['index']}", json={"keywords": ["nope"]})
+    assert {p["id"] for p in client.get("/api/tags/task:multi/prompts").json()} == {"prompt-1", "prompt-3"}
+    assert client.put(f"/api/tags/task:multi/rules/{session_rule}", json={"keywords": []}).status_code == 400
+    assert client.put("/api/tags/task:other/rules/0", json={"keywords": ["x"]}).status_code == 404
+    bad = client.post("/api/tags", json={"tag": "task:bad", "rules": [{"keywords": ["a"]}, {"keywords": ["b"], "match": "x"}]})
+    assert bad.status_code == 400 and "task:bad" not in {t["tag"] for t in client.get("/api/tags").json()}
+
+
+def test_any_rules_are_split(client, tmp_path):
+    client.post("/api/tags", json={"tag": "task:any", "rules": [{"keywords": ["release", "flaky"], "match": "any", "scope": "session"}]})
+    rules = client.get("/api/tags/task:any/rules").json()
+    assert [(r["keywords"], r["match"], r["scope"]) for r in rules] == [(["flaky"], "all", "session"), (["release"], "all", "session")]
+    # updating one rule into "any" of two keywords: two rules in its place
+    client.put(f"/api/tags/task:any/rules/{rules[0]['index']}", json={"keywords": ["notes", "test"], "match": "any"})
+    assert [r["keywords"] for r in client.get("/api/tags/task:any/rules").json()] == [["notes"], ["test"], ["release"]]
+    # rules saved before the split are split when the app starts, tagging the same prompts
+    conn = db.connect(tmp_path / "d.db")
+    db.save_settings(conn, {"tag_rules": [{"tag": "task:old", "keywords": ["release", "flaky"], "match": "any"}]})
+    restarted = TestClient(create_app(tmp_path / "d.db", background=False))
+    assert [r["keywords"] for r in restarted.get("/api/tags/task:old/rules").json()] == [["release"], ["flaky"]]  # saved order
+    assert {p["id"] for p in restarted.get("/api/tags/task:old/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    # a part the tag already has is not added twice
+    rules = restarted.get("/api/tags/task:old/rules").json()
+    restarted.put(f"/api/tags/task:old/rules/{rules[1]['index']}", json={"keywords": ["release", "notes"], "match": "any"})
+    assert [r["keywords"] for r in restarted.get("/api/tags/task:old/rules").json()] == [["release"], ["notes"]]
+
+
+def test_skill_rules(client):
+    # prompt-3 is the only prompt where the agent used review-skill
+    assert client.get("/api/rules/preview", params={"skill": "review-skill"}).json() == {"matches": 1}
+    assert client.get("/api/rules/preview", params={"skill": "review-skill", "scope": "session"}).json() == {"matches": 1}
+    client.post("/api/tags", json={"tag": "task:review", "rules": [{"skill": "skill:review-skill"}]})
+    [rule] = client.get("/api/tags/task:review/rules").json()
+    assert rule["skill"] == "review-skill" and "keywords" not in rule
+    assert {p["id"] for p in client.get("/api/tags/task:review/prompts").json()} == {"prompt-3"}
+    # session scope: every prompt of the session where it was used
+    client.put(f"/api/tags/task:review/rules/{rule['index']}", json={"skill": "review-skill", "scope": "session"})
+    assert {p["id"] for p in client.get("/api/tags/task:review/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    # a skill and keywords on one tag: separate rules
+    client.post("/api/tags/task:review/rules", json={"keywords": ["release"]})
+    assert len(client.get("/api/tags/task:review/rules").json()) == 2
+    assert client.post("/api/tags/task:review/rules", json={}).status_code == 200  # nothing to add
+    assert client.put(f"/api/tags/task:review/rules/{rule['index']}", json={}).status_code == 400
+
+
+def test_tag_selected_prompts(client):
+    r = client.post("/api/tags/task:picked/prompts", json={"prompt_ids": ["prompt-1", "prompt-4", "nope"]})
+    assert r.json() == {"tag": "task:picked", "tagged": 2}
+    assert {p["id"] for p in client.get("/api/tags/task:picked/prompts").json()} == {"prompt-1", "prompt-4"}
+    [tag] = [t for t in client.get("/api/prompts/prompt-4").json()["tags"] if t["tag"] == "task:picked"]
+    assert tag["kind"] == "human" and not tag["from_rule"]  # by hand: removable from the prompt
+    assert {t["tag"]: t["kind"] for t in client.get("/api/tags").json()}["task:picked"] == "human"
+
+
+def test_delete_tag(client):
+    client.post("/api/tags", json={"tag": "task:gone", "description": "x", "rules": [{"keywords": ["release"]}]})
+    client.post("/api/tags/task:gone/prompts", json={"prompt_ids": ["prompt-1"]})
+    before = client.get("/api/prompts").json()["total"]
+    assert client.delete("/api/tags/task:gone").json() == {"tag": "task:gone", "prompts": 2, "rules": 1}
+    # only the tag goes: every prompt it was on is still there, with its other tags
+    assert client.get("/api/prompts").json()["total"] == before
+    assert {t["tag"] for t in client.get("/api/prompts/prompt-1").json()["tags"]} >= {"project:repo"}
+    assert "task:gone" not in {t["tag"] for t in client.get("/api/tags").json()}
+    assert client.get("/api/tags/task:gone/rules").json() == []
+    # the rule is gone too: a new import does not bring the tag back
+    client.post("/api/ingest", params={"force": True})
+    assert "task:gone" not in {t["tag"] for t in client.get("/api/tags").json()}
+    # rule routes still reach their handler, AI tags stay
+    client.post("/api/tags", json={"tag": "task:kept", "rules": [{"keywords": ["release"]}]})
+    assert client.delete("/api/tags/task:kept/rules/0").status_code == 200
+    assert client.delete("/api/tags/project:repo").status_code == 400
+    assert client.delete("/api/tags/task:never").status_code == 404

@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import background as bg, db, otel
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
-from .ingest import apply_rules, ingest
-from .tagging import rule_matches, similarity
+from .ingest import apply_rules, ingest, session_texts
+from .tagging import rule_matches, rule_scope, similarity, split_any
 
 STATIC = Path(__file__).parent / "static"
 CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
@@ -37,10 +37,10 @@ def _tag(tag: str, auto: int) -> dict:
     return {"tag": tag, "kind": "ai" if auto == 1 else "human", "from_rule": auto == 2}
 
 
-def _record_creation(c, tag: str) -> None:
+def _record_creation(c, tag: str, description: str | None = None) -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     with c:
-        c.execute("INSERT OR IGNORE INTO tag_meta(tag, created_at) VALUES (?, ?)", (tag, now))
+        c.execute("INSERT OR IGNORE INTO tag_meta(tag, created_at, description) VALUES (?, ?, ?)", (tag, now, description))
 
 
 def _row(r) -> dict:
@@ -59,6 +59,17 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         c = db.connect(db_path)
         db.create_prompt_view(c, db.get_settings(c)["cost_source"] == "claude-code")
         return c
+
+    def split_any_rules() -> None:
+        """Rules saved before "any" rules were split: split them once (they tag the same prompts)."""
+        c = conn()
+        rules = db.get_settings(c)["tag_rules"]
+        split = [part for r in rules for part in split_any(r)]
+        if split != rules:
+            db.save_settings(c, {"tag_rules": split})
+            apply_rules(c, split)
+
+    split_any_rules()
 
     def run_ingest(force: bool = False) -> dict:
         with ingest_lock:
@@ -178,6 +189,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "projects_dir": str(projects),
             "projects_dir_exists": projects.is_dir(),
             "transcript_count": len(list(projects.glob("*/*.jsonl"))) if projects.is_dir() else 0,
+            # the connected agent: the page names it here only, the rest of the UI stays agent-neutral
+            "agent": "Claude Code",
             "claude_settings_path": str(CLAUDE_SETTINGS),
             "cleanup_period_days": cs.get("cleanupPeriodDays"),
             "hook_installed": hook_installed(cs),
@@ -272,15 +285,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         "tokens": "p.total_tokens DESC",
     }
 
-    @app.get("/api/prompts")
-    def list_prompts(
-        q: str = "", tag: str = "", project: str = "", since: str = "", sort: str = "recent",
-        limit: int = 100, offset: int = 0,
-    ):
-        """Prompts matching the filters, plus `summary`: totals over all of them (not just this page)."""
-        if sort not in PROMPT_SORTS:
-            raise HTTPException(400, f"sort must be one of {list(PROMPT_SORTS)}")
-        c = conn()
+    def prompt_filters(q: str, tag: str, project: str, since: str) -> tuple[str, list]:
+        """WHERE clause (or "") over the prompts view `p` shared by the prompt list and the overview."""
         where, args = [], []
         if since:
             where.append("p.started_at >= ?")
@@ -294,9 +300,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if tag:
             where.append("p.id IN (SELECT prompt_id FROM tags WHERE tag = ?)")
             args.append(tag)
-        sql = f"SELECT {LIST_COLS} FROM pv p"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
+        return ("WHERE " + " AND ".join(where) if where else ""), args
+
+    @app.get("/api/prompts")
+    def list_prompts(
+        q: str = "", tag: str = "", project: str = "", since: str = "", sort: str = "recent",
+        limit: int = 100, offset: int = 0,
+    ):
+        """Prompts matching the filters, plus `summary`: totals over all of them (not just this page)."""
+        if sort not in PROMPT_SORTS:
+            raise HTTPException(400, f"sort must be one of {list(PROMPT_SORTS)}")
+        c = conn()
+        where, args = prompt_filters(q, tag, project, since)
+        sql = f"SELECT {LIST_COLS} FROM pv p {where}"
         summary = dict(c.execute(
             "SELECT COUNT(*) count, SUM(total_cost_usd) cost_usd, SUM(total_tokens) tokens, "
             f"SUM(COALESCE(active_ms, wall_ms)) duration_ms, MAX(total_cost_usd) max_cost_usd FROM ({sql})",
@@ -346,19 +362,40 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         prompt["similar"] = compared
         return prompt
 
-    def add_rule(c, tag: str, keywords: list[str], match: str) -> None:
-        """Keyword rule tagging every matching prompt, past and future, with the human tag `tag`."""
+    def make_rules(
+        tag: str, keywords: list[str], match: str = "all", scope: str = "prompt", skill: str = "",
+    ) -> list[dict]:
+        """Rule tagging, past and future, with the human tag `tag` every prompt (or every prompt of a session)
+        containing the keywords, or where the agent used `skill`: one rule, one per keyword with "any", none
+        without keywords or skill."""
         keywords = sorted({k.strip() for k in keywords if k.strip()}, key=str.lower)
-        if not keywords:
-            return
+        skill = skill.strip().removeprefix("skill:")
         if match not in ("all", "any"):
             raise HTTPException(400, "match must be 'all' or 'any'")
-        settings = db.get_settings(c)
+        if scope not in ("prompt", "session"):
+            raise HTTPException(400, "scope must be 'prompt' or 'session'")
+        if skill:
+            rule = {"tag": tag, "skill": skill}
+            if scope == "session":
+                rule["scope"] = "session"
+            return [rule]
+        if not keywords:
+            return []
         rule = {"tag": tag, "keywords": keywords, "match": match}
+        if scope == "session":  # prompt rules keep their original shape
+            rule["scope"] = "session"
+        return split_any(rule)
+
+    def add_rules(c, tag: str, rules: list[dict]) -> None:
+        settings = db.get_settings(c)
+        new = [r for r in rules if r not in settings["tag_rules"]]
         _record_creation(c, tag)
-        if rule not in settings["tag_rules"]:
-            db.save_settings(c, {"tag_rules": [*settings["tag_rules"], rule]})
-        apply_rules(c, db.get_settings(c)["tag_rules"])
+        if new:
+            db.save_settings(c, {"tag_rules": [*settings["tag_rules"], *new]})
+            apply_rules(c, db.get_settings(c)["tag_rules"])
+
+    def add_rule(c, tag: str, keywords: list[str], match: str, scope: str = "prompt") -> None:
+        add_rules(c, tag, make_rules(tag, keywords, match, scope))
 
     @app.post("/api/prompts/{prompt_id}/tags")
     def add_tag(
@@ -366,8 +403,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         tag: str = Body(..., embed=True),
         keywords: list[str] = Body([], embed=True),
         match: str = Body("all", embed=True),
+        scope: str = Body("prompt", embed=True),
     ):
-        """Add a human tag; with `keywords`, also tag every prompt containing all (or any) of them."""
+        """Add a human tag; with `keywords`, also tag every prompt (or session) containing all (or any) of them."""
         tag = tag.strip()
         if not tag:
             raise HTTPException(400, "empty tag")
@@ -378,15 +416,57 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "INSERT INTO tags(prompt_id, tag, auto) VALUES (?,?,0) ON CONFLICT DO UPDATE SET auto=0",
                 (prompt_id, tag),
             )
-        add_rule(c, tag, keywords, match)
+        add_rule(c, tag, keywords, match, scope)
         return tags_for(c, [prompt_id])[prompt_id]
 
     @app.get("/api/rules/preview")
-    def preview_rule(keywords: str, match: str = "all"):
-        """How many prompts a keyword rule would tag (`keywords` is comma-separated)."""
+    def preview_rule(keywords: str = "", match: str = "all", scope: str = "prompt", skill: str = ""):
+        """How many prompts (or sessions, with scope=session) a keyword rule (`keywords` comma-separated)
+        or a skill rule would tag."""
         c = conn()
+        if skill:
+            used = "SELECT prompt_id FROM tags WHERE tag = ? AND auto = 1"
+            what = "COUNT(DISTINCT session_id)" if scope == "session" else "COUNT(*)"
+            n = c.execute(f"SELECT {what} FROM prompts WHERE id IN ({used})", (f"skill:{skill.removeprefix('skill:')}",)).fetchone()[0]
+            return {"matches": n}
         rule = {"keywords": keywords.split(","), "match": match}
+        if scope == "session":
+            return {"matches": sum(rule_matches(rule, text) for _, text in session_texts(c))}
         return {"matches": sum(rule_matches(rule, r[0]) for r in c.execute("SELECT text FROM prompts"))}
+
+    @app.post("/api/tags")
+    def create_tag(
+        tag: str = Body(..., embed=True),
+        description: str = Body("", embed=True),
+        keywords: list[str] = Body([], embed=True),
+        match: str = Body("all", embed=True),
+        scope: str = Body("prompt", embed=True),
+        rules: list[dict] = Body([], embed=True),
+    ):
+        """A new human tag, before any prompt carries it. Each of `rules` ({keywords, match, scope}, or the
+        single `keywords`/`match`/`scope`) tags the prompts or sessions it matches."""
+        tag = tag.strip()
+        if not tag:
+            raise HTTPException(400, "empty tag")
+        c = conn()
+        if c.execute("SELECT 1 FROM tag_meta WHERE tag = ? UNION SELECT 1 FROM tags WHERE tag = ?", (tag, tag)).fetchone():
+            raise HTTPException(409, f"the tag {tag} already exists")
+        # validate every rule before saving anything
+        made = make_rules(tag, keywords, match, scope) + [
+            part for r in rules
+            for part in make_rules(tag, r.get("keywords") or [], r.get("match", "all"), r.get("scope", "prompt"), r.get("skill") or "")
+        ]
+        _record_creation(c, tag, description.strip() or None)
+        add_rules(c, tag, made)
+        return {"tag": tag, "prompts": c.execute("SELECT COUNT(*) FROM tags WHERE tag = ?", (tag,)).fetchone()[0]}
+
+    @app.put("/api/tags/{tag:path}/description")
+    def set_tag_description(tag: str, description: str = Body(..., embed=True)):
+        c = conn()
+        _record_creation(c, tag)
+        with c:
+            c.execute("UPDATE tag_meta SET description = ? WHERE tag = ?", (description.strip() or None, tag))
+        return {"tag": tag, "description": description.strip() or None}
 
     @app.get("/api/tags/{tag:path}/rules")
     def tag_rules(tag: str):
@@ -394,9 +474,31 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return [{**r, "index": i} for i, r in enumerate(db.get_settings(c)["tag_rules"]) if r.get("tag") == tag]
 
     @app.post("/api/tags/{tag:path}/rules")
-    def add_tag_rule(tag: str, keywords: list[str] = Body(..., embed=True), match: str = Body("all", embed=True)):
+    def add_tag_rule(
+        tag: str, keywords: list[str] = Body([], embed=True), match: str = Body("all", embed=True),
+        scope: str = Body("prompt", embed=True), skill: str = Body("", embed=True),
+    ):
         c = conn()
-        add_rule(c, tag, keywords, match)
+        add_rules(c, tag, make_rules(tag, keywords, match, scope, skill))
+        return tag_rules(tag)
+
+    @app.put("/api/tags/{tag:path}/rules/{index}")
+    def update_tag_rule(
+        tag: str, index: int, keywords: list[str] = Body([], embed=True), match: str = Body("all", embed=True),
+        scope: str = Body("prompt", embed=True), skill: str = Body("", embed=True),
+    ):
+        c = conn()
+        rules = db.get_settings(c)["tag_rules"]
+        if not 0 <= index < len(rules) or rules[index].get("tag") != tag:
+            raise HTTPException(404)
+        made = make_rules(tag, keywords, match, scope, skill)
+        if not made:
+            raise HTTPException(400, "a rule needs at least one keyword, or a skill")
+        others = rules[:index] + rules[index + 1:]
+        # "any" of several keywords becomes one rule each, in its place, skipping rules the tag already has
+        rules[index:index + 1] = [r for r in made if r not in others]
+        db.save_settings(c, {"tag_rules": rules})
+        apply_rules(c, rules)
         return tag_rules(tag)
 
     @app.delete("/api/tags/{tag:path}/rules/{index}")
@@ -433,8 +535,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "SELECT t.tag, p.total_cost_usd FROM tags t JOIN pv p ON p.id = t.prompt_id ORDER BY p.started_at"
         ):
             history.setdefault(tag, []).append(round(cost or 0, 4))
-        return [
-            {**dict(r), "spark": history.get(r["tag"], [])[-SPARK_POINTS:]}
+        described = {r[0]: (r[1], r[2]) for r in c.execute("SELECT tag, created_at, description FROM tag_meta")}
+        out = [
+            {**dict(r), "description": described.get(r["tag"], (None, None))[1], "spark": history.get(r["tag"], [])[-SPARK_POINTS:]}
             for r in c.execute(
                 "SELECT t.tag, CASE WHEN MIN(t.auto = 1) = 0 THEN 'human' ELSE 'ai' END kind, COUNT(*) prompts, SUM(p.total_cost_usd) cost_usd, AVG(p.total_cost_usd) avg_cost_usd, "
                 "AVG(p.total_tokens) avg_tokens, AVG(p.wall_ms) avg_wall_ms, MAX(p.started_at) last_used, "
@@ -444,6 +547,30 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "FROM tags t JOIN pv p ON p.id = t.prompt_id GROUP BY t.tag ORDER BY kind DESC, last_used DESC"
             )
         ]
+        # tags created on the Tags page that no prompt carries yet
+        used = {t["tag"] for t in out}
+        out += [
+            {"tag": tag, "kind": "human", "prompts": 0, "cost_usd": 0, "avg_cost_usd": None, "avg_tokens": None,
+             "avg_wall_ms": None, "last_used": None, "first_used": None, "created_at": created, "description": desc, "spark": []}
+            for tag, (created, desc) in described.items() if tag not in used
+        ]
+        return out
+
+    @app.post("/api/tags/{tag:path}/prompts")
+    def tag_some_prompts(tag: str, prompt_ids: list[str] = Body(..., embed=True)):
+        """Give the human tag `tag` by hand to every prompt of `prompt_ids` (a selection on a tag page)."""
+        tag = tag.strip()
+        if not tag:
+            raise HTTPException(400, "empty tag")
+        c = conn()
+        known = {r[0] for r in c.execute(f"SELECT id FROM prompts WHERE id IN ({','.join('?' * len(prompt_ids))})", prompt_ids)} if prompt_ids else set()
+        _record_creation(c, tag)
+        with c:
+            c.executemany(
+                "INSERT INTO tags(prompt_id, tag, auto) VALUES (?,?,0) ON CONFLICT DO UPDATE SET auto=0",
+                [(i, tag) for i in prompt_ids if i in known],
+            )
+        return {"tag": tag, "tagged": len(known)}
 
     @app.get("/api/tags/{tag:path}/prompts")
     def tag_prompts(tag: str):
@@ -465,14 +592,47 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         "SUM(p.api_ms) api_ms, SUM(p.agent_count) agent_count, SUM(p.api_calls) api_calls, SUM(p.tool_calls) tool_calls"
     )
 
+    SESSION_SORTS = {
+        "recent": "started_at DESC",
+        "cost": "cost_usd DESC",
+        "prompts": "prompts DESC, cost_usd DESC",
+        "duration": "active_ms DESC",
+        "tokens": "total_tokens DESC",
+    }
+
     @app.get("/api/sessions")
-    def list_sessions(project: str = "", limit: int = 100, offset: int = 0):
+    def list_sessions(
+        q: str = "", project: str = "", since: str = "", sort: str = "recent", limit: int = 100, offset: int = 0,
+    ):
+        """Sessions matching the filters (`q` searches titles and prompts; `since` keeps sessions started after it),
+        plus `summary` over all of them and, on the first page, `highlights`: the priciest, busiest and longest."""
+        if sort not in SESSION_SORTS:
+            raise HTTPException(400, f"sort must be one of {list(SESSION_SORTS)}")
         c = conn()
-        where, args = ("WHERE s.project = ?", [project]) if project else ("", [])
-        sql = f"SELECT {SESSION_COLS} FROM sessions s JOIN pv p ON p.session_id = s.id {where} GROUP BY s.id"
-        total = c.execute(f"SELECT COUNT(*) FROM ({sql})", args).fetchone()[0]
-        rows = c.execute(f"{sql} ORDER BY started_at DESC LIMIT ? OFFSET ?", [*args, limit, offset])
-        return {"total": total, "items": [dict(r) for r in rows]}
+        where, args = [], []
+        if project:
+            where.append("s.project = ?")
+            args.append(project)
+        if q:
+            where.append("(s.title LIKE ? OR s.id IN (SELECT session_id FROM prompts WHERE text LIKE ?))")
+            args += [f"%{q}%", f"%{q}%"]
+        sql = (
+            f"SELECT {SESSION_COLS}, (SELECT text FROM prompts f WHERE f.session_id = s.id ORDER BY f.started_at LIMIT 1) first_prompt "
+            f"FROM sessions s JOIN pv p ON p.session_id = s.id {'WHERE ' + ' AND '.join(where) if where else ''} GROUP BY s.id"
+        )
+        if since:
+            sql += " HAVING MIN(p.started_at) >= ?"
+            args.append(since)
+        summary = dict(c.execute(
+            "SELECT COUNT(*) count, SUM(prompts) prompts, SUM(cost_usd) cost_usd, SUM(total_tokens) tokens, "
+            f"SUM(active_ms) active_ms, MAX(cost_usd) max_cost_usd FROM ({sql})",
+            args,
+        ).fetchone())
+        page = lambda order, n, skip=0: [dict(r) for r in c.execute(f"{sql} ORDER BY {order} LIMIT ? OFFSET ?", [*args, n, skip])]
+        out = {"total": summary["count"], "summary": summary, "items": page(SESSION_SORTS[sort], limit, offset)}
+        if offset == 0 and summary["count"]:
+            out["highlights"] = {key: page(SESSION_SORTS[key], 1)[0] for key in ("cost", "prompts", "duration")}
+        return out
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str):
@@ -515,6 +675,70 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         session["agents"] = agents
         session["telemetry"] = telemetry_breakdown(c, "session_id = ?", (session_id,))
         return session
+
+    # ---- overview (home page) ------------------------------------------------------
+
+    @app.get("/api/overview")
+    def overview(q: str = "", tag: str = "", project: str = "", since: str = ""):
+        """Totals, the priciest prompt, the most repeated prompt text, the repeated text costing the most in total
+        and usage per tag, over the prompts matching the same filters as /api/prompts."""
+        c = conn()
+        where, args = prompt_filters(q, tag, project, since)
+        totals = dict(c.execute(
+            "SELECT COUNT(*) prompts, COUNT(DISTINCT p.session_id) sessions, SUM(p.total_cost_usd) cost_usd, "
+            "SUM(p.total_tokens) tokens, SUM(COALESCE(p.active_ms, p.wall_ms)) duration_ms, "
+            f"MIN(p.started_at) first_at, MAX(p.started_at) last_at FROM pv p {where}",
+            args,
+        ).fetchone())
+        r = c.execute(f"SELECT {LIST_COLS} FROM pv p {where} ORDER BY p.total_cost_usd DESC LIMIT 1", args).fetchone()
+        priciest = _row(r) if r else None
+        if priciest:
+            priciest["tags"] = tags_for(c, [priciest["id"]])[priciest["id"]]
+        def top_repeated(order: str) -> dict | None:
+            """Same text typed again (whitespace and case aside); the latest run opens the comparison with the others."""
+            r = c.execute(
+                "SELECT COUNT(*) runs, SUM(p.total_cost_usd) cost_usd, AVG(p.total_cost_usd) avg_cost_usd, "
+                "MAX(p.started_at) last_at, MAX(p.started_at || '|' || p.id) latest, MIN(p.text) text "
+                f"FROM pv p {where} GROUP BY LOWER(TRIM(p.text)) HAVING runs > 1 ORDER BY {order} LIMIT 1",
+                args,
+            ).fetchone()
+            if r is None:
+                return None
+            return {**{k: r[k] for k in ("runs", "cost_usd", "avg_cost_usd", "last_at", "text")}, "id": r["latest"].split("|", 1)[1]}
+        tags = [
+            dict(t)
+            for t in c.execute(
+                "SELECT t.tag, CASE WHEN MIN(t.auto = 1) = 0 THEN 'human' ELSE 'ai' END kind, COUNT(*) prompts, "
+                "SUM(p.total_cost_usd) cost_usd, AVG(p.total_cost_usd) avg_cost_usd, MAX(p.started_at) last_used "
+                f"FROM tags t JOIN pv p ON p.id = t.prompt_id {where} GROUP BY t.tag ORDER BY prompts DESC, cost_usd DESC",
+                args,
+            )
+        ]
+        return {
+            "totals": totals, "priciest": priciest, "tags": tags,
+            "repeated": top_repeated("runs DESC, cost_usd DESC"),
+            "priciest_repeated": top_repeated("cost_usd DESC, runs DESC"),
+        }
+
+    # declared after the /rules/{index} routes: the greedy {tag:path} would otherwise swallow them
+    @app.delete("/api/tags/{tag:path}")
+    def delete_tag(tag: str):
+        """Delete one of your tags: off every prompt, with its rules and description. AI tags come from the
+        transcripts and cannot be deleted."""
+        c = conn()
+        mine = c.execute("SELECT 1 FROM tag_meta WHERE tag = ? UNION SELECT 1 FROM tags WHERE tag = ? AND auto != 1", (tag, tag)).fetchone()
+        if not mine:
+            if c.execute("SELECT 1 FROM tags WHERE tag = ?", (tag,)).fetchone():
+                raise HTTPException(400, "AI tags are derived from the transcripts and cannot be deleted")
+            raise HTTPException(404)
+        rules = db.get_settings(c)["tag_rules"]
+        kept = [r for r in rules if r.get("tag") != tag]
+        with c:
+            prompts = c.execute("DELETE FROM tags WHERE tag = ? AND auto != 1", (tag,)).rowcount
+            c.execute("DELETE FROM tag_meta WHERE tag = ?", (tag,))
+        if kept != rules:
+            db.save_settings(c, {"tag_rules": kept})
+        return {"tag": tag, "prompts": prompts, "rules": len(rules) - len(kept)}
 
     @app.get("/api/projects")
     def list_projects():

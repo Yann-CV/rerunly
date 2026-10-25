@@ -12,14 +12,15 @@
   <header class="topbar">
     <a class="brand" href="#/"><img src="/static/icon.svg" alt="" width="24" height="24">Rerunly</a>
     <nav>
-      <a href="#/" data-nav="prompts">Prompts</a>
+      <a href="#/" data-nav="home">Home</a>
+      <a href="#/prompts" data-nav="prompts">Prompts</a>
       <a href="#/sessions" data-nav="sessions">Sessions</a>
       <a href="#/tags" data-nav="tags">Tags</a>
       <a href="#/setup" data-nav="setup">Setup</a>
     </nav>
     <div class="segmented cost-switch" role="group" aria-label="Cost shown">
       <button type="button" data-cost-source="claude-code"
-        title="Cost reported by Claude Code (OpenTelemetry) for prompts it fully covers; the price table for the others">Official</button>
+        title="Cost reported by the agent itself (OpenTelemetry) for prompts it fully covers; the price table for the others">Official</button>
       <button type="button" data-cost-source="prices" title="Token counts × the price table configured on the Setup page">Price table</button>
     </div>
     <button id="refresh" class="btn" title="Import new transcripts now">Refresh</button>

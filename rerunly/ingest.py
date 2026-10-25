@@ -9,7 +9,7 @@ from .db import get_settings
 from .pricing import Usage, cost_usd
 from .sources.base import AgentRecord, ApiCall, PromptRecord, SessionRecord
 from .sources.claude_code import ClaudeCodeSource
-from .tagging import ai_tags, rule_tags
+from .tagging import ai_tags, rule_scope, rule_tags
 
 
 def _ms_between(start: str | None, end: str | None) -> int | None:
@@ -96,12 +96,39 @@ def apply_rules(conn: sqlite3.Connection, rules: list[dict]) -> None:
     """Recompute the tags given by auto-tag rules on every prompt."""
     with conn:
         conn.execute("DELETE FROM tags WHERE auto = 2")
+        # INSERT OR IGNORE keeps a tag already added by hand (auto = 0) as such.
+        insert = "INSERT OR IGNORE INTO tags(prompt_id, tag, auto) VALUES (?,?,2)"
         for prompt_id, text in conn.execute("SELECT id, text FROM prompts").fetchall():
-            # INSERT OR IGNORE keeps a tag already added by hand (auto = 0) as such.
-            conn.executemany(
-                "INSERT OR IGNORE INTO tags(prompt_id, tag, auto) VALUES (?,?,2)",
-                [(prompt_id, tag) for tag in rule_tags(text, rules)],
+            conn.executemany(insert, [(prompt_id, tag) for tag in rule_tags(text, rules)])
+        # skill rules: the prompts where the agent used the skill (its AI tag), or every prompt of their sessions
+        for r in rules:
+            if not (r.get("tag") and r.get("skill")):
+                continue
+            used = "SELECT prompt_id AS id FROM tags WHERE tag = ? AND auto = 1"
+            if rule_scope(r) == "session":
+                used = (
+                    "SELECT id FROM prompts WHERE session_id IN "
+                    "(SELECT p.session_id FROM prompts p JOIN tags t ON t.prompt_id = p.id WHERE t.tag = ? AND t.auto = 1)"
+                )
+            conn.execute(
+                f"INSERT OR IGNORE INTO tags(prompt_id, tag, auto) SELECT ids.id, ?, 2 FROM ({used}) ids",
+                (r["tag"], f"skill:{r['skill']}"),
             )
+        if not any(rule_scope(r) == "session" for r in rules):
+            return
+        for session_id, text in session_texts(conn):
+            tags = rule_tags(text, rules, "session")
+            if tags:
+                ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (session_id,))]
+                conn.executemany(insert, [(i, tag) for i in ids for tag in tags])
+
+
+def session_texts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Each session's title and prompts, the text session-scoped rules match."""
+    return conn.execute(
+        "SELECT s.id, COALESCE(s.title, '') || char(10) || COALESCE(GROUP_CONCAT(p.text, char(10)), '') "
+        "FROM sessions s LEFT JOIN prompts p ON p.session_id = s.id GROUP BY s.id"
+    ).fetchall()
 
 
 def sources_from_settings(settings: dict) -> list:
