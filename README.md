@@ -153,7 +153,7 @@ a timeline by creation date. Click one to open its charts in place.</p>
   more runs" lists a tag's earlier runs. An **Order** menu sorts the cards in two sections:
   *Tags* (most used, recently used, newest tags, A to Z) and *Timing, cost & usage* (priciest
   per run, most expensive in total, longest per run, most time in total, most tokens per run).
-  Prompts without a human tag get their own "Not tagged by you" card.
+  Prompts without any of your tags get their own "Not tagged by you" card.
 </details>
 
 <details>
@@ -165,31 +165,32 @@ a timeline by creation date. Click one to open its charts in place.</p>
   read and cache write tokens, cost, duration, tool calls. Each subagent shows its **persona**
   and the skill that spawned it; runs of one agent type with different personas are reported
   apart.
-- Cost, duration and token charts over time against a comparison group of your choice:
-  similar prompts (default), all prompts sharing one of its human tags, or similar prompts
-  sharing that tag.
-- Add a human tag, with optional keywords, right from the page.
+- Cost, duration and token charts over the prompt's history: its similar prompts (default), all
+  prompts sharing one of your tags, or similar prompts sharing it, split by model, skill,
+  project or your tags if you like (see [How prompts are linked](#-how-prompts-are-linked)).
+- *+ Add a tag*: one of your tags, or a new one with a description and rules.
 </details>
 
 <details>
 <summary><b>Tags</b>: five color-coded categories, automatic and your own</summary>
 
-- **Human** (blue, filled chip): yours, added on a prompt page or by keyword and regex rules.
+- **Your tags** (blue, filled chip): added by hand, to a selection of prompts, or by rules.
   Use them to group prompts aiming at the same task, such as `task:review-branch`.
 - **AI tags** (dashed outline), derived from what the agent did and refreshed on every import:
   **Project** (orange) `project:`, **Model** (aqua) `model:`, **Skill** (violet) `skill:`,
   and **Other AI** (grey) `cmd:` for slash commands, `agent:` for subagent types, `persona:`.
-- Color is never the only cue: chips carry their prefix and human chips have their own shape.
+- Color is never the only cue: chips carry their prefix and your tags' chips have their own shape.
   The palette passes a color-blindness check in light and dark mode.
-- **Keywords**: give a human tag keywords and every prompt containing all (or any) of them gets
-  it, past ones right away and new ones on import, with a live count of matches.
+- **New tag**: a name, a description and rules (keywords or a skill, in a prompt or in a
+  session), each rule in its own color with a live count of matches.
 - **Tags gallery**: cards with cost per prompt, sparkline and trend badge; a summary band with
   the priciest and most used tags; search, category filters, five sorts; **Grouped** (by
   category, then family) or **Timeline** (by month of creation) layouts. Click a card to open
   its charts in place; Escape closes them.
-- **A page per tag**: a header in the tag's color, its keyword rules as removable chips, a
-  summary band (runs, total cost, median cost with trend, median time), charts, and its runs
-  with the same toolbar and layouts as the Prompts page.
+- **A page per tag**: a header in the tag's color, its rules as colored chips you can change or
+  remove, a summary band (runs, total cost, median cost with trend, median time), charts with
+  one line per model (or skill, project, tag of yours), and its runs with the Prompts page's
+  toolbar.
 </details>
 
 <details>
@@ -231,6 +232,58 @@ uv run rerunly --reload       # while hacking on it: restarts on Python changes
   `RERUNLY_DB`. Coming from the tool's former name, Agent Task Dashboard? Your data moves
   over by itself the first time you run `rerunly`.
 
+## 🔗 How prompts are linked
+
+A prompt is only interesting next to its other runs. Rerunly links prompts in three ways, from
+the most automatic to the most deliberate.
+
+**1. Sessions: where it was typed.** Every prompt belongs to the session (the conversation) it
+was typed in. Everything the agent did until your next prompt belongs to it, subagents included:
+they are tied to their prompt through the transcript's `promptId`. When a session is resumed or
+forked and replays earlier prompts, each prompt stays in its first session, so nothing counts
+twice.
+
+**2. Similar prompts: what it says.** Two prompts are similar when their words overlap enough.
+Each text is lowercased and split into words; one-letter words and common ones (*the*, *and*,
+*please*…) are dropped. The score is the share of words they have in common (Jaccard: shared
+words ÷ all distinct words), and prompts scoring at least the **similarity threshold** (0.6 by
+default, on the Setup page) are similar. Running the same slash command counts as at least 0.5,
+plus half the word overlap: with the default threshold, `/review` runs are similar as soon as a
+fifth of their words match. A prompt rerun word for word is similar to its earlier runs, unless
+it is only common words (such as "do it"), which leaves nothing to compare.
+
+**3. Tags: what you decide.** Prompts sharing a tag are linked, whatever their words.
+
+- **AI tags** come from what the agent did, refreshed on every import: the project
+  (`project:`), the models that answered (`model:`), skills used (`skill:`), the slash command
+  (`cmd:`), subagent types (`agent:`) and their personas (`persona:`).
+- **Your tags** link the runs of one task, such as `task:review-branch`. Give one:
+  - **by hand**, on a prompt's page (*+ Add a tag*);
+  - **to many prompts at once**: on the Prompts page (List view) or a tag's page, *Select
+    prompts*, search or filter, *Select all*, then *Tag N selected…*;
+  - **with rules**, which tag past prompts right away and new ones on every import. A rule is a
+    keyword alone, several keywords that must all appear (*any of them* becomes one rule per
+    keyword), or a **skill** the agent used. It applies **in a prompt** (that prompt gets the
+    tag) or **in a session** (the session's title or any of its prompts matches, and every
+    prompt of that session gets the tag). A prompt matching any of a tag's rules gets the tag.
+
+  Deleting a tag only removes the tag and its rules: the prompts stay.
+
+**Where the links are used**
+
+- On a **prompt's page**, *How it compares with* picks the prompt's history: its **similar
+  prompts** (default), **all prompts tagged** with one of your tags, or **similar prompts
+  tagged** with it (when one tag covers several kinds of prompts). The charts, the
+  "vs group median" figures and the table of runs all use that history and nothing else.
+- *One line per* splits that history by **model**, **skill**, **project** or **your tags**, with
+  a table of each group's runs, median cost, time and tokens, and the cheapest one marked. The
+  same split works on every **tag's page**, over all its runs: the way to see which model does a
+  task for less.
+
+**Tip:** for the most reliable comparison, give a task's runs one tag of yours (a keyword rule
+does it for you) and compare with "All prompts tagged …". Similarity is a good default, but it
+only sees words.
+
 ## 🧮 How the numbers are computed
 
 Trust, but verify: every figure comes from data Claude Code writes itself.
@@ -248,7 +301,7 @@ Trust, but verify: every figure comes from data Claude Code writes itself.
 | Wall time | From the prompt to its last event, including subagents that finish later. |
 | API time | Sum of `duration_ms` over the prompt's telemetry events (telemetry only). |
 | Persona | Read from the start of the subagent's prompt: `<persona>…</persona>`, `Persona: …` / `Role: …`, or `You are a…` / `Act as…`. The skill is the last one invoked (or the slash command run) before the subagent was spawned. |
-| Similar prompts | Word overlap (Jaccard) ≥ the threshold (default 0.6), or the same slash command with some overlap. |
+| Similar prompts | Word overlap (Jaccard) ≥ the threshold (default 0.6); the same slash command counts as 0.5 + half the overlap. See [How prompts are linked](#-how-prompts-are-linked). |
 
 Switch between the two costs at any time with **Official / Price table** in the top bar:
 **Official** shows Claude Code's own cost for every prompt telemetry fully covers and the
@@ -261,10 +314,8 @@ exactly. Telemetry only applies to Claude Code sessions started after it is enab
 made while the dashboard is not running are lost; a prompt missing some of its calls falls back
 to the estimate.
 
-**Tip:** to compare runs of one task reliably, give them the same human tag and choose "All
-prompts tagged …" on a prompt page. Add the tag by hand, with keywords, or with a regex rule
-such as `{"pattern": "review .*paper", "tag": "task:paper-review"}`. Choose "Similar prompts
-tagged …" when one tag covers several kinds of prompts, such as a project-wide tag.
+Rules can also be regular expressions, written on the Setup page:
+`{"pattern": "review .*paper", "tag": "task:paper-review"}`.
 </details>
 
 ## 🛣️ Beyond Claude Code
