@@ -214,6 +214,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     def hook_installed(cs: dict) -> bool:
         return any(is_ours(h) for h in cs.get("hooks", {}).get("Stop", []))
 
+    @app.get("/api/models")
+    def available_models():
+        c = conn()
+        used = set()
+        for row in c.execute("SELECT models FROM prompts"):
+            used.update(json.loads(row[0]))
+        return replay.agent_models(list(db.get_settings(c)["prices"]), sorted(used))
+
     @app.get("/api/setup/status")
     def setup_status():
         c = conn()
@@ -245,6 +253,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "last_event_at": events["last"],
                 "cost_source": settings["cost_source"],
             },
+            "codex": {"sessions_dir": settings["codex_sessions_dir"],
+                      "exists": Path(settings["codex_sessions_dir"]).expanduser().is_dir(),
+                      "transcript_count": len(list(Path(settings["codex_sessions_dir"]).expanduser().rglob("rollout-*.jsonl"))),
+                      "installed": shutil.which("codex") is not None},
             "projects_dir": str(projects),
             "projects_dir_exists": projects.is_dir(),
             "transcript_count": len(list(projects.glob("*/*.jsonl"))) if projects.is_dir() else 0,
@@ -958,11 +970,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "rate": body.get("rate", True) is not False, "judge_model": judge_model}
 
     def replayable(c, prompt_id: str):
-        r = c.execute("SELECT text, cwd, harness, harness_version FROM pv WHERE id = ?", (prompt_id,)).fetchone()
+        r = c.execute("SELECT text, cwd, harness, harness_version, requested_model, effort FROM pv WHERE id = ?", (prompt_id,)).fetchone()
         if r is None:
             raise HTTPException(404, f"no prompt {prompt_id}")
-        if r["harness"] and r["harness"] != "Claude Code":
-            raise HTTPException(400, "only Claude Code prompts can be replayed")
+        if r["harness"] and r["harness"] not in ("Claude Code", "Codex"):
+            raise HTTPException(400, "this harness does not support replay")
         return r
 
     reruns_dir = db_path.parent / "reruns"
@@ -997,8 +1009,17 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         """Rerun a prompt with Claude Code: the same folder and prompt, the skills as they ran, the model,
         effort and release asked for; in the background (unattended) or in a terminal window."""
         r = replayable(c, prompt_id)
+        opts = dict(opts)
+        codex = opts["model"].startswith(replay.CODEX_PREFIX) or (opts["model"].startswith("gpt-") and not opts["model"].startswith("gpt-oss")) or (not opts["model"] and r["harness"] == "Codex")
+        if codex and opts["mode"] == "background" and opts["budget"] is not None:
+            raise HTTPException(400, "Codex cannot enforce a USD budget cap; clear the budget to continue.")
+        same_harness = codex == (r["harness"] == "Codex")
+        opts["model"] = opts["model"] or r["requested_model"] or ""
+        opts["effort"] = opts["effort"] or r["effort"] or ""
         version = (r["harness_version"] or "") if opts["release"] == "same" else opts["release"]
         version = version if replay.VERSION_RE.match(version) else ""
+        if opts["release"] == "same" and not same_harness:
+            version = ""
         session_id = str(uuid.uuid4())
         cwd = r["cwd"] or str(Path.home())
         # the skills as they ran, in a plugin for this session only: the user's copies stay untouched
@@ -1007,6 +1028,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "AND v.origin != 'bundled' ORDER BY k.skill", (prompt_id,))] if opts["restore_skills"] else []
         plugin = reruns_dir / session_id / "plugin" if versions else None
         skills = runner.build_skills_plugin(plugin, versions) if plugin else []
+        if codex:
+            for skill in skills:
+                skill["pinned"] = str(plugin / "skills" / runner._skill_name(skill["skill"]) / "SKILL.md")
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
                "harness_version": version, "launched_at": runner.now(), "mode": opts["mode"], "skills": json.dumps(skills),
                "permission": opts["permission"], "budget_usd": opts["budget"], "auto_rate": int(opts.get("rate", True)),
@@ -1015,23 +1039,28 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             note = "\n".join(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with."
                               for k in skills)
             argv = replay.claude_argv(r["text"], session_id, opts["model"], opts["effort"], version, str(plugin or ""), note)
+            if codex:
+                argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version, note=note)
             launched = replay.launch(cwd, argv)
             row.update(status="interactive")
         else:
             argv = runner.background_argv(r["text"], session_id, opts["model"], opts["effort"], version, opts["permission"],
                                           opts["budget"], plugin, skills)
+            if codex:
+                argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version,
+                                         background=True, permission=opts["permission"], note=runner.unattended_note(skills))
             log = reruns_dir / session_id / "stream.jsonl"
             row.update(status="running", log_path=str(log))
             # recorded before it starts: a quick end must find its row
             with c:
                 c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
             try:
-                pid = runner.start(cwd, argv, log, lambda: finish_rerun(session_id))
+                pid = runner.start(cwd, argv, log, lambda: finish_rerun(session_id), **({"timeout": 3600} if codex else {}))
             except OSError as e:
                 with c:
                     c.execute("UPDATE replays SET status = 'failed', result = ?, ended_at = ? WHERE session_id = ?",
-                              (f"Claude Code could not start: {e}", runner.now(), session_id))
-                raise HTTPException(500, f"Claude Code could not start: {e}") from None
+                              (f"{'Codex' if codex else 'Claude Code'} could not start: {e}", runner.now(), session_id))
+                raise HTTPException(500, f"{'Codex' if codex else 'Claude Code'} could not start: {e}") from None
             with c:
                 c.execute("UPDATE replays SET pid = ? WHERE session_id = ?", (pid, session_id))
             return {"prompt_id": prompt_id, "session_id": session_id, "mode": "background", "terminal": None, "cwd": cwd,

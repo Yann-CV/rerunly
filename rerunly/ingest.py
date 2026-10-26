@@ -9,6 +9,7 @@ from .db import get_settings
 from .pricing import Usage, cost_usd
 from .sources.base import AgentRecord, ApiCall, PromptRecord, SessionRecord
 from .sources.claude_code import ClaudeCodeSource
+from .sources.codex import CodexSource
 from .tagging import ai_tags, rule_scope, rule_tags
 from .versions import body_hash, resolve
 
@@ -168,7 +169,7 @@ def session_texts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def sources_from_settings(settings: dict) -> list:
-    return [ClaudeCodeSource(settings["claude_projects_dir"])]
+    return [ClaudeCodeSource(settings["claude_projects_dir"]), CodexSource(settings["codex_sessions_dir"])]
 
 
 def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:

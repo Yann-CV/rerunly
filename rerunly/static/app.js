@@ -1087,18 +1087,19 @@ function rerunCommand(p) {
       lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
     }
   }
-  const agent = r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude";
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? ` --effort ${r.effort}` : ""} ${shellQuote(p.text)}`);
+  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${r.harness_version}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""} ${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }
 
-const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 /** Replay it with Claude Code from here, and the replays launched so far. */
 function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
-  if (r.harness && r.harness !== "Claude Code") return "";
+  if (r.harness && !["Claude Code", "Codex"].includes(r.harness)) return "";
+  const isCodex = r.harness === "Codex";
   const same = r.requested_model || Object.keys(p.models || {})[0] || "";
   const opt = (value, label, current) => `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
   const others = [...new Set([...models, ...p.references.map((x) => x.model).filter(Boolean)])].filter((m) => m !== same).sort();
@@ -1119,20 +1120,21 @@ function replayHtml(p, models, defaultJudge = "") {
         : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
   }).join("");
   return `<div class="replay">
-    <div class="replay-head"><strong>Rerun with Claude</strong>
+    <div class="replay-head"><strong>Rerun with ${esc(r.harness || "Claude Code")}</strong>
       <span class="muted">In <code>${esc(r.cwd || "your home folder")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}.
         <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
         <strong>In a terminal</strong>: you watch it and approve its actions.
         ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
+    ${isCodex ? '<p class="muted">Codex costs are API estimates. No USD budget cap is available. Read-only allows commands inside the read-only sandbox; read and edit allows workspace commands too. Restored skills are supplied by exact file path.</p>' : ""}
     <form id="replay-form" class="replay-form">
       ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
         opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
       <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
-      <label title="Through npx for a release other than the installed one">Claude Code <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
+      <label title="Through npx for a release other than the installed one">${esc(r.harness || "Claude Code")} <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
       <label>Run <select id="replay-mode">${opt("background", "Unattended, in the background", "background")}${opt("terminal", "In a terminal window", "")}</select></label>
       <label class="bg-only" title="Anything else it tries is denied, and reported">May <select id="replay-permission">${opt("ask", "only read", "ask")}${opt("edits", "read and edit files", "")}</select></label>
-      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>
+      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${isCodex ? "" : budget}" size="5" ${isCodex ? "disabled" : ""}></label>
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
       <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
@@ -1158,7 +1160,7 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
         <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
         <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
   ];
-  const command = r.harness === "Claude Code" ? rerunCommand(p) : "";
+  const command = ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
@@ -1180,6 +1182,15 @@ function bindRerun(p) {
     restore_skills: document.getElementById("replay-skills")?.checked ?? true,
     rate: document.getElementById("replay-rate").checked, judge_model: document.getElementById("replay-judge").value,
   });
+  const modelSelect = document.getElementById("replay-model");
+  const updateHarness = () => {
+    const selected = modelSelect.value;
+    const codex = selected.startsWith("codex:") || (!selected && p.rerun.harness === "Codex");
+    const budget = document.getElementById("replay-budget");
+    budget.disabled = codex;
+    if (codex) budget.value = "";
+  };
+  if (modelSelect) modelSelect.onchange = updateHarness;
   // permission and budget only apply to unattended reruns
   const mode = document.getElementById("replay-mode");
   if (mode) mode.onchange = () => form.querySelectorAll(".bg-only").forEach((el) => { el.hidden = mode.value !== "background"; });
@@ -1196,6 +1207,7 @@ function bindRerun(p) {
     set("replay-model", x?.model, p.rerun.requested_model);
     set("replay-effort", x?.effort, p.rerun.effort);
     set("replay-release", x?.harness_version, null);
+    updateHarness();
   };
   const queueButton = document.getElementById("queue-replay");
   if (queueButton) queueButton.onclick = async () => {
@@ -1383,7 +1395,7 @@ let promptSplit = "";
 
 async function viewPrompt(id, compare = {}) {
   let [p, allTags, settings] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags"), api("/api/settings")]);
-  const knownModels = allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const knownModels = (await api("/api/models")).map((m) => m.id);
   ruleSkills = skillsFromTags(allTags);
   // compare by tag only through one of this prompt's own human tags (a stale link falls back to similar)
   if (compare.scope && compare.scope !== "similar" && humanTags(p.tags).some((t) => t.tag === compare.tag)) {
@@ -2449,7 +2461,8 @@ async function viewSetup() {
 
     <h2>Settings</h2>
     <form id="settings" class="card">
-      <div class="setup-row"><div><strong>Transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir)}"></div>
+      <div class="setup-row"><div><strong>Codex sessions directory</strong><br><span class="muted">${st.codex?.transcript_count || 0} CLI and IDE rollouts; refreshed automatically. USD costs are estimates. Claude telemetry and hooks below apply to Claude only.</span></div><input name="codex_sessions_dir" size="50" value="${esc(settings.codex_sessions_dir)}"></div>
+      <div class="setup-row"><div><strong>Claude Code transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir)}"></div>
       <div class="setup-row"><div><strong>Cost shown</strong><br><span class="muted">The agent's own cost when telemetry covers the whole prompt, or always the price table.</span></div>
         <select name="cost_source">
           <option value="claude-code" ${settings.cost_source === "claude-code" ? "selected" : ""}>The agent's own cost when available</option>
@@ -2508,6 +2521,7 @@ async function viewSetup() {
     try {
       values = {
         claude_projects_dir: f.get("claude_projects_dir"),
+        codex_sessions_dir: f.get("codex_sessions_dir"),
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
         judge_model: String(f.get("judge_model") || "").trim(),
@@ -2794,7 +2808,7 @@ async function viewCompare(query) {
   const a = query.get("a"), b = query.get("b");
   if (!a || !b) { app.innerHTML = '<div class="card status-warn">Pick two runs to compare: open a rerun, then Compare.</div>'; return; }
   const [data, tags, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/tags"), api("/api/settings")]);
-  const models = tags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const models = (await api("/api/models")).map((m) => m.id);
   const kindLabel = { original: "Original", rerun: "Rerun", reference: "Reference run" };
   const label = (pid) => kindLabel[data.candidates.find((x) => x.id === pid)?.kind] || "Run";
   const picker = (id, current) => `<select id="${id}">${data.candidates.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>

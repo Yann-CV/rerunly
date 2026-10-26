@@ -378,3 +378,59 @@ uv run pytest
 ```
 
 <p align="center"><sub>Built for people who tune their agents like they tune their code.</sub></p>
+
+
+### OpenAI Codex
+
+Codex CLI and IDE rollout history is imported automatically from
+`$CODEX_HOME/sessions` (or `~/.codex/sessions`). Change **Codex sessions directory**
+on Setup if needed. Existing installations gain the new default model prices without
+replacing edited prices. Refresh imports changed rollouts; the normal polling interval
+also keeps them current. No API key is needed for importing history.
+
+Codex prompts use the same history, filters, tags, comparisons, references, exclusions,
+exports, rerun queue and output judging as Claude prompts. Imports include the recorded
+model, CLI version, reasoning effort, prompt/answer, token/cache counts, tool calls,
+`apply_patch` file paths, and explicitly injected `<skill>` snapshots. Parent spawn
+outputs identifying child thread IDs link separate subagent rollouts to their prompt.
+Both cumulative `token_count` and response-level `token_usage_record` formats are supported;
+when both exist, only response-level usage is counted. Cached input is subtracted from
+input before pricing; reasoning output is already included in output tokens.
+
+Choose a `codex:` model in the rerun or judge picker to use Codex. The picker includes
+the documented Codex models, account-visible entries from the local model cache, and
+previously used OpenAI model IDs. Availability depends on the account and CLI release.
+Codex must be installed and authenticated to run tasks; pinned releases use
+`npx -y @openai/codex@VERSION`. Reruns start fresh in the original directory and retain
+a small replay marker in their prompt so their imported history links to the original.
+Restored skills are placed in an isolated folder and referenced by exact path in the
+rerun's instructions. They are removed after a background run finishes.
+
+Codex does have these parity limits:
+
+- **No dollar budget cap:** Codex background reruns reject a USD budget rather than
+  pretending to enforce one. They have a one-hour process timeout. Codex judging has
+  a ten-minute timeout and no dollar cap.
+- **Permissions differ:** read-only and workspace-write sandbox policies restrict
+  filesystem access, but both allow sandboxed commands. Workspace-write is broader
+  than Claude's edits-only permission. Background approval policy is `never`.
+- **Estimated cost only:** standard short-context API prices estimate token cost;
+  they are not subscription charges or credit consumption. Unknown models are flagged
+  unpriced. Fast/long-context rates, cache writes, hosted tools and other billing
+  adjustments are not fully represented by Codex rollout data and this estimate.
+  Claude-specific cost telemetry and Stop-hook installation do not apply to Codex;
+  Codex history uses automatic polling instead.
+- **Transcript-dependent detail:** only recorded skill bodies can be restored;
+  reading a skill through arbitrary shell commands does not reliably provide a
+  recoverable skill snapshot. Skill-to-subagent association, personas and edited files
+  cannot always be recovered. Only explicit spawn-result links are attributed;
+  missing or unlinked child transcripts cannot provide complete subagent totals.
+  Exact historical API request counts are unavailable in older cumulative-only logs.
+  Active time is elapsed turn time where completion events exist, rather than
+  Claude's harness-reported active duration. A replay does not restore conversation
+  context, repository state, authentication, MCP servers or the full harness configuration.
+
+Model and CLI behavior were checked against the
+[official Codex model documentation](https://learn.chatgpt.com/docs/models),
+[CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli), and
+[OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
