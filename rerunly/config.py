@@ -31,4 +31,9 @@ DEFAULT_SETTINGS = {
     # "claude-code": use the cost Claude Code reports through OpenTelemetry when it covers the
     # whole prompt, the price table otherwise. "prices": always use the price table.
     "cost_source": "claude-code",
+    # Projects, session ids and AI tags (skills `skill:x`, subagent types `agent:x`) left out of the
+    # history: their prompts are still imported, shown nowhere.
+    "excluded_projects": [],
+    "excluded_sessions": [],
+    "excluded_tags": [],
 }

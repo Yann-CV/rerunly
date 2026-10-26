@@ -1,7 +1,9 @@
 import json
 import os
 from datetime import datetime, timezone
+import shlex
 import shutil
+import uuid
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, otel
+from . import background as bg, db, otel, replay, runner
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .ingest import apply_rules, ingest, session_texts
 from .tagging import rule_matches, rule_scope, similarity, split_any
@@ -45,7 +47,7 @@ def _record_creation(c, tag: str, description: str | None = None) -> None:
 
 def _row(r) -> dict:
     d = dict(r)
-    for key in ("tools", "models", "unpriced_models"):
+    for key in ("tools", "models", "unpriced_models", "files"):
         if key in d and d[key]:
             d[key] = json.loads(d[key])
     return d
@@ -57,7 +59,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     def conn():
         c = db.connect(db_path)
-        db.create_prompt_view(c, db.get_settings(c)["cost_source"] == "claude-code")
+        settings = db.get_settings(c)
+        db.create_prompt_view(c, settings["cost_source"] == "claude-code", settings)
         return c
 
     def split_any_rules() -> None:
@@ -235,6 +238,40 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         write_claude_settings(cs)
         return setup_status()
 
+    @app.get("/api/setup/history")
+    def history_scope():
+        """Every project and session, excluded ones included, for the Setup page's exclusion lists."""
+        c = conn()
+        s = db.get_settings(c)
+        projects = [
+            {"project": r[0], "prompts": r[1], "excluded": r[0] in s["excluded_projects"]}
+            for r in c.execute("SELECT project, COUNT(*) FROM prompts WHERE project != '' GROUP BY project ORDER BY project")
+        ]
+        sessions = [
+            {**dict(r), "excluded": r["id"] in s["excluded_sessions"]}
+            for r in c.execute(
+                "SELECT s.id, s.title, s.project, MIN(p.started_at) started_at, COUNT(p.id) prompts, "
+                "(SELECT text FROM prompts f WHERE f.session_id = s.id ORDER BY f.started_at LIMIT 1) first_prompt "
+                "FROM sessions s JOIN prompts p ON p.session_id = s.id GROUP BY s.id ORDER BY started_at DESC"
+            )
+        ]
+        # skills and subagent types the agent used, from their AI tags
+        used = [
+            {"tag": r[0], "prompts": r[1], "excluded": r[0] in s["excluded_tags"]}
+            for r in c.execute(
+                "SELECT tag, COUNT(*) FROM tags WHERE auto = 1 AND (tag LIKE 'skill:%' OR tag LIKE 'agent:%') GROUP BY tag ORDER BY tag"
+            )
+        ]
+        reruns = c.execute("SELECT COUNT(*) FROM tags WHERE tag = 'rerun' AND auto = 1").fetchone()[0]
+        return {
+            "reruns": [{"tag": "rerun", "prompts": reruns, "excluded": "rerun" in s["excluded_tags"]}] if reruns else [],
+            # prompts left out by any exclusion, each counted once
+            "hidden": c.execute("SELECT (SELECT COUNT(*) FROM prompts) - (SELECT COUNT(*) FROM pv)").fetchone()[0],
+            "projects": projects, "sessions": sessions,
+            "skills": [u for u in used if u["tag"].startswith("skill:")],
+            "agents": [u for u in used if u["tag"].startswith("agent:")],
+        }
+
     @app.post("/api/setup/autostart")
     def setup_autostart(enable: bool = Body(..., embed=True)):
         bg.set_autostart(enable, db_path, port)
@@ -258,10 +295,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 out[r["prompt_id"]].append(_tag(r["tag"], r["auto"]))
         return out
 
+    # each skill version a prompt ran, labelled "skill @ commit" (or its plugin or bundling harness version),
+    # separated by \x1f: lets the charts split runs by skill version
+    SKILL_VERSIONS_SQL = (
+        "SELECT GROUP_CONCAT(k.skill || ' @ ' || COALESCE(substr(v.git_commit, 1, 7), 'Claude Code ' || v.bundled_version, "
+        "'v' || v.plugin_version, substr(k.hash, 1, 7)), char(31)) FROM prompt_skill_runs k "
+        "JOIN skill_versions v ON v.hash = k.hash WHERE k.prompt_id = p.id"
+    )
+
     LIST_COLS = (
         "p.id, p.session_id, p.project, p.command, p.text, p.started_at, p.wall_ms, p.active_ms, "
         "p.total_tokens, p.total_cost_usd, p.cost_usd, p.agent_count, p.api_calls, p.tool_calls, "
-        "p.estimated_cost_usd, p.official_cost_usd, p.cost_source, p.api_ms"
+        "p.estimated_cost_usd, p.official_cost_usd, p.cost_source, p.api_ms, p.harness, p.harness_version, p.effort, p.requested_model, "
+        f"({SKILL_VERSIONS_SQL}) skill_versions"
     )
 
     def telemetry_breakdown(c, where: str, args: tuple) -> list[dict]:
@@ -338,10 +384,54 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             raise HTTPException(404)
         prompt = _row(r)
         prompt["tags"] = tags_for(c, [prompt_id])[prompt_id]
+        prompt["skill_versions"] = c.execute(f"SELECT ({SKILL_VERSIONS_SQL}) FROM prompts p WHERE p.id = ?", (prompt_id,)).fetchone()[0]
         prompt["agents"] = [_row(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=? ORDER BY started_at", (prompt_id,))]
         s = c.execute("SELECT title, reported_cost_usd FROM sessions WHERE id=?", (prompt["session_id"],)).fetchone()
         prompt["session"] = dict(s) if s else {}
         prompt["telemetry"] = telemetry_breakdown(c, "prompt_id = ?", (prompt_id,))
+        # reference runs of this prompt's tags: their settings can be reused to rerun it
+        prompt["references"] = [
+            dict(x) for x in c.execute(
+                "SELECT r.tag, p.id, p.started_at, p.total_cost_usd, p.requested_model model, p.effort, p.harness_version "
+                "FROM tag_reference r JOIN tags t ON t.tag = r.tag AND t.prompt_id = ? "
+                "JOIN pv p ON p.id = r.prompt_id JOIN tags rt ON rt.tag = r.tag AND rt.prompt_id = p.id "
+                "WHERE p.id != ? ORDER BY r.tag", (prompt_id, prompt_id))
+        ]
+        # replays launched from here, and the prompt this one replays
+        refresh_reruns(c)
+        prompt["replays"] = [
+            {**rerun_row(x), "prompt": (lambda q: dict(q) if q else None)(c.execute(
+                "SELECT id, started_at, total_cost_usd, total_tokens, active_ms, wall_ms FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1",
+                (x["session_id"],)).fetchone())}
+            for x in c.execute("SELECT * FROM replays WHERE prompt_id = ? ORDER BY launched_at DESC", (prompt_id,))
+        ]
+        # a prompt of a rerun session: the prompt it reruns, and the configuration chosen to launch it
+        # with what the comparison needs: the original's answer, files and figures
+        of = c.execute(
+            "SELECT p.id, p.started_at, p.total_cost_usd, p.text, p.answer, p.files, p.total_tokens, p.active_ms, p.wall_ms, "
+            "p.api_calls, p.tool_calls, p.tools, x.model, x.effort, x.harness_version, x.launched_at, x.mode, x.status, x.result, "
+            "x.denials, x.skills, x.permission, x.budget_usd, x.cost_usd run_cost_usd, "
+            "? = (SELECT id FROM prompts WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) first "
+            "FROM replays x LEFT JOIN pv p ON p.id = x.prompt_id WHERE x.session_id = ?",
+            (prompt_id, prompt["session_id"]),
+        ).fetchone()
+        if of:
+            o = _row(of)
+            o.update(first=bool(o["first"]), denials=json.loads(o["denials"] or "null"), skills=json.loads(o["skills"] or "[]"))
+            prompt["replay_of"] = o
+        else:
+            prompt["replay_of"] = None
+        # what ran it, to run it again: harness, effort, model and the exact skill versions
+        prompt["rerun"] = {
+            "harness": r["harness"] or "", "harness_version": r["harness_version"] or "", "effort": r["effort"] or "",
+            "requested_model": r["requested_model"] or "", "cwd": r["cwd"] or "",
+            "skills": [
+                dict(x) for x in c.execute(
+                    "SELECT r.skill, r.hash, r.args, v.base_dir, v.origin, v.git_repo, v.git_path, v.git_commit, v.git_state, "
+                    "v.plugin, v.plugin_version, v.bundled_version FROM prompt_skill_runs r JOIN skill_versions v ON v.hash = r.hash "
+                    "WHERE r.prompt_id = ? ORDER BY r.skill", (prompt_id,))
+            ],
+        }
 
         threshold = db.get_settings(c)["similarity_threshold"]
         my_tags = {t["tag"] for t in prompt["tags"]}
@@ -358,7 +448,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 continue
             compared.append({**_row(o), "score": round(score, 3), "tags": [_tag(t, a) for t, a in other_tags.items()]})
         compared.sort(key=lambda x: x["started_at"], reverse=True)
-        prompt["compare"] = {"scope": compare, "tag": tag}
+        prompt["compare"] = {"scope": compare, "tag": tag, "reference": reference_of(c, tag) if tag else None}
         prompt["similar"] = compared
         return prompt
 
@@ -427,12 +517,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if skill:
             used = "SELECT prompt_id FROM tags WHERE tag = ? AND auto = 1"
             what = "COUNT(DISTINCT session_id)" if scope == "session" else "COUNT(*)"
-            n = c.execute(f"SELECT {what} FROM prompts WHERE id IN ({used})", (f"skill:{skill.removeprefix('skill:')}",)).fetchone()[0]
+            n = c.execute(f"SELECT {what} FROM pv WHERE id IN ({used})", (f"skill:{skill.removeprefix('skill:')}",)).fetchone()[0]
             return {"matches": n}
         rule = {"keywords": keywords.split(","), "match": match}
+        # counted in the history only: excluded projects and sessions are left out
         if scope == "session":
-            return {"matches": sum(rule_matches(rule, text) for _, text in session_texts(c))}
-        return {"matches": sum(rule_matches(rule, r[0]) for r in c.execute("SELECT text FROM prompts"))}
+            shown = {r[0] for r in c.execute("SELECT DISTINCT session_id FROM pv")}
+            return {"matches": sum(rule_matches(rule, text) for sid, text in session_texts(c) if sid in shown)}
+        return {"matches": sum(rule_matches(rule, r[0]) for r in c.execute("SELECT text FROM pv"))}
 
     @app.post("/api/tags")
     def create_tag(
@@ -555,6 +647,32 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             for tag, (created, desc) in described.items() if tag not in used
         ]
         return out
+
+    def reference_of(c, tag: str) -> dict | None:
+        """The tag's reference run, while it still carries the tag and is in the history."""
+        r = c.execute(
+            f"SELECT {LIST_COLS} FROM pv p JOIN tag_reference r ON r.prompt_id = p.id "
+            "JOIN tags t ON t.prompt_id = p.id AND t.tag = r.tag WHERE r.tag = ?",
+            (tag,),
+        ).fetchone()
+        return _row(r) if r else None
+
+    @app.get("/api/tags/{tag:path}/reference")
+    def get_tag_reference(tag: str):
+        return {"tag": tag, "reference": reference_of(conn(), tag)}
+
+    @app.put("/api/tags/{tag:path}/reference")
+    def set_tag_reference(tag: str, prompt_id: str | None = Body(None, embed=True)):
+        """Make one of the tag's runs its reference; null clears it."""
+        c = conn()
+        with c:
+            if prompt_id is None:
+                c.execute("DELETE FROM tag_reference WHERE tag = ?", (tag,))
+            elif not c.execute("SELECT 1 FROM tags WHERE tag = ? AND prompt_id = ?", (tag, prompt_id)).fetchone():
+                raise HTTPException(400, "the reference must be one of the tag's runs")
+            else:
+                c.execute("INSERT INTO tag_reference(tag, prompt_id) VALUES (?, ?) ON CONFLICT(tag) DO UPDATE SET prompt_id = excluded.prompt_id", (tag, prompt_id))
+        return {"tag": tag, "reference": reference_of(c, tag)}
 
     @app.post("/api/tags/{tag:path}/prompts")
     def tag_some_prompts(tag: str, prompt_ids: list[str] = Body(..., embed=True)):
@@ -736,14 +854,228 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         with c:
             prompts = c.execute("DELETE FROM tags WHERE tag = ? AND auto != 1", (tag,)).rowcount
             c.execute("DELETE FROM tag_meta WHERE tag = ?", (tag,))
+            c.execute("DELETE FROM tag_reference WHERE tag = ?", (tag,))
         if kept != rules:
             db.save_settings(c, {"tag_rules": kept})
         return {"tag": tag, "prompts": prompts, "rules": len(rules) - len(kept)}
 
+    async def dashboard_json(request: Request) -> dict:
+        """The body of a request that starts (or queues) agents: JSON sent by the dashboard itself, never by
+        another page posting here."""
+        if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+            raise HTTPException(415, "send JSON")
+        origin = request.headers.get("origin")
+        if origin and origin.split("://", 1)[-1] != request.headers.get("host"):
+            raise HTTPException(403, "replays start from the dashboard only")
+        return await request.json()
+
+    def rerun_options(body: dict) -> dict:
+        """How to rerun: model, effort, Claude Code release ("" installed, "same" the prompt's own, or a
+        version such as a reference run's), mode ("background": unattended, or "terminal": interactive),
+        what it may do without asking (background), a budget cap in USD, and whether to restore the skills."""
+        model, effort = str(body.get("model") or ""), str(body.get("effort") or "")
+        if model and not replay.MODEL_RE.match(model):
+            raise HTTPException(400, "unknown model")
+        if effort and effort not in replay.EFFORTS:
+            raise HTTPException(400, f"effort must be one of {replay.EFFORTS}")
+        release = str(body.get("version") or "") or ("same" if body.get("same_version") else "")
+        if release not in ("", "same") and not replay.VERSION_RE.match(release):
+            raise HTTPException(400, "unknown Claude Code version")
+        mode = str(body.get("mode") or "background")
+        if mode not in ("background", "terminal"):
+            raise HTTPException(400, "mode must be background or terminal")
+        permission = str(body.get("permission") or "ask")
+        if permission not in runner.PERMISSIONS:
+            raise HTTPException(400, f"permission must be one of {list(runner.PERMISSIONS)}")
+        try:
+            budget = float(body["budget_usd"]) if body.get("budget_usd") not in (None, "") else None
+        except (TypeError, ValueError):
+            raise HTTPException(400, "budget must be a number") from None
+        if budget is not None and not 0 < budget <= 1000:
+            raise HTTPException(400, "budget must be between 0 and 1000 USD")
+        return {"model": model, "effort": effort, "release": release, "mode": mode, "permission": permission,
+                "budget": budget, "restore_skills": body.get("restore_skills", True) is not False}
+
+    def replayable(c, prompt_id: str):
+        r = c.execute("SELECT text, cwd, harness, harness_version FROM pv WHERE id = ?", (prompt_id,)).fetchone()
+        if r is None:
+            raise HTTPException(404, f"no prompt {prompt_id}")
+        if r["harness"] and r["harness"] != "Claude Code":
+            raise HTTPException(400, "only Claude Code prompts can be replayed")
+        return r
+
+    reruns_dir = db_path.parent / "reruns"
+
+    def finish_rerun(session_id: str) -> None:
+        """Record how a background rerun ended, from its log, and drop its restored skills."""
+        c = conn()
+        x = c.execute("SELECT log_path, status FROM replays WHERE session_id = ?", (session_id,)).fetchone()
+        if x is None or x["status"] != "running":
+            return
+        log = Path(x["log_path"])
+        out = runner.outcome(log)
+        if out is None:  # no result: it crashed, or Claude Code could not start
+            try:
+                tail = log.read_text()[-600:].strip()
+            except OSError:
+                tail = ""
+            out = {"status": "failed", "result": tail or "It stopped without a result.", "denials": [], "cost_usd": None, "blocked": ""}
+        with c:
+            c.execute("UPDATE replays SET status = ?, result = ?, denials = ?, cost_usd = ?, ended_at = ? WHERE session_id = ?",
+                      (out["status"], out["result"], json.dumps({"denied": out["denials"], "blocked": out["blocked"]}),
+                       out["cost_usd"], runner.now(), session_id))
+        runner.remove_plugin(reruns_dir / session_id / "plugin")
+
+    def refresh_reruns(c) -> None:
+        """Background reruns whose process ended while the dashboard was not watching it."""
+        for x in c.execute("SELECT session_id, pid FROM replays WHERE status = 'running'").fetchall():
+            if not runner.alive(x["pid"]):
+                finish_rerun(x["session_id"])
+
+    def start_replay(c, prompt_id: str, opts: dict) -> dict:
+        """Rerun a prompt with Claude Code: the same folder and prompt, the skills as they ran, the model,
+        effort and release asked for; in the background (unattended) or in a terminal window."""
+        r = replayable(c, prompt_id)
+        version = (r["harness_version"] or "") if opts["release"] == "same" else opts["release"]
+        version = version if replay.VERSION_RE.match(version) else ""
+        session_id = str(uuid.uuid4())
+        cwd = r["cwd"] or str(Path.home())
+        # the skills as they ran, in a plugin for this session only: the user's copies stay untouched
+        versions = [dict(v) for v in c.execute(
+            "SELECT k.skill, v.* FROM prompt_skill_runs k JOIN skill_versions v ON v.hash = k.hash WHERE k.prompt_id = ? "
+            "AND v.origin != 'bundled' ORDER BY k.skill", (prompt_id,))] if opts["restore_skills"] else []
+        plugin = reruns_dir / session_id / "plugin" if versions else None
+        skills = runner.build_skills_plugin(plugin, versions) if plugin else []
+        row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
+               "harness_version": version, "launched_at": runner.now(), "mode": opts["mode"], "skills": json.dumps(skills),
+               "permission": opts["permission"], "budget_usd": opts["budget"]}
+        if opts["mode"] == "terminal":
+            note = "\n".join(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with."
+                              for k in skills)
+            argv = replay.claude_argv(r["text"], session_id, opts["model"], opts["effort"], version, str(plugin or ""), note)
+            launched = replay.launch(cwd, argv)
+            row.update(status="interactive")
+        else:
+            argv = runner.background_argv(r["text"], session_id, opts["model"], opts["effort"], version, opts["permission"],
+                                          opts["budget"], plugin, skills)
+            log = reruns_dir / session_id / "stream.jsonl"
+            row.update(status="running", log_path=str(log))
+            # recorded before it starts: a quick end must find its row
+            with c:
+                c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+            try:
+                pid = runner.start(cwd, argv, log, lambda: finish_rerun(session_id))
+            except OSError as e:
+                with c:
+                    c.execute("UPDATE replays SET status = 'failed', result = ?, ended_at = ? WHERE session_id = ?",
+                              (f"Claude Code could not start: {e}", runner.now(), session_id))
+                raise HTTPException(500, f"Claude Code could not start: {e}") from None
+            with c:
+                c.execute("UPDATE replays SET pid = ? WHERE session_id = ?", (pid, session_id))
+            return {"prompt_id": prompt_id, "session_id": session_id, "mode": "background", "terminal": None, "cwd": cwd,
+                    "skills": skills, "command": f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"}
+        # recorded even without a terminal: the command carries the session id, so running it by hand links it too
+        with c:
+            c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+        return {"prompt_id": prompt_id, "session_id": session_id, "mode": "terminal", "terminal": launched, "cwd": cwd,
+                "skills": skills, "command": f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"}
+
+    @app.post("/api/prompts/{prompt_id}/replay")
+    async def replay_prompt(prompt_id: str, request: Request):
+        return start_replay(conn(), prompt_id, rerun_options(await dashboard_json(request)))
+
+    # ---- reruns: a queue, launched together from the Reruns page -----------------------------
+
+    QUEUE_KEYS = ("model", "effort", "release", "mode", "permission", "budget_usd", "restore_skills")
+
+    @app.post("/api/reruns/queue")
+    async def queue_reruns(request: Request):
+        """Queue prompts for a rerun with these options; a prompt already queued with them is not added twice."""
+        body = await dashboard_json(request)
+        o = rerun_options(body)
+        values = {"model": o["model"], "effort": o["effort"], "release": o["release"], "mode": o["mode"], "permission": o["permission"],
+                  "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"])}
+        c = conn()
+        ids = [str(i) for i in body.get("prompt_ids") or []]
+        for i in ids:
+            replayable(c, i)
+        same = " AND ".join(f"COALESCE({k}, '') = COALESCE(?, '')" for k in values)
+        with c:
+            added = sum(
+                c.execute(
+                    f"INSERT INTO replay_queue(prompt_id, same_version, added_at, {', '.join(values)}) "
+                    f"SELECT ?, ?, ?, {', '.join('?' * len(values))} WHERE NOT EXISTS (SELECT 1 FROM replay_queue WHERE prompt_id = ? AND {same})",
+                    (i, int(o["release"] == "same"), runner.now(), *values.values(), i, *values.values()),
+                ).rowcount
+                for i in ids
+            )
+        return {"added": added, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
+
+    @app.get("/api/reruns")
+    def list_reruns():
+        """The queue, and the reruns launched so far with how they ended, the prompt they replay and, once
+        imported, the rerun itself."""
+        c = conn()
+        refresh_reruns(c)
+        prompt_cols = "id, text, project, started_at, total_cost_usd, total_tokens, active_ms, wall_ms, harness_version"
+        def prompt(pid):
+            r = c.execute(f"SELECT {prompt_cols} FROM pv WHERE id = ?", (pid,)).fetchone()
+            return dict(r) if r else None
+        queue = [{**dict(q), "prompt": prompt(q["prompt_id"])} for q in c.execute("SELECT * FROM replay_queue ORDER BY id")]
+        launched = []
+        for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC LIMIT 200"):
+            done = c.execute(f"SELECT {prompt_cols} FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
+            launched.append({**rerun_row(x), "original": prompt(x["prompt_id"]), "replay": dict(done) if done else None})
+        return {"queue": queue, "launched": launched}
+
+    def rerun_row(x) -> dict:
+        d = dict(x)
+        d["skills"] = json.loads(d.get("skills") or "[]")
+        d["denials"] = json.loads(d.get("denials") or "null")
+        d.pop("pid", None), d.pop("log_path", None)
+        return d
+
+    @app.delete("/api/reruns/queue/{item_id}")
+    def unqueue(item_id: int):
+        c = conn()
+        with c:
+            c.execute("DELETE FROM replay_queue WHERE id = ?", (item_id,))
+        return {"queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
+
+    @app.post("/api/reruns/launch")
+    async def launch_reruns(request: Request):
+        """Launch queued reruns together and take them out of the queue."""
+        body = await dashboard_json(request)
+        c = conn()
+        results = []
+        for item_id in body.get("ids") or []:
+            q = c.execute("SELECT * FROM replay_queue WHERE id = ?", (int(item_id),)).fetchone()
+            if q is None:
+                continue
+            release = q["release"] if q["release"] is not None else ("same" if q["same_version"] else "")
+            opts = {"model": q["model"] or "", "effort": q["effort"] or "", "release": release, "mode": q["mode"] or "background",
+                    "permission": q["permission"] or "ask", "budget": q["budget_usd"],
+                    "restore_skills": q["restore_skills"] is None or bool(q["restore_skills"])}
+            try:
+                results.append({"id": q["id"], **start_replay(c, q["prompt_id"], opts)})
+            except HTTPException as e:
+                results.append({"id": q["id"], "prompt_id": q["prompt_id"], "error": e.detail})
+            with c:
+                c.execute("DELETE FROM replay_queue WHERE id = ?", (q["id"],))
+        return {"results": results}
+
+    @app.get("/api/skill-versions/{hash}")
+    def skill_version(hash: str):
+        """A skill exactly as a run loaded it (SKILL.md without its frontmatter), and where it comes from."""
+        r = conn().execute("SELECT * FROM skill_versions WHERE hash = ?", (hash,)).fetchone()
+        if r is None:
+            raise HTTPException(404)
+        return dict(r)
+
     @app.get("/api/projects")
     def list_projects():
         c = conn()
-        return [r[0] for r in c.execute("SELECT DISTINCT project FROM prompts WHERE project != '' ORDER BY project")]
+        return [r[0] for r in c.execute("SELECT DISTINCT project FROM pv WHERE project != '' ORDER BY project")]
 
     return app
 

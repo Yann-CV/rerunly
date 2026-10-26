@@ -169,6 +169,30 @@ a timeline by creation date. Click one to open its charts in place.</p>
   prompts sharing one of your tags, or similar prompts sharing it, split by model, skill,
   project or your tags if you like (see [How prompts are linked](#-how-prompts-are-linked)).
 - *+ Add a tag*: one of your tags, or a new one with a description and rules.
+- **Run it again**: what ran the prompt (the agent and its version, the model and effort, and
+  each skill's exact version) and a command repeating it: same folder, skills checked out at the
+  commit they ran from, same agent release and model. View or download each skill exactly as it
+  ran, even when no commit has it.
+- **Rerun with Claude**: the same folder and prompt, with **the skills as they ran** (rebuilt
+  from their commit, or their snapshot, into a plugin for that run only: your copies stay
+  untouched), the same model and effort or others, the installed Claude Code or a given release.
+  **Unattended** (the default), it runs in the background: anything that would need you (a
+  command, an edit, a question) is denied, the agent stops and says what it needed, and a budget
+  cap stops runaways. **In a terminal**, you watch it and approve its actions.
+- Each rerun gets a **status**: running, done, needs you (with the actions it was denied and
+  what it said it needed), or failed.
+- **Compared with the original**: a rerun's page sets its figures (cost, tokens, time, calls)
+  next to the original's, lists the files each edited, and shows both final answers side by
+  side or as differences.
+- **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
+  it, or leave reruns out of the history on the Setup page) and none of the original's tags. A
+  rerun's page says what it reruns, its cost against it, and the configuration chosen to launch
+  it (model, effort, Claude Code release).
+- When one of the prompt's tags has a reference run, *Settings from* reuses the reference's
+  model, effort and Claude Code release; on a tag's page, *Queue … with the reference's
+  settings* does it for many prompts at once.
+- **Add to queue** keeps a rerun for later, with the settings picked. Queue many at once from
+  the Prompts page or a tag's page: *Select prompts*, then *Queue reruns*.
 </details>
 
 <details>
@@ -194,6 +218,17 @@ a timeline by creation date. Click one to open its charts in place.</p>
 </details>
 
 <details>
+<summary><b>Reruns</b>: a queue, launched together</summary>
+
+- The queued reruns, with their prompt, its original cost and the settings to rerun it with
+  (model, effort, Claude Code release). Pick some, or all, and **Run selected**: each opens its
+  own Claude Code window, all at the same time, after a confirmation saying how many and what
+  their originals cost.
+- **Launched**: every rerun started from the dashboard, and once imported, its cost and time
+  against the original.
+</details>
+
+<details>
 <summary><b>Sessions, Setup and the status bar icon</b></summary>
 
 - **Sessions**: every session with its totals, and a page each with the price-table cost next
@@ -201,8 +236,9 @@ a timeline by creation date. Click one to open its charts in place.</p>
   and persona, Claude Code's own per-caller cost when telemetry is on, and its prompts over
   time.
 - **Setup**: check that transcripts are found, install the live-update hook, enable telemetry,
-  extend transcript retention, start at login, and edit the price table, similarity threshold
-  and auto-tag rules.
+  extend transcript retention, start at login, leave projects, skills, subagent types or
+  sessions out of the history, and edit the price table and similarity threshold. Tags and
+  their rules live on the Tags pages.
 - **Status bar icon**: today's cost and prompt count, *Open dashboard* (also a left click),
   *Import now*, *Start at login* and *Quit*.
 </details>
@@ -275,10 +311,13 @@ it is only common words (such as "do it"), which leaves nothing to compare.
   prompts** (default), **all prompts tagged** with one of your tags, or **similar prompts
   tagged** with it (when one tag covers several kinds of prompts). The charts, the
   "vs group median" figures and the table of runs all use that history and nothing else.
-- *One line per* splits that history by **model**, **skill**, **project** or **your tags**, with
-  a table of each group's runs, median cost, time and tokens, and the cheapest one marked. The
-  same split works on every **tag's page**, over all its runs: the way to see which model does a
-  task for less.
+- *One line per* splits that history by **model**, **skill**, **skill version**, **agent
+  version**, **project** or **your tags**, with a table of each group's runs, median cost, time
+  and tokens, and the cheapest one marked. The same split works on every **tag's page**, over all
+  its runs: the way to see which model, or which version of a skill, does a task for less.
+- Any tag can have a **reference run**, the version the others are measured against: click ☆
+  on one of its runs. Every run then shows its cost against it (*▼ 23% vs ref*), the charts mark
+  it with a ◆, and a prompt compared with that tag shows its cost, tokens and time against it.
 
 **Tip:** for the most reliable comparison, give a task's runs one tag of yours (a keyword rule
 does it for you) and compare with "All prompts tagged …". Similarity is a good default, but it
@@ -301,6 +340,8 @@ Trust, but verify: every figure comes from data Claude Code writes itself.
 | Wall time | From the prompt to its last event, including subagents that finish later. |
 | API time | Sum of `duration_ms` over the prompt's telemetry events (telemetry only). |
 | Persona | Read from the start of the subagent's prompt: `<persona>…</persona>`, `Persona: …` / `Role: …`, or `You are a…` / `Act as…`. The skill is the last one invoked (or the slash command run) before the subagent was spawned. |
+| Skill version | The instructions the agent loaded, which Claude Code writes into the transcript after a `Skill` call ("Base directory for this skill: …"): an exact snapshot, kept by its hash. Its origin is found once, at import: the newest git commit made before the run whose `SKILL.md` (without frontmatter) matches, the version in the nearest `.claude-plugin/plugin.json`, or the Claude Code release bundling it. |
+| Agent version, model, effort | The `version`, `requestedModel` and `effort` fields of the transcript, plus the model of each answer. |
 | Similar prompts | Word overlap (Jaccard) ≥ the threshold (default 0.6); the same slash command counts as 0.5 + half the overlap. See [How prompts are linked](#-how-prompts-are-linked). |
 
 Switch between the two costs at any time with **Official / Price table** in the top bar:
@@ -313,9 +354,6 @@ land within a few percent of it, and on a test prompt telemetry and the price ta
 exactly. Telemetry only applies to Claude Code sessions started after it is enabled, and calls
 made while the dashboard is not running are lost; a prompt missing some of its calls falls back
 to the estimate.
-
-Rules can also be regular expressions, written on the Setup page:
-`{"pattern": "review .*paper", "tag": "task:paper-review"}`.
 </details>
 
 ## 🛣️ Beyond Claude Code

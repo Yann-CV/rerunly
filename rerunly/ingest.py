@@ -10,6 +10,7 @@ from .pricing import Usage, cost_usd
 from .sources.base import AgentRecord, ApiCall, PromptRecord, SessionRecord
 from .sources.claude_code import ClaudeCodeSource
 from .tagging import ai_tags, rule_scope, rule_tags
+from .versions import body_hash, resolve
 
 
 def _ms_between(start: str | None, end: str | None) -> int | None:
@@ -71,14 +72,35 @@ def _insert_prompt(conn: sqlite3.Connection, p: PromptRecord, source: str, setti
         json.dumps(p.tools), json.dumps(models), json.dumps(sorted(unpriced)),
         len(p.agents), agent_tokens, agent_cost,
         usage.total_tokens + agent_tokens, cost + agent_cost,
+        p.harness, p.harness_version, p.effort, p.requested_model,
+        p.answer, json.dumps(sorted(p.files)),
     ))
+    for run in p.skill_runs:
+        h = _store_skill_version(conn, run, p.started_at)
+        conn.execute("INSERT OR IGNORE INTO prompt_skill_runs(prompt_id, skill, hash, args) VALUES (?,?,?,?)", (p.id, run.name, h, run.args))
     for tag in ai_tags(p):
         conn.execute("INSERT OR IGNORE INTO tags(prompt_id, tag, auto) VALUES (?,?,1)", (p.id, tag))
+
+
+def _store_skill_version(conn: sqlite3.Connection, run, used_at: str) -> str:
+    """Keep the skill's snapshot; find what restores it once, or again while it was not committed."""
+    h = body_hash(run.body)
+    row = conn.execute("SELECT git_state, origin FROM skill_versions WHERE hash = ?", (h,)).fetchone()
+    if row and (row[1] != "git" or row[0] == "committed"):
+        return h
+    v = resolve(run.base_dir, run.body, used_at)
+    conn.execute(
+        "INSERT OR REPLACE INTO skill_versions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (h, run.name, run.base_dir, run.body, v["origin"], v["git_repo"], v["git_path"], v["git_commit"], v["git_state"],
+         v["plugin"], v["plugin_version"], v["bundled_version"], datetime.now().isoformat(timespec="seconds")),
+    )
+    return h
 
 
 def store_session(conn: sqlite3.Connection, session: SessionRecord, settings: dict) -> None:
     old_ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id=?", (session.id,))]
     conn.executemany("DELETE FROM tags WHERE prompt_id=? AND auto != 0", [(i,) for i in old_ids])
+    conn.executemany("DELETE FROM prompt_skill_runs WHERE prompt_id=?", [(i,) for i in old_ids])
     conn.execute("DELETE FROM agents WHERE session_id=?", (session.id,))
     conn.execute("DELETE FROM prompts WHERE session_id=?", (session.id,))
     _insert(conn, "sessions", (
@@ -90,6 +112,20 @@ def store_session(conn: sqlite3.Connection, session: SessionRecord, settings: di
         if conn.execute("SELECT 1 FROM prompts WHERE id=?", (prompt.id,)).fetchone():
             continue
         _insert_prompt(conn, prompt, session.source, settings)
+    _link_replay(conn, session.id)
+
+
+RERUN_TAG = "rerun"
+
+
+def _link_replay(conn: sqlite3.Connection, session_id: str) -> None:
+    """A session launched as a rerun is studied on its own: every prompt of it gets the `rerun` tag (an AI
+    tag, so it can be filtered on or left out of the history), and none of the original's tags."""
+    if conn.execute("SELECT 1 FROM replays WHERE session_id = ?", (session_id,)).fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(prompt_id, tag, auto) SELECT id, ?, 1 FROM prompts WHERE session_id = ?",
+            (RERUN_TAG, session_id),
+        )
 
 
 def apply_rules(conn: sqlite3.Connection, rules: list[dict]) -> None:

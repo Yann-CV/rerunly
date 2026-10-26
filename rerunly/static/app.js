@@ -59,6 +59,15 @@ const median = (xs) => {
   const m = Math.floor(s.length / 2);
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
+/** A run against the tag's reference run: "▼ 23% vs ref", green when lower (cheaper, faster, fewer tokens). */
+function refDelta(value, ref, { long = false, against } = {}) {
+  if (value == null || !ref) return "";
+  const pct = Math.round(((value - ref) / ref) * 100);
+  const vs = against ?? (long ? "reference" : "ref");
+  const text = `${pct === 0 ? "=" : pct < 0 ? `▼ ${-pct}%` : `▲ ${pct}%`}${vs ? ` vs ${vs}` : ""}`;
+  return `<span class="pdelta ${pct < 0 ? "delta-good" : pct > 0 ? "delta-bad" : ""}">${text}</span>`;
+}
+
 /** Change against the median of the comparison group picked below the tiles. */
 function deltaText(value, ref) {
   if (value == null || !ref) return "";
@@ -314,7 +323,7 @@ function evolutionChart(canvas, points, metric, format, currentId, othersLabel) 
 const COMPARE_COLORS = ["--rule-0", "--rule-2", "--rule-3", "--rule-4", "--rule-5", "--tag-ai"];
 
 /** One metric over time for several groups of prompts (`groups`: {label, color, points}); `current` stands out. */
-function compareChart(canvas, groups, current, metric, format) {
+function compareChart(canvas, groups, current, metric, format, reference = null) {
   const surface = css("--surface-1");
   const toXY = (label) => (p) => ({ x: new Date(p.started_at).getTime(), y: metric(p), p, label });
   const line = (g) => {
@@ -331,6 +340,9 @@ function compareChart(canvas, groups, current, metric, format) {
       datasets: [
         { label: "This prompt", data: !current || metric(current) == null ? [] : [toXY("This prompt")(current)], showLine: false, pointRadius: 7, pointHoverRadius: 9,
           pointBackgroundColor: css("--series-2"), pointBorderColor: surface, pointBorderWidth: 2, order: 0 },
+        { label: "Reference", data: !reference || metric(reference) == null ? [] : [toXY("Reference")(reference)], showLine: false,
+          pointStyle: "rectRot", pointRadius: 8, pointHoverRadius: 10, pointBackgroundColor: css("--text-primary"),
+          pointBorderColor: surface, pointBorderWidth: 2, order: 0 },
         ...groups.map(line),
       ],
     },
@@ -461,10 +473,10 @@ function savePromptPrefs() {
 // on a tag page `lockTag` pins the tag filter
 // `selecting` turns the list's rows into a selection (`selected`: prompt ids) to give them a tag
 const listState = { q: "", tag: "", project: "", range: "all", sort: "recent", order: "used", lockTag: "", ...loadPromptPrefs(), items: [], summary: null, tags: [],
-  selecting: false, selected: new Set(), split: "" };
+  selecting: false, selected: new Set(), split: "", reference: null };
 
 // a tag page's charts: one line for all runs, or one per model (project, skill, tag of yours) among them
-const SPLITS = { "": "Nothing", model: "Model", skill: "Skill", project: "Project", human: "Your tags" };
+const SPLITS = { "": "Nothing", model: "Model", skill: "Skill", skillver: "Skill version", agentver: "Agent version", project: "Project", human: "Your tags" };
 
 /** The runs grouped by their tags of category `cat` (a run with two models is in both); the biggest groups,
     the rest together, and the runs with none. */
@@ -472,18 +484,21 @@ function splitRuns(items, cat, exclude = listState.lockTag) {
   if (!cat) return [{ label: "All runs", points: items, color: COMPARE_COLORS[0] }];
   const groups = new Map(), none = [];
   for (const p of items) {
-    const tags = (p.tags || []).filter((t) => tagCategory(t) === cat && t.tag !== exclude);
-    if (!tags.length) none.push(p);
-    for (const t of tags) {
-      if (!groups.has(t.tag)) groups.set(t.tag, []);
-      groups.get(t.tag).push(p);
+    // versions come from the run itself; the other splits from its tags
+    const values = cat === "agentver" ? (p.harness_version ? [`${p.harness || "Agent"} ${p.harness_version}`.trim()] : [])
+      : cat === "skillver" ? (p.skill_versions ? p.skill_versions.split("\x1f") : [])
+      : (p.tags || []).filter((t) => tagCategory(t) === cat && t.tag !== exclude).map((t) => t.tag);
+    if (!values.length) none.push(p);
+    for (const v of values) {
+      if (!groups.has(v)) groups.set(v, []);
+      groups.get(v).push(p);
     }
   }
   const sorted = [...groups].sort((a, b) => b[1].length - a[1].length);
   const max = COMPARE_COLORS.length - (none.length ? 2 : 1);
   const out = sorted.slice(0, max).map(([label, points]) => ({ label, points }));
   if (sorted.length > max) out.push({ label: `${sorted.length - max} others`, points: [...new Set(sorted.slice(max).flatMap(([, ps]) => ps))] });
-  if (none.length) out.push({ label: { model: "No model", skill: "No skill", project: "No project", human: "None of your tags" }[cat], points: none });
+  if (none.length) out.push({ label: { model: "No model", skill: "No skill", skillver: "No skill", agentver: "Unknown version", project: "No project", human: "None of your tags" }[cat], points: none });
   return out.map((g, i) => ({ ...g, color: COMPARE_COLORS[i] }));
 }
 
@@ -557,6 +572,11 @@ function promptRow(p, maxCost, { compact = false } = {}) {
   const selectable = listState.selecting && !groupedLayout() && !compact;
   const picked = selectable && listState.selected.has(p.id);
   const timeHtml = `<time datetime="${esc(p.started_at)}">${when}</time>`;
+  // on a tag page: the reference run, and the button making a run the reference
+  const ref = listState.lockTag && !compact ? listState.reference : null;
+  const isRef = Boolean(ref && ref.id === p.id);
+  const starHtml = listState.lockTag && !compact
+    ? `<button type="button" class="pref" data-ref="${esc(p.id)}" aria-pressed="${isRef}" title="${isRef ? "The reference run: click to clear it" : "Make this run the reference every other run is compared with"}">${isRef ? "★" : "☆"}</button>` : "";
   return `<article class="prow ${compact ? "compact" : ""} ${picked ? "selected" : ""}" data-id="${esc(p.id)}">
     ${selectable ? `<div class="pwhen"><input type="checkbox" class="psel" data-select="${esc(p.id)}" ${picked ? "checked" : ""}
       aria-label="Select this prompt">${timeHtml}</div>` : timeHtml}
@@ -565,9 +585,10 @@ function promptRow(p, maxCost, { compact = false } = {}) {
       ${compact ? "" : `<div class="pchips">${p.project ? `<span class="pproject">${esc(p.project)}</span>` : ""}${rowChips((p.tags || []).filter((t) => tagCategory(t) !== "project"))}</div>`}
     </div>
     <div class="pmetrics">
-      <span class="pcost">${fmtCost(p.total_cost_usd)}</span>
+      <span class="pcost-line">${starHtml}<span class="pcost">${fmtCost(p.total_cost_usd)}</span></span>
       <span class="cost-bar" title="Cost relative to the most expensive prompt shown"><i style="width:${pct}%"></i></span>
       <span class="pmeta">${meta}</span>
+      ${ref && !isRef ? refDelta(p.total_cost_usd, ref.total_cost_usd) : isRef ? '<span class="pdelta ref-badge">◆ Reference</span>' : ""}
     </div>
   </article>`;
 }
@@ -588,7 +609,7 @@ function listHtml(items, maxCost) {
   }).join("");
 }
 
-const FAMILY_LABELS = { project: "Projects", model: "Models", skill: "Skills", cmd: "Slash commands", agent: "Subagent types", persona: "Personas" };
+const FAMILY_LABELS = { project: "Projects", model: "Models", skill: "Skills", cmd: "Slash commands", agent: "Subagent types", persona: "Personas", rerun: "Reruns" };
 
 // earlier runs of each group, rendered on first open: the sections can hold thousands of rows
 let groupRuns = [];
@@ -784,10 +805,11 @@ async function renderPrompts({ reload = true } = {}) {
     document.getElementById("tag-charts").innerHTML = !items.length ? "" : `
       <div class="compare-picker split-picker" role="group" aria-label="Split by"><span class="muted">One line per</span>
         ${Object.entries(SPLITS).map(([key, label]) => `<button type="button" class="series-chip" data-split="${key}" aria-pressed="${key === listState.split}">${label}</button>`).join("")}</div>
-      ${groups.length > 1 ? `<div class="legend">${groups.map((g) => `<span><i style="background:var(${g.color})"></i>${esc(g.label)} <span class="mi-count">${g.points.length}</span></span>`).join("")}</div>` : ""}
+      ${groups.length > 1 || listState.reference ? `<div class="legend">${listState.reference ? '<span><i class="ref-swatch"></i>Reference run</span>' : ""}${groups.length > 1 ? groups.map((g) => `<span><i style="background:var(${g.color})"></i>${esc(g.label)} <span class="mi-count">${g.points.length}</span></span>`).join("") : ""}</div>` : ""}
       <div class="charts">${metrics.map(([id, title]) => `<div class="card"><div class="chart-title">${title}</div><div class="chart-box"><canvas id="tagchart-${id}"></canvas></div></div>`).join("")}</div>
       ${splitSummaryHtml(groups)}`;
-    if (items.length) metrics.forEach(([id, , metric, fmt]) => compareChart(document.getElementById(`tagchart-${id}`), groups, null, metric, fmt));
+    if (items.length) metrics.forEach(([id, , metric, fmt]) => compareChart(document.getElementById(`tagchart-${id}`), groups, null, metric, fmt, listState.reference));
+    document.getElementById("tag-reference").innerHTML = referenceCardHtml();
     document.querySelectorAll("[data-split]").forEach((b) => b.onclick = () => { listState.split = b.dataset.split; renderPrompts({ reload: false }); });
   }
   document.getElementById("active-filters").innerHTML = activeFiltersHtml();
@@ -818,6 +840,10 @@ function selectBarHtml() {
     ${n ? '<button type="button" class="link-btn" data-select-none>Clear</button>' : ""}
     <span class="toolbar-spacer"></span>
     <span class="muted select-hint">${n ? "" : "Click prompts to select them; search or filter first to narrow them down."}</span>
+    <span class="select-note" id="select-note"></span>
+    <button type="button" class="btn" data-queue-selected ${n ? "" : "disabled"} title="Rerun them later from the Reruns page, with the model and effort they ran with">↻ Queue ${n || ""} rerun${n === 1 ? "" : "s"}</button>
+    ${listState.lockTag && listState.reference ? `<button type="button" class="btn" data-queue-selected="reference" ${n ? "" : "disabled"}
+      title="Rerun them with the reference run's model, effort and Claude Code release">↻ … with the reference's settings</button>` : ""}
     <button type="button" class="btn primary" data-new-tag ${n ? "" : "disabled"}>Tag ${n || ""} selected…</button>
     <button type="button" class="btn" data-toggle-select>Done</button>
   </div>`;
@@ -845,6 +871,11 @@ function bindSelection(page, { tags, exclude = [] }) {
       renderPrompts({ reload: false });
     } else if (e.target.closest("[data-select-none]")) {
       listState.selected.clear(); renderPrompts({ reload: false });
+    } else if (e.target.closest("[data-queue-selected]")) {
+      const ref = e.target.closest("[data-queue-selected]").dataset.queueSelected === "reference" ? listState.reference : null;
+      const settings = ref ? { model: ref.requested_model || "", effort: ref.effort || "", version: ref.harness_version || "" } : {};
+      const out = await api("/api/reruns/queue", { method: "POST", body: { prompt_ids: [...listState.selected], ...settings } });
+      document.getElementById("select-note").innerHTML = `${plural(out.added, "rerun")} queued · <a href="#/reruns">${out.queued} on the Reruns page</a>`;
     }
   });
 }
@@ -859,6 +890,7 @@ function bindPromptResults() {
   renderSelectBar();
   // while selecting, a click on a row (its checkbox included) selects it instead of opening it
   results.onclick = (e) => {
+    if (e.target.closest("[data-ref]")) return; // the reference star: handled by the page
     if (!listState.selecting || e.target.closest("[data-filter-tag]")) return;
     const row = e.target.closest(".prow[data-id]");
     if (!row || !row.querySelector(".psel")) return;
@@ -1020,6 +1052,267 @@ function compareSelect(p) {
   ${human.length ? "" : `<span class="muted" style="font-size:12px">Add one of your tags to compare with every prompt sharing it.</span>`}`;
 }
 
+// ---- run it again: what ran a prompt, and the command repeating it ----------------------
+
+const shellQuote = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
+
+/** Where a skill version comes from, in words. */
+function skillOrigin(k) {
+  const short = (k.git_commit || "").slice(0, 7);
+  const plugin = k.plugin ? ` · plugin ${esc(k.plugin)}${k.plugin_version ? ` ${esc(k.plugin_version)}` : ""}` : "";
+  switch (k.origin === "git" ? k.git_state : k.origin) {
+    case "committed": return `commit <code>${esc(short)}</code> of <code>${esc(k.git_repo)}</code> (<code>${esc(k.git_path)}</code>)${plugin}`;
+    case "uncommitted": return `uncommitted changes in <code>${esc(k.git_repo)}</code> when it ran: the snapshot is the only copy${plugin}`;
+    case "changed": return `no commit of <code>${esc(k.git_repo)}</code> has this version: the snapshot is the only copy${plugin}`;
+    case "bundled": return `built into Claude Code ${esc(k.bundled_version)}`;
+    case "missing": return `its folder <code>${esc(k.base_dir)}</code> is gone: the snapshot is the only copy${plugin}`;
+    default: return `folder <code>${esc(k.base_dir)}</code>, outside git: the snapshot is the only copy${plugin}`;
+  }
+}
+
+/** Shell lines repeating the run with Claude Code: the same folder, skill versions, release and model. */
+function rerunCommand(p) {
+  const r = p.rerun, model = r.requested_model || Object.keys(p.models || {})[0] || "";
+  const lines = [];
+  if (r.cwd) lines.push(`cd ${shellQuote(r.cwd)}`);
+  const undo = [];
+  for (const k of r.skills) {
+    if (k.origin === "git" && k.git_state === "committed") {
+      lines.push(`# ${k.skill} as it ran (commit ${k.git_commit.slice(0, 7)}): this replaces the skill's files, commit or stash your changes first`,
+        `git -C ${shellQuote(k.git_repo)} checkout ${k.git_commit} -- ${shellQuote(k.git_path)}`);
+      undo.push(`git -C ${shellQuote(k.git_repo)} checkout HEAD -- ${shellQuote(k.git_path)}`);
+    } else if (k.origin === "bundled") {
+      lines.push(`# ${k.skill}: built into Claude Code ${k.bundled_version}, comes with the release below`);
+    } else {
+      lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
+    }
+  }
+  const agent = r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude";
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? ` --effort ${r.effort}` : ""} ${shellQuote(p.text)}`);
+  if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
+  return lines.join("\n");
+}
+
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+/** Replay it with Claude Code from here, and the replays launched so far. */
+function replayHtml(p, models) {
+  const r = p.rerun;
+  if (r.harness && r.harness !== "Claude Code") return "";
+  const same = r.requested_model || Object.keys(p.models || {})[0] || "";
+  const opt = (value, label, current) => `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
+  const others = [...new Set([...models, ...p.references.map((x) => x.model).filter(Boolean)])].filter((m) => m !== same).sort();
+  // releases to pin: the one this run used, and the reference runs' ones
+  const releases = [];
+  if (r.harness_version) releases.push([r.harness_version, "the release it ran with"]);
+  for (const x of p.references) {
+    if (x.harness_version && !releases.some(([v]) => v === x.harness_version)) releases.push([x.harness_version, `reference of ${x.tag}`]);
+  }
+  const restorable = r.skills.filter((k) => k.origin !== "bundled");
+  // a budget cap well above what the run cost, so it only stops runaways
+  const budget = Math.max(0.5, Math.ceil((p.total_cost_usd || 0) * 3 * 2) / 2);
+  const replays = p.replays.map((x) => {
+    const done = x.prompt;
+    return `<li><span class="muted">${esc(fmtDate(x.launched_at))}</span> ${rerunStatusHtml(x, { details: false })}
+      ${done ? `<a href="#/prompt/${encodeURIComponent(done.id)}">${fmtCost(done.total_cost_usd)} · ${fmtMs(duration(done))} · compare</a> ${refDelta(done.total_cost_usd, p.total_cost_usd, { against: "original" })}`
+        : x.status === "running" ? '<span class="muted">running in the background</span>'
+        : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
+  }).join("");
+  return `<div class="replay">
+    <div class="replay-head"><strong>Rerun with Claude</strong>
+      <span class="muted">In <code>${esc(r.cwd || "your home folder")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}.
+        <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
+        <strong>In a terminal</strong>: you watch it and approve its actions.
+        ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
+    <form id="replay-form" class="replay-form">
+      ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
+        opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
+      <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
+      <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
+      <label title="Through npx for a release other than the installed one">Claude Code <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
+      <label>Run <select id="replay-mode">${opt("background", "Unattended, in the background", "background")}${opt("terminal", "In a terminal window", "")}</select></label>
+      <label class="bg-only" title="Anything else it tries is denied, and reported">May <select id="replay-permission">${opt("ask", "only read", "ask")}${opt("edits", "read and edit files", "")}</select></label>
+      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>
+      ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
+        <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
+      <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
+        <button class="btn primary">↻ Rerun now</button></span>
+    </form>
+    <p id="replay-status" class="replay-status" hidden></p>
+    ${replays ? `<div class="replays"><span class="muted">Reruns</span><ul>${replays}</ul></div>` : ""}
+  </div>`;
+}
+
+function rerunSectionHtml(p, knownModels = []) {
+  const r = p.rerun;
+  if (!r) return "";
+  const models = Object.keys(p.models || {}).map((m) => m.replace("claude-", ""));
+  const rows = [
+    ["Agent", r.harness ? `${esc(r.harness)}${r.harness_version ? ` <code>${esc(r.harness_version)}</code>` : ""}` : '<span class="muted">unknown</span>'],
+    ["Model", `${r.requested_model ? `<code>${esc(r.requested_model)}</code>` : ""}${models.length ? ` <span class="muted">answered by ${esc(models.join(", "))}</span>` : ""}${r.effort ? ` · effort ${esc(r.effort)}` : ""}`],
+    ...r.skills.map((k) => [`Skill`, `<strong>${esc(k.skill)}</strong>${k.args ? ` <span class="muted">with “${esc(k.args.slice(0, 80))}${k.args.length > 80 ? "…" : ""}”</span>` : ""}
+      <div class="skill-origin">${skillOrigin(k)}</div>
+      <div class="skill-actions"><button type="button" class="link-btn" data-view-skill="${esc(k.hash)}">View it as it ran</button>
+        <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
+        <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
+  ];
+  const command = r.harness === "Claude Code" ? rerunCommand(p) : "";
+  return `<h2 class="page-sec">Run it again</h2>
+    <div class="card rerun">
+      <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+      ${replayHtml(p, knownModels)}
+      ${command ? `<div class="rerun-cmd"><div class="rerun-cmd-head"><span>The same run, from a terminal</span>
+          <button type="button" class="btn" id="copy-rerun">Copy</button></div><pre><code>${esc(command)}</code></pre></div>` : ""}
+    </div>
+    <dialog id="skill-dialog" class="tag-dialog skill-dialog"><div class="skill-dialog-body">
+      <div class="rerun-cmd-head"><h2 id="skill-dialog-title"></h2><button type="button" class="btn" data-close-skill>Close</button></div>
+      <p class="muted" id="skill-dialog-origin"></p><pre id="skill-dialog-text"></pre></div></dialog>`;
+}
+
+function bindRerun(p) {
+  const form = document.getElementById("replay-form");
+  const settings = () => ({
+    model: document.getElementById("replay-model").value, effort: document.getElementById("replay-effort").value,
+    version: document.getElementById("replay-release").value, mode: document.getElementById("replay-mode").value,
+    permission: document.getElementById("replay-permission").value, budget_usd: document.getElementById("replay-budget").value,
+    restore_skills: document.getElementById("replay-skills")?.checked ?? true,
+  });
+  // permission and budget only apply to unattended reruns
+  const mode = document.getElementById("replay-mode");
+  if (mode) mode.onchange = () => form.querySelectorAll(".bg-only").forEach((el) => { el.hidden = mode.value !== "background"; });
+  // a reference run's settings, copied into the menus (still editable)
+  const from = document.getElementById("replay-from");
+  if (from) from.onchange = () => {
+    const x = p.references[Number(from.value)];
+    const set = (id, value, sameValue) => {
+      const select = document.getElementById(id);
+      const v = !x || !value || value === sameValue ? "" : value;
+      if (v && ![...select.options].some((o) => o.value === v)) select.add(new Option(v, v));
+      select.value = v;
+    };
+    set("replay-model", x?.model, p.rerun.requested_model);
+    set("replay-effort", x?.effort, p.rerun.effort);
+    set("replay-release", x?.harness_version, null);
+  };
+  const queueButton = document.getElementById("queue-replay");
+  if (queueButton) queueButton.onclick = async () => {
+    const out = await api("/api/reruns/queue", { method: "POST", body: { prompt_ids: [p.id], ...settings() } });
+    const status = document.getElementById("replay-status");
+    status.innerHTML = `${out.added ? "Added to the queue" : "Already in the queue with these settings"}: <a href="#/reruns">${out.queued} queued on the Reruns page</a>.`;
+    status.hidden = false;
+  };
+  if (form) form.onsubmit = async (e) => {
+    e.preventDefault();
+    const status = document.getElementById("replay-status");
+    const button = form.querySelector("button.primary");
+    button.disabled = true;
+    try {
+      const out = await api(`/api/prompts/${encodeURIComponent(p.id)}/replay`, { method: "POST", body: settings() });
+      const skills = out.skills.length ? ` With ${out.skills.map((k) => `${esc(k.skill)} @ ${esc(k.source)}`).join(", ")}.` : "";
+      status.innerHTML = out.mode === "background"
+        ? `Rerun started in the background.${skills} Follow it on the <a href="#/reruns">Reruns</a> page: it says when it is done, or what it needed.`
+        : out.terminal
+          ? `Claude Code opened in a new terminal window.${skills} Once it answers, the rerun shows up here (press Refresh).`
+          : `No terminal window could be opened from here. Run this in a terminal: the rerun is linked to this prompt once imported.<pre><code>${esc(out.command)}</code></pre>`;
+      status.hidden = false;
+      if (out.mode === "background" || out.terminal) setTimeout(() => route(), 1500);
+    } catch (err) {
+      status.textContent = err.message; status.hidden = false;
+    } finally { button.disabled = false; }
+  };
+  const copy = document.getElementById("copy-rerun");
+  if (copy) copy.onclick = async () => {
+    await navigator.clipboard.writeText(rerunCommand(p));
+    copy.textContent = "Copied"; setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  };
+  const fetched = {};
+  const skillText = async (hash) => (fetched[hash] ||= await api(`/api/skill-versions/${hash}`));
+  app.querySelectorAll("[data-view-skill]").forEach((b) => b.onclick = async () => {
+    const v = await skillText(b.dataset.viewSkill);
+    document.getElementById("skill-dialog-title").textContent = v.skill;
+    document.getElementById("skill-dialog-origin").innerHTML = skillOrigin(v);
+    document.getElementById("skill-dialog-text").textContent = v.body;
+    document.getElementById("skill-dialog").showModal();
+  });
+  app.querySelector("[data-close-skill]")?.addEventListener("click", () => document.getElementById("skill-dialog").close());
+  app.querySelectorAll("[data-download-skill]").forEach((b) => b.onclick = async () => {
+    const v = await skillText(b.dataset.downloadSkill);
+    // the instructions as loaded: SKILL.md's frontmatter is not part of them, so a minimal one is put back
+    const name = v.skill.split(":").pop();
+    const file = new Blob([`---\nname: ${name}\n---\n${v.body}\n`], { type: "text/markdown" });
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(file), download: `${name}-${v.hash.slice(0, 7)}-SKILL.md` });
+    a.click(); URL.revokeObjectURL(a.href);
+  });
+}
+
+/** Line differences between two texts (longest common subsequence): ["=", line] kept, ["-", line] only in
+    the first, ["+", line] only in the second. */
+function lineDiff(a, b) {
+  const x = a.split("\n").slice(0, 400), y = b.split("\n").slice(0, 400);
+  const lcs = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+  for (let i = x.length - 1; i >= 0; i--) for (let j = y.length - 1; j >= 0; j--)
+    lcs[i][j] = x[i] === y[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < x.length && j < y.length) {
+    if (x[i] === y[j]) { out.push(["=", x[i]]); i++; j++; }
+    else if (lcs[i + 1][j] >= lcs[i][j + 1]) out.push(["-", x[i++]]);
+    else out.push(["+", y[j++]]);
+  }
+  while (i < x.length) out.push(["-", x[i++]]);
+  while (j < y.length) out.push(["+", y[j++]]);
+  return out;
+}
+
+/** A rerun against its original: figures, files edited, and their final answers. */
+function compareOriginalHtml(p) {
+  const o = p.replay_of;
+  const rerunAnswer = p.answer || o.result || "";
+  const rows = [
+    ["Cost", o.total_cost_usd, p.total_cost_usd, fmtCost], ["Tokens", o.total_tokens, p.total_tokens, fmtTokens],
+    ["Active time", o.active_ms ?? o.wall_ms, duration(p), fmtMs], ["API calls", o.api_calls, p.api_calls, String],
+    ["Tool calls", o.tool_calls, p.tool_calls, String],
+  ];
+  const before = new Set(o.files || []), after = new Set(p.files || []);
+  const files = [...new Set([...before, ...after])].sort().map((f) => {
+    const where = before.has(f) && after.has(f) ? ["both", "both"] : before.has(f) ? ["before", "only the original"] : ["after", "only the rerun"];
+    return `<li class="file-${where[0]}"><code>${esc(f)}</code> <span class="muted">${where[1]}</span></li>`;
+  }).join("");
+  const sameAnswer = (o.answer || "").trim() === rerunAnswer.trim();
+  return `<h2 class="page-sec" id="compare-original">Compared with the original</h2>
+    <div class="card compare-original">
+      <table class="compare-figures"><thead><tr><th></th><th class="num">Original</th><th class="num">Rerun</th><th class="num">Change</th></tr></thead>
+        <tbody>${rows.map(([label, a, b, fmt]) => `<tr><td>${label}</td><td class="num">${a == null ? "–" : fmt(a)}</td><td class="num">${b == null ? "–" : fmt(b)}</td>
+          <td class="num">${a && b != null ? refDelta(b, a, { against: "" }) : ""}</td></tr>`).join("")}</tbody></table>
+      <div class="compare-files"><strong>Files edited</strong>${files ? `<ul>${files}</ul>` : '<p class="muted">Neither run edited a file.</p>'}</div>
+      <div class="compare-answers">
+        <div class="compare-answers-head"><strong>Final answers</strong>
+          ${sameAnswer ? '<span class="trend down">identical</span>' : '<button type="button" class="link-btn" id="toggle-diff">Show differences</button>'}</div>
+        <div class="answers" id="answers-side">
+          <div><span class="muted">Original</span><pre>${esc(o.answer || "(no answer recorded: re-import its transcript)")}</pre></div>
+          <div><span class="muted">Rerun</span><pre>${esc(rerunAnswer || "(no answer yet)")}</pre></div>
+        </div>
+        <pre class="answer-diff" id="answers-diff" hidden>${lineDiff(o.answer || "", rerunAnswer).map(([op, line]) =>
+          `<span class="diff-${op === "=" ? "same" : op === "-" ? "del" : "add"}">${op === "=" ? " " : op} ${esc(line) || " "}</span>`).join("")}</pre>
+      </div>
+    </div>`;
+}
+
+/** On a rerun's page: what it reruns, against it, and the configuration chosen when launching it. */
+function rerunOfHtml(p) {
+  const o = p.replay_of;
+  const original = o.id
+    ? `<a href="#/prompt/${encodeURIComponent(o.id)}">the run of ${esc(fmtDate(o.started_at))}</a> (${fmtCost(o.total_cost_usd)})`
+    : "a prompt no longer in the history";
+  return `<div class="rerun-of">
+    <span class="ref-label">↻ Rerun</span>
+    ${rerunStatusHtml(o)}
+    <span>${o.first ? `Rerun of ${original} ${o.id ? refDelta(p.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}` : `Follow-up in the rerun of ${original}`}</span>
+    <span class="rerun-config"><span class="muted">launched ${esc(fmtDate(o.launched_at))} with</span> ${rerunSettings(o)}</span>
+    <a class="link-btn" href="#/tag/rerun">All reruns</a>
+  </div>`;
+}
+
 // how a prompt page splits its history ("" or a SPLITS key): kept while moving from prompt to prompt
 let promptSplit = "";
 
@@ -1045,10 +1338,13 @@ async function viewPrompt(id, compare = {}) {
     const text = deltaText(value, r);
     return text ? `<span class="${value <= r ? "delta-good" : "delta-bad"}">${value <= r ? "▼" : "▲"} ${text}</span>` : "";
   };
+  // compared with a tag that has a reference run: this run against it (unless it is the reference)
+  const refRun = p.compare.reference && p.compare.reference.id !== p.id ? p.compare.reference : null;
+  const vsRef = (metric) => (refRun ? `<br>${refDelta(metric(p), metric(refRun), { long: true })}` : "");
   const facts = [
-    ["Total cost", fmtCost(p.total_cost_usd), delta(p.total_cost_usd, ref.cost), costNote(p)],
-    ["Total tokens", fmtTokens(p.total_tokens), delta(p.total_tokens, ref.tokens), "incl. cache and subagents"],
-    ["Active time", fmtMs(p.active_ms), delta(duration(p), ref.dur), `wall ${fmtMs(p.wall_ms)}`],
+    ["Total cost", fmtCost(p.total_cost_usd), delta(p.total_cost_usd, ref.cost) + vsRef((x) => x.total_cost_usd), costNote(p)],
+    ["Total tokens", fmtTokens(p.total_tokens), delta(p.total_tokens, ref.tokens) + vsRef((x) => x.total_tokens), "incl. cache and subagents"],
+    ["Active time", fmtMs(p.active_ms), delta(duration(p), ref.dur) + vsRef(duration), `wall ${fmtMs(p.wall_ms)}`],
     ["API calls", p.api_calls, `${p.tool_calls} tool calls`, p.api_ms != null ? `API time ${fmtMs(p.api_ms)}` : ""],
     ["Subagents", p.agent_count, p.agent_count ? `${fmtCost(p.agent_cost_usd)} · ${fmtTokens(p.agent_tokens)} tok` : "none", ""],
   ];
@@ -1079,6 +1375,7 @@ async function viewPrompt(id, compare = {}) {
     <a class="crumb" href="#/prompts">← All prompts</a>
     <header class="prompt-head">
       ${pageKicker("Prompt", "What this prompt cost, where the money went, and how it compares with its reruns.")}
+      ${p.replay_of ? rerunOfHtml(p) : ""}
       <div class="prompt-meta"><time datetime="${esc(p.started_at)}">${fmtDate(p.started_at)}</time>${p.project ? `<span>${esc(p.project)}</span>` : ""}
         ${p.command ? `<span class="pcmd">/${esc(p.command)}</span>` : ""}<span class="prompt-cost">${fmtCost(p.total_cost_usd)}</span></div>
       <pre class="prompt-text">${esc(p.text)}</pre>
@@ -1092,6 +1389,8 @@ async function viewPrompt(id, compare = {}) {
     ${unpriced}
     <div class="tags-hero prompt-facts">${facts.map(([label, value, sub, note]) => `<div class="hero-fact"><span class="label">${label}</span>
       <span class="value">${value}</span><span class="sub">${sub || "&nbsp;"}</span>${note ? `<span class="sub">${note}</span>` : ""}</div>`).join("")}</div>
+    ${p.replay_of?.first && p.replay_of.id ? compareOriginalHtml(p) : ""}
+    ${rerunSectionHtml(p, allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`))}
 
     <h2 class="page-sec">Cost per agent</h2>
     <div class="table-wrap"><table>
@@ -1106,6 +1405,12 @@ async function viewPrompt(id, compare = {}) {
     ${telemetryTable(p.telemetry)}
 
     <h2 class="page-sec" id="compare-sec">How it compares with ${compareSelect(p)} <span class="muted">(${sim.length} prompts)</span></h2>
+    ${p.compare.tag ? `<p class="ref-hint">${p.compare.reference
+      ? (p.compare.reference.id === p.id
+        ? `◆ This run is the reference of <strong>${esc(p.compare.tag)}</strong>.`
+        : `◆ Reference of <strong>${esc(p.compare.tag)}</strong>: <a href="#/prompt/${encodeURIComponent(p.compare.reference.id)}">${esc(fmtDate(p.compare.reference.started_at))} · ${fmtCost(p.compare.reference.total_cost_usd)}</a>.`)
+      : `<span class="muted"><strong>${esc(p.compare.tag)}</strong> has no reference run yet.</span>`}
+      ${p.compare.reference?.id === p.id ? "" : `<button type="button" class="link-btn" id="make-reference">Make this run the reference</button>`}</p>` : ""}
     ${sim.length ? `<div class="compare-picker split-picker" role="group" aria-label="Split by"><span class="muted">One line per</span>
         ${Object.entries(SPLITS).map(([key, label]) => `<button type="button" class="series-chip" data-split="${key}">${label}</button>`).join("")}</div>
       <div class="legend" id="cmp-legend"></div>
@@ -1128,13 +1433,25 @@ async function viewPrompt(id, compare = {}) {
     destroyCharts();
     const groups = splitRuns(history, promptSplit, p.compare.tag || "");
     app.querySelectorAll("[data-split]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.split === promptSplit)));
-    document.getElementById("cmp-legend").innerHTML = `<span><i style="background:var(--series-2)"></i>This prompt</span>${groups.map((g) =>
+    document.getElementById("cmp-legend").innerHTML = `<span><i style="background:var(--series-2)"></i>This prompt</span>${refRun ? '<span><i class="ref-swatch"></i>Reference run</span>' : ""}${groups.map((g) =>
       `<span><i style="background:var(${g.color})"></i>${esc(g.label === "All runs" ? `This prompt and ${what}` : g.label)} <span class="mi-count">${g.points.length}</span></span>`).join("")}`;
     document.getElementById("cmp-summary").innerHTML = splitSummaryHtml(groups);
     [["cost", (x) => x.total_cost_usd, fmtCost], ["dur", duration, fmtMs], ["tok", (x) => x.total_tokens, fmtTokens]]
-      .forEach(([id, metric, fmt]) => compareChart(document.getElementById(`cmp-${id}`), groups, p, metric, fmt));
+      .forEach(([id, metric, fmt]) => compareChart(document.getElementById(`cmp-${id}`), groups, p, metric, fmt, refRun));
   };
   app.querySelectorAll("[data-split]").forEach((b) => b.onclick = () => { promptSplit = b.dataset.split; drawCompare(); });
+  bindRerun(p);
+  const toggleDiff = document.getElementById("toggle-diff");
+  if (toggleDiff) toggleDiff.onclick = () => {
+    const diff = document.getElementById("answers-diff"), side = document.getElementById("answers-side");
+    diff.hidden = !diff.hidden; side.hidden = !diff.hidden;
+    toggleDiff.textContent = diff.hidden ? "Show differences" : "Show side by side";
+  };
+  const makeRef = document.getElementById("make-reference");
+  if (makeRef) makeRef.onclick = async () => {
+    await api(`/api/tags/${encodeURIComponent(p.compare.tag)}/reference`, { method: "PUT", body: { prompt_id: p.id } });
+    route();
+  };
   drawCompare();
   bindRowClicks();
   document.querySelectorAll("[data-remove-tag]").forEach((b) => b.onclick = async () => {
@@ -1628,14 +1945,27 @@ function tagSummaryHtml(items, s) {
     ${fact("Total cost", fmtCost(s.cost_usd || 0), `${fmtTokens(s.tokens || 0)} tokens`)}
     ${fact("Median cost", fmtCost(median(costs)), trendBadge(costs) || "per run")}
     ${fact("Median time", fmtMs(median(items.map(duration))), "per run, active time")}
+    ${listState.reference ? fact("Median vs reference", refDelta(median(costs), listState.reference.total_cost_usd, { long: true }) || "–",
+      `reference run ${fmtCost(listState.reference.total_cost_usd)}`) : ""}
   </div>`;
+}
+
+/** The tag's reference run, or how to pick one. */
+function referenceCardHtml() {
+  const r = listState.reference;
+  if (!r) return `<p class="ref-hint muted">No reference run yet: click ☆ on a run below to compare every other run with it.</p>`;
+  return `<div class="ref-card"><span class="ref-label">◆ Reference run</span>
+    <a class="ref-text" href="#/prompt/${encodeURIComponent(r.id)}">${esc(r.text)}</a>
+    <span class="pmeta">${fmtDate(r.started_at)} · ${fmtCost(r.total_cost_usd)} · ${fmtTokens(r.total_tokens)} tok · ${fmtMs(duration(r))}</span>
+    <button type="button" class="link-btn" data-ref="${esc(r.id)}">Clear</button></div>`;
 }
 
 async function viewTag(tag, query = new URLSearchParams()) {
   filtersFromQuery(query);
   Object.assign(listState, { lockTag: tag, tag, split: query.get("split") in SPLITS ? query.get("split") : "" });
   const enc = encodeURIComponent(tag);
-  const [projects, tags, rules] = await Promise.all([api("/api/projects"), api("/api/tags"), api(`/api/tags/${enc}/rules`)]);
+  const [projects, tags, rules, { reference }] = await Promise.all([api("/api/projects"), api("/api/tags"), api(`/api/tags/${enc}/rules`), api(`/api/tags/${enc}/reference`)]);
+  listState.reference = reference;
   promptProjects = projects;
   listState.tags = tags;
   ruleSkills = skillsFromTags(tags);
@@ -1646,6 +1976,7 @@ async function viewTag(tag, query = new URLSearchParams()) {
       ${tagHeadHtml(info, rules)}
       <div id="prompt-summary"></div>
       <div id="prompt-highlights"></div>
+      <div id="tag-reference"></div>
       <section class="tag-evolution" aria-labelledby="evo-title"><h2 id="evo-title" class="page-sec">How it evolves</h2><div id="tag-charts"></div></section>
       <h2 class="page-sec">Runs</h2>
       <div id="prompt-toolbar"></div>
@@ -1656,6 +1987,15 @@ async function viewTag(tag, query = new URLSearchParams()) {
     ${tagDialogHtml({ forPrompts: true })}`;
   Object.assign(listState, { selecting: false, selected: new Set() });
   bindSelection(app.querySelector(".tag-page"), { tags, exclude: [tag] });
+  // ☆ on a run makes it the reference, ★ (or Clear on the card) clears it
+  app.querySelector(".tag-page").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-ref]");
+    if (!b) return;
+    e.preventDefault();
+    const id = listState.reference?.id === b.dataset.ref ? null : b.dataset.ref;
+    listState.reference = (await api(`/api/tags/${enc}/reference`, { method: "PUT", body: { prompt_id: id } })).reference;
+    renderPrompts({ reload: false });
+  });
   rerenderToolbar();
   await renderPrompts();
   if (tagCategory(info) !== "human") return;
@@ -1928,6 +2268,8 @@ async function viewSession(id) {
       <div class="prompt-meta"><time datetime="${esc(s.started_at)}">${fmtDate(s.started_at)}</time>${s.project ? `<span>${esc(s.project)}</span>` : ""}
         <code title="Session id">${esc(s.id.slice(0, 8))}</code><span class="prompt-cost">${fmtCost(s.cost_usd)}</span></div>
       <h1 class="session-title">${esc(sessionTitle({ ...s, first_prompt: first?.text }))}</h1>
+      <div class="tag-head-meta"><button type="button" class="link-btn danger-link" id="exclude-this-session"
+        title="Leave this session out of every page; bring it back from the Setup page">Exclude from history</button></div>
     </header>
     <nav class="page-cards link-cards" aria-label="Related pages">${links}</nav>
     <div class="tags-hero prompt-facts">${facts.map(([label, value, sub, note]) => `<div class="hero-fact"><span class="label">${label}</span>
@@ -1950,6 +2292,13 @@ async function viewSession(id) {
     <div class="prow-list">${s.prompts.map((p) => promptRow(p, maxCost, { compact: true })).join("")}</div>
     </div>`;
   block.mount();
+  document.getElementById("exclude-this-session").onclick = async () => {
+    const its = s.prompts.length === 1 ? "Its prompt disappears from every page but stays imported: bring it" : `Its ${s.prompts.length} prompts disappear from every page but stay imported: bring them`;
+    if (!confirm(`Leave this session out of the history?\n\n${its} back from the Setup page.`)) return;
+    const { excluded_sessions: list } = await api("/api/settings");
+    await api("/api/settings", { method: "PUT", body: { excluded_sessions: [...new Set([...list, s.id])] } });
+    location.hash = "#/sessions";
+  };
   // the hash routes pages: the prompts card scrolls instead of navigating
   app.querySelector('[data-jump="session-prompts"]').onclick = (e) => {
     e.preventDefault();
@@ -1957,8 +2306,37 @@ async function viewSession(id) {
   };
 }
 
+/** Projects to click in or out of the history, and the sessions left out with a way back. */
+function excludedCardHtml(scope) {
+  const sessionLabel = (x) => `${fmtDate(x.started_at)} · ${x.title || (x.first_prompt || "").slice(0, 60) || x.id.slice(0, 8)}${x.project ? ` · ${x.project}` : ""}`;
+  const out = scope.sessions.filter((x) => x.excluded);
+  const pickable = scope.sessions.filter((x) => !x.excluded && !scope.projects.some((pr) => pr.excluded && pr.project === x.project));
+  const { hidden } = scope;
+  const tagChips = (list, prefix) => list.map((x) => `<button type="button" class="exclude-chip" data-exclude-tag="${esc(x.tag)}" aria-pressed="${x.excluded}"
+    title="${x.excluded ? "Left out: click to bring it back" : "Click to leave out every prompt where the agent used it"}">${esc(x.tag.slice(prefix.length))} <span class="mi-count">${x.prompts}</span></button>`).join("");
+  return `<div class="card exclusions">
+    <p class="muted">Leave a project, a skill, a kind of subagent or a session out of every page: totals, lists, tags, charts and comparisons. Its prompts stay imported,
+      so bringing it back is instant.${hidden ? ` <strong>${plural(hidden, "prompt")} left out now.</strong>` : ""}</p>
+    <div class="setup-row"><div><strong>Projects</strong><br><span class="muted">Click a project to leave it out; click it again to bring it back.</span>
+      <div class="exclude-chips">${scope.projects.map((x) => `<button type="button" class="exclude-chip" data-exclude-project="${esc(x.project)}" aria-pressed="${x.excluded}"
+        title="${x.excluded ? "Left out: click to bring it back" : "Click to leave it out of the history"}">${esc(x.project)} <span class="mi-count">${x.prompts}</span></button>`).join("") || '<span class="muted">No project yet.</span>'}</div></div></div>
+    <div class="setup-row"><div><strong>Skills</strong><br><span class="muted">Leave out every prompt where the agent used a skill, such as a batch job that skews the figures.</span>
+      <div class="exclude-chips">${tagChips(scope.skills, "skill:") || '<span class="muted">No skill used yet.</span>'}</div></div></div>
+    ${scope.reruns.length ? `<div class="setup-row"><div><strong>Reruns</strong><br><span class="muted">Leave out every prompt of the reruns launched from here, to keep the history to your own work.</span>
+      <div class="exclude-chips">${tagChips(scope.reruns, "")}</div></div></div>` : ""}
+    <div class="setup-row"><div><strong>Subagent types</strong><br><span class="muted">Leave out every prompt that ran a kind of subagent.</span>
+      <div class="exclude-chips">${tagChips(scope.agents, "agent:") || '<span class="muted">No subagent run yet.</span>'}</div></div></div>
+    <div class="setup-row"><div><strong>Sessions</strong><br><span class="muted">Leave out one conversation, such as a test or an experiment.</span>
+      ${out.length ? `<ul class="excluded-sessions">${out.map((x) => `<li><span>${esc(sessionLabel(x))} <span class="mi-count">${plural(x.prompts, "prompt")}</span></span>
+        <button type="button" class="link-btn" data-include-session="${esc(x.id)}">Bring back</button></li>`).join("")}</ul>` : ""}
+      <form id="exclude-session-form" class="inline-form exclude-form"><select id="exclude-session" aria-label="Session to leave out">
+        <option value="">Pick a session…</option>${pickable.map((x) => `<option value="${esc(x.id)}">${esc(sessionLabel(x))}</option>`).join("")}</select>
+        <button class="btn">Leave it out</button></form></div></div>
+  </div>`;
+}
+
 async function viewSetup() {
-  const [st, settings] = await Promise.all([api("/api/setup/status"), api("/api/settings")]);
+  const [st, settings, scope] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history")]);
   const ok = (cond) => (cond ? "status-ok" : "status-warn");
   const retentionOk = st.cleanup_period_days != null && st.cleanup_period_days >= 365;
   // the checks below, in order: counted in the banner
@@ -1969,7 +2347,7 @@ async function viewSetup() {
       <div class="hero-copy">
         <h1><span class="hero-name">Setup · ${steps.filter(Boolean).length} of ${steps.length} done</span>Connect your agent once. <em>Every prompt shows up on its own.</em></h1>
         <p>Rerunly reads what <strong>${esc(st.agent)}</strong> already writes on your machine: nothing leaves it. Import your history, then let the
-          <strong>hook</strong> bring each new prompt in as soon as the agent answers. Prices, similarity and auto-tag rules are below.</p>
+          <strong>hook</strong> bring each new prompt in as soon as the agent answers. What to leave out of the history, prices and similarity are below; tags and their rules live on the <a href="#/tags">Tags</a> page.</p>
       </div>
     </header>
     <div class="card">
@@ -2002,6 +2380,9 @@ async function viewSetup() {
       ${st.unpriced_models.length ? `<div class="setup-row"><div class="status-warn"><strong>Models without a price</strong><br><span class="muted">${esc(st.unpriced_models.join(", "))} — add them to the price table below.</span></div></div>` : ""}
     </div>
 
+    <h2 id="excluded">Excluded from the history</h2>
+    ${excludedCardHtml(scope)}
+
     <h2>Settings</h2>
     <form id="settings" class="card">
       <div class="setup-row"><div><strong>Transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir)}"></div>
@@ -2013,8 +2394,6 @@ async function viewSetup() {
         <input name="similarity_threshold" type="number" min="0" max="1" step="0.05" value="${settings.similarity_threshold}"></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
-      <div class="setup-row"><div style="flex-basis:100%"><strong>Auto-tag rules</strong><br><span class="muted">Usually managed from a tag's page (keywords). Raw form: <code>{"tag": "task:x", "keywords": ["review", "branch"], "match": "all"}</code> or a regex <code>{"tag": "task:x", "pattern": "review .*paper"}</code></span>
-        <textarea name="tag_rules" rows="4">${esc(JSON.stringify(settings.tag_rules, null, 2))}</textarea></div></div>
       <div class="setup-row"><div style="flex-basis:100%"><strong>Prices (USD per million tokens)</strong><br><span class="muted">Longest model-id prefix wins. Cache writes cost 1.25× (5 min) or 2× (1 h) input; fast mode 2×; web search $10/1k.</span>
         <textarea name="prices" rows="12">${esc(JSON.stringify(settings.prices, null, 2))}</textarea></div></div>
       <div style="padding-top:10px"><button class="btn primary">Save &amp; re-import</button> <span id="saved" class="muted"></span></div>
@@ -2035,6 +2414,26 @@ async function viewSetup() {
     await api("/api/setup/autostart", { method: "POST", body: { enable: !st.autostart.enabled } }); viewSetup();
   });
   document.getElementById("retention").onclick = (e) => busy(e.target, async () => { await api("/api/setup/retention", { method: "POST", body: { days: 3650 } }); viewSetup(); });
+  // exclusions: a click saves the new list and redraws the page
+  const exclude = (key, list) => api("/api/settings", { method: "PUT", body: { [key]: list } }).then(() => viewSetup());
+  const excludedProjects = scope.projects.filter((x) => x.excluded).map((x) => x.project);
+  const excludedSessions = scope.sessions.filter((x) => x.excluded).map((x) => x.id);
+  app.querySelectorAll("[data-exclude-project]").forEach((b) => b.onclick = () => {
+    const name = b.dataset.excludeProject;
+    exclude("excluded_projects", excludedProjects.includes(name) ? excludedProjects.filter((x) => x !== name) : [...excludedProjects, name]);
+  });
+  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns].filter((x) => x.excluded).map((x) => x.tag);
+  app.querySelectorAll("[data-exclude-tag]").forEach((b) => b.onclick = () => {
+    const tag = b.dataset.excludeTag;
+    exclude("excluded_tags", excludedTags.includes(tag) ? excludedTags.filter((x) => x !== tag) : [...excludedTags, tag]);
+  });
+  app.querySelectorAll("[data-include-session]").forEach((b) => b.onclick = () =>
+    exclude("excluded_sessions", excludedSessions.filter((x) => x !== b.dataset.includeSession)));
+  document.getElementById("exclude-session-form").onsubmit = (e) => {
+    e.preventDefault();
+    const id = document.getElementById("exclude-session").value;
+    if (id) exclude("excluded_sessions", [...excludedSessions, id]);
+  };
   document.getElementById("settings").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -2045,7 +2444,6 @@ async function viewSetup() {
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
         auto_ingest_interval: parseInt(f.get("auto_ingest_interval"), 10),
-        tag_rules: JSON.parse(f.get("tag_rules")),
         prices: JSON.parse(f.get("prices")),
       };
     } catch (err) { alert("Invalid JSON: " + err.message); return; }
@@ -2066,6 +2464,8 @@ const HOME_PAGES = [
     (o) => `${o.totals.sessions || 0} session${o.totals.sessions === 1 ? "" : "s"}`],
   ["tags", "Tags", "Cost and time by task, project, model or skill. Create your own tags to group the runs of one task and see if your prompt changes paid off.",
     (o) => `${o.tags.length} tag${o.tags.length === 1 ? "" : "s"}`],
+  ["reruns", "Reruns", "Queue prompts to run again, with the same model or another, then launch them together and see what each rerun cost against the original.",
+    () => "Queue and launch"],
   ["setup", "Setup", "Import your transcripts, install the live-update hook, start at login, turn on the agent's own cost reporting, and edit prices and auto-tag rules.",
     () => "Import, hook, prices"],
 ];
@@ -2178,6 +2578,148 @@ async function viewHome(query = new URLSearchParams()) {
   });
 }
 
+// ---- Reruns page: the queue, launched together, and what the reruns cost ---------------------
+
+const RERUN_STATUS = {
+  running: ["⏳", "Running", "status-running"],
+  done: ["✓", "Done", "status-done"],
+  needs_you: ["⚠", "Needs you", "status-needs"],
+  failed: ["✕", "Failed", "status-failed"],
+  interactive: ["▸", "In a terminal", "status-interactive"],
+};
+
+/** How a rerun ended: a badge, and what it needed when it stopped for you. */
+function rerunStatusHtml(x, { details = true } = {}) {
+  const [icon, label, cls] = RERUN_STATUS[x.status] || RERUN_STATUS.interactive;
+  const d = x.denials || {};
+  const denied = (d.denied || []).map((a) => `${esc(a.tool)}${a.input?.file_path || a.input?.command ? ` <code>${esc(String(a.input.file_path || a.input.command).slice(0, 80))}</code>` : ""}`);
+  const needs = [d.blocked ? esc(d.blocked) : "", ...denied].filter(Boolean);
+  return `<span class="rerun-status ${cls}" title="${esc(label)}">${icon} ${label}</span>${details && x.status === "needs_you" && needs.length
+    ? `<span class="rerun-needs">It needed: ${needs.join(" · ")}</span>` : ""}${details && x.status === "failed" && x.result
+    ? `<span class="rerun-needs">${esc(x.result.slice(0, 200))}</span>` : ""}`;
+}
+
+const rerunState = { picked: new Set() };
+
+function rerunSettings(x) {
+  const skills = Array.isArray(x.skills) ? x.skills : [];
+  const parts = [x.mode === "terminal" ? "in a terminal" : "unattended", x.mode !== "terminal" ? (x.permission === "edits" ? "may edit files" : "read-only") : "",
+    x.budget_usd ? `up to ${fmtCost(x.budget_usd)}` : "",
+    ...skills.map((k) => `${k.skill.split(":").pop()} @ ${k.source}`),
+    x.model || "same model", x.effort ? `effort ${x.effort}` : "same effort",
+    x.harness_version ? `Claude Code ${x.harness_version}` // launched: the release it ran with
+      : x.release === "same" || (x.release == null && x.same_version) ? "the release it ran with"
+      : x.release ? `Claude Code ${x.release}` : "installed Claude Code"];
+  return parts.filter(Boolean).map((t) => `<span class="rr-chip">${esc(t)}</span>`).join("");
+}
+
+function rerunPromptCell(p) {
+  if (!p) return '<span class="muted">This prompt left the history (excluded on the Setup page).</span>';
+  return `<a class="rr-text" href="#/prompt/${encodeURIComponent(p.id)}">${esc(p.text)}</a>
+    <span class="pmeta">${[p.project, `ran ${fmtDate(p.started_at)}`, fmtCost(p.total_cost_usd)].filter(Boolean).map(esc).join(" · ")}</span>`;
+}
+
+async function viewReruns() {
+  const data = await api("/api/reruns");
+  rerunState.picked = new Set([...rerunState.picked].filter((id) => data.queue.some((q) => q.id === id)));
+  const picked = data.queue.filter((q) => rerunState.picked.has(q.id));
+  const estimate = picked.reduce((t, q) => t + (q.prompt?.total_cost_usd || 0), 0);
+  const done = data.launched.filter((x) => x.replay);
+  app.innerHTML = `
+    <div class="prompts-page reruns-page">
+      <header class="home-hero page-hero">
+        <div class="hero-copy">
+          <h1><span class="hero-name">Reruns · ${data.queue.length} queued</span>Queue reruns, launch them together. <em>Did your change pay off?</em></h1>
+          <p>Queue a prompt from its page (<strong>Add to queue</strong>), or many from the Prompts page or a tag's page (<strong>Select prompts</strong>, then
+            <strong>Queue reruns</strong>). Launching opens one Claude Code window per rerun, interactively: you approve their actions.
+            Once imported, each rerun is linked to its original, with what it cost against it.</p>
+        </div>
+      </header>
+
+      <h2 class="page-sec">Queue <span class="muted">${data.queue.length}</span></h2>
+      ${data.queue.length ? `
+        <div class="select-bar rerun-bar">
+          <strong>${picked.length} selected</strong>
+          <button type="button" class="btn" data-rr-all ${picked.length === data.queue.length ? "disabled" : ""}>Select all ${data.queue.length}</button>
+          ${picked.length ? '<button type="button" class="link-btn" data-rr-none>Clear</button>' : ""}
+          <span class="toolbar-spacer"></span>
+          ${picked.length ? `<span class="muted select-hint">their originals cost ${fmtCost(estimate)} together</span>` : ""}
+          <button type="button" class="btn primary" data-rr-launch ${picked.length ? "" : "disabled"}>↻ Run ${picked.length || ""} selected</button>
+        </div>
+        <p id="rr-status" class="replay-status" hidden></p>
+        <div class="rr-list">${data.queue.map((q) => `<article class="rr-row ${rerunState.picked.has(q.id) ? "selected" : ""}" data-rr="${q.id}">
+          <input type="checkbox" class="psel" data-rr-pick="${q.id}" ${rerunState.picked.has(q.id) ? "checked" : ""} aria-label="Select this rerun">
+          <div class="rr-body">${rerunPromptCell(q.prompt)}<div class="rr-settings">${rerunSettings(q)}</div></div>
+          <span class="muted rr-added" title="${esc(fmtDate(q.added_at))}">queued ${esc(fmtAgo(q.added_at))}</span>
+          <button type="button" class="rr-remove" data-rr-remove="${q.id}" title="Take it out of the queue" aria-label="Take it out of the queue">✕</button>
+        </article>`).join("")}</div>`
+      : `<div class="card muted rr-empty">Nothing queued. Open a prompt and choose <strong>Add to queue</strong> in <em>Run it again</em>, or select prompts on the
+          <a href="#/prompts">Prompts</a> page or a tag's page and choose <strong>Queue reruns</strong>.</div>`}
+      <p id="rr-status-empty" class="replay-status" hidden></p>
+
+      <h2 class="page-sec">Launched <span class="muted">${data.launched.length}${data.launched.length ? ` · ${done.length} imported` : ""}</span></h2>
+      ${data.launched.length ? `<div class="rr-list">${data.launched.map((x) => {
+        const r = x.replay, o = x.original;
+        return `<article class="rr-row launched">
+          <span class="muted rr-added">${esc(fmtDate(x.launched_at))}</span>
+          <div class="rr-body">${rerunPromptCell(o)}<div class="rr-settings">${rerunSettings(x)}</div></div>
+          <div class="rr-result">${rerunStatusHtml(x)}${r
+            ? `<a href="#/prompt/${encodeURIComponent(r.id)}"><strong>${fmtCost(r.total_cost_usd)}</strong> · ${fmtMs(duration(r))} · compare</a>${o ? refDelta(r.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}`
+            : x.status === "running" ? '<span class="muted">running in the background</span>'
+            : `<span class="muted">${x.cost_usd != null ? `${fmtCost(x.cost_usd)} · ` : ""}not imported yet</span>`}</div>
+        </article>`;
+      }).join("")}</div><p class="muted group-note">${data.launched.some((x) => x.status === "running")
+        ? "This page updates itself while reruns are running." : "A rerun's figures show once it was imported: press Refresh if needed."}</p>`
+      : '<div class="card muted rr-empty">No rerun launched yet.</div>'}
+    </div>`;
+
+  const page = app.querySelector(".reruns-page");
+  // while reruns run, check again every few seconds (only while this page is shown)
+  clearTimeout(rerunState.timer);
+  if (data.launched.some((x) => x.status === "running")) {
+    const here = location.hash;
+    rerunState.timer = setTimeout(async () => {
+      if (location.hash !== here) return;
+      await api("/api/ingest", { method: "POST" }).catch(() => {});
+      if (location.hash === here) viewReruns();
+    }, 5000);
+  }
+  page.onclick = async (e) => {
+    const pick = e.target.closest("[data-rr-pick]"), row = e.target.closest("article.rr-row:not(.launched)");
+    if (e.target.closest("[data-rr-remove]")) {
+      await api(`/api/reruns/queue/${e.target.closest("[data-rr-remove]").dataset.rrRemove}`, { method: "DELETE" });
+      return viewReruns();
+    }
+    if (e.target.closest("[data-rr-all]")) { data.queue.forEach((q) => rerunState.picked.add(q.id)); return viewReruns(); }
+    if (e.target.closest("[data-rr-none]")) { rerunState.picked.clear(); return viewReruns(); }
+    if (e.target.closest("[data-rr-launch]")) return launchPicked(picked, estimate);
+    // a click on a queued row (not its links) picks it
+    if (row && (pick || !e.target.closest("a"))) {
+      const id = Number(row.dataset.rr);
+      rerunState.picked.has(id) ? rerunState.picked.delete(id) : rerunState.picked.add(id);
+      return viewReruns();
+    }
+  };
+}
+
+async function launchPicked(picked, estimate) {
+  const n = picked.length;
+  if (!n || !confirm(`Open ${n} terminal window${n === 1 ? "" : "s"}, each running Claude Code on one prompt?\n\nThey run at the same time, ` +
+      `and you approve each one's actions. Their originals cost ${fmtCost(estimate)} together.`)) return;
+  const { results } = await api("/api/reruns/launch", { method: "POST", body: { ids: picked.map((q) => q.id) } });
+  rerunState.picked.clear();
+  await viewReruns();
+  const opened = results.filter((r) => r.terminal), manual = results.filter((r) => !r.terminal && !r.error), failed = results.filter((r) => r.error);
+  const status = document.getElementById("rr-status") || document.getElementById("rr-status-empty");
+  status.innerHTML = [
+    opened.length ? `${plural(opened.length, "Claude Code window")} opened.` : "",
+    manual.length ? `No terminal window could be opened for ${manual.length}: run ${manual.length === 1 ? "this" : "these"} yourself (they are linked once imported):
+      <pre><code>${esc(manual.map((r) => r.command).join("\n"))}</code></pre>` : "",
+    failed.length ? `${plural(failed.length, "rerun")} could not start: ${failed.map((r) => esc(r.error)).join("; ")}.` : "",
+  ].filter(Boolean).join(" ");
+  status.hidden = false;
+}
+
 // ---- router ----------------------------------------------------------------
 
 async function route() {
@@ -2198,6 +2740,7 @@ async function route() {
     else if (view === "session") await viewSession(decodeURIComponent(arg));
     else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)), query);
     else if (view === "setup") await viewSetup();
+    else if (view === "reruns") await viewReruns();
     else await viewHome(query);
   } catch (e) {
     if (e instanceof StaleNavigation) return; // the newer page renders itself

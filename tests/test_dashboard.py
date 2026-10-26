@@ -13,6 +13,7 @@ from rerunly.sources.claude_code import ClaudeCodeSource, extract_persona
 from rerunly.tagging import rule_matches, similarity
 
 SESSION = "11111111-1111-1111-1111-111111111111"
+SKILL_DIR = "/nowhere/skills/review-skill"
 CWD = "/work/repo"
 
 
@@ -26,6 +27,7 @@ def user(uuid, ts, content, prompt_id, human=True, **extra):
 
 def assistant(msg_id, ts, blocks, usage, model="claude-opus-5-5"):
     return {"type": "assistant", "uuid": f"u-{msg_id}-{ts}", "timestamp": ts, "sessionId": SESSION, "cwd": CWD,
+            "version": "2.1.0", "effort": "medium", "requestedModel": model,
             "message": {"id": msg_id, "model": model, "content": blocks, "usage": usage}}
 
 
@@ -56,6 +58,9 @@ def projects(tmp_path: Path) -> Path:
             {"type": "tool_use", "id": "s0", "name": "Skill", "input": {"skill": "review-skill"}},
             {"type": "tool_use", "id": "t2", "name": "Agent", "input": {}},
         ], USAGE),
+        # the skill's instructions, injected by Claude Code after the Skill call
+        user("k1", "2026-10-02T10:00:04Z", [{"type": "text", "text": f"Base directory for this skill: {SKILL_DIR}\n\n# Review\nRead the diff.\n\nARGUMENTS: the branch"}],
+             "prompt-3", human=False, isMeta=True, sourceToolUseID="s0"),
         user("p4", "2026-10-03T10:00:00Z", "write the release notes", "prompt-4"),
         assistant("m4", "2026-10-03T10:00:04Z", [{"type": "text", "text": "done"}], USAGE),
         {"type": "cost-state", "sessionId": SESSION, "totalCostUSD": 0.5},
@@ -450,3 +455,290 @@ def test_delete_tag(client):
     assert client.delete("/api/tags/task:kept/rules/0").status_code == 200
     assert client.delete("/api/tags/project:repo").status_code == 400
     assert client.delete("/api/tags/task:never").status_code == 404
+
+
+def test_exclude_from_history(client):
+    total = client.get("/api/overview").json()["totals"]["prompts"]
+    client.put("/api/settings", json={"excluded_projects": ["repo"]})
+    assert client.get("/api/prompts").json()["total"] == 0
+    assert client.get("/api/sessions").json()["total"] == 0
+    assert client.get("/api/overview").json()["totals"]["prompts"] == 0
+    assert client.get("/api/projects").json() == []
+    assert "project:repo" not in {t["tag"] for t in client.get("/api/tags").json()}
+    assert client.get("/api/prompts/prompt-1").status_code == 404
+    assert client.get("/api/rules/preview", params={"keywords": "flaky"}).json() == {"matches": 0}
+    # the Setup page still lists everything, with what is excluded
+    scope = client.get("/api/setup/history").json()
+    assert scope["projects"] == [{"project": "repo", "prompts": 3, "excluded": True}]
+    assert [s["id"] for s in scope["sessions"]] == [SESSION]
+    # back in the history, nothing lost
+    client.put("/api/settings", json={"excluded_projects": [], "excluded_sessions": [SESSION]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == 0
+    assert client.get("/api/setup/history").json()["sessions"][0]["excluded"]
+    client.put("/api/settings", json={"excluded_sessions": []})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total
+    # a quote in a name cannot break the filter
+    client.put("/api/settings", json={"excluded_projects": ["it's"]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total
+
+
+def test_exclude_skills_and_agents(client):
+    scope = client.get("/api/setup/history").json()
+    assert scope["skills"] == [{"tag": "skill:review-skill", "prompts": 1, "excluded": False}]
+    assert scope["agents"] == [{"tag": "agent:Explore", "prompts": 1, "excluded": False}]
+    total = client.get("/api/overview").json()["totals"]["prompts"]
+    # prompt-3 used review-skill and an Explore subagent: excluding either hides it, and only it
+    for tag in ("skill:review-skill", "agent:Explore"):
+        client.put("/api/settings", json={"excluded_tags": [tag]})
+        assert client.get("/api/overview").json()["totals"]["prompts"] == total - 1
+        assert client.get("/api/prompts/prompt-3").status_code == 404
+        assert tag not in {t["tag"] for t in client.get("/api/tags").json()}
+        assert client.get("/api/setup/history").json()["skills" if tag.startswith("skill") else "agents"][0]["excluded"]
+    client.put("/api/settings", json={"excluded_tags": []})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total
+
+
+def test_tag_reference(client):
+    client.post("/api/tags/task:ref/prompts", json={"prompt_ids": ["prompt-1", "prompt-3"]})
+    assert client.get("/api/tags/task:ref/reference").json()["reference"] is None
+    assert client.put("/api/tags/task:ref/reference", json={"prompt_id": "prompt-4"}).status_code == 400  # not one of its runs
+    ref = client.put("/api/tags/task:ref/reference", json={"prompt_id": "prompt-1"}).json()["reference"]
+    assert ref["id"] == "prompt-1" and ref["total_cost_usd"] > 0
+    # a prompt compared with the tag gets its reference
+    detail = client.get("/api/prompts/prompt-3", params={"compare": "tag", "tag": "task:ref"}).json()
+    assert detail["compare"]["reference"]["id"] == "prompt-1"
+    assert client.get("/api/prompts/prompt-3").json()["compare"]["reference"] is None
+    # AI tags can have one too
+    assert client.put("/api/tags/project:repo/reference", json={"prompt_id": "prompt-4"}).json()["reference"]["id"] == "prompt-4"
+    # a reference that loses the tag, or leaves the history, is no reference
+    client.delete("/api/prompts/prompt-1/tags/task:ref")
+    assert client.get("/api/tags/task:ref/reference").json()["reference"] is None
+    client.put("/api/settings", json={"excluded_sessions": [SESSION]})
+    assert client.get("/api/tags/project:repo/reference").json()["reference"] is None
+    client.put("/api/settings", json={"excluded_sessions": []})
+    client.put("/api/tags/project:repo/reference", json={"prompt_id": None})
+    assert client.get("/api/tags/project:repo/reference").json()["reference"] is None
+
+
+def test_rerun_info(client):
+    from rerunly.sources.base import SkillRun  # noqa: F401  (the record the parser fills)
+    p = client.get("/api/prompts/prompt-3").json()
+    rerun = p["rerun"]
+    assert (rerun["harness"], rerun["harness_version"], rerun["effort"], rerun["requested_model"]) == ("Claude Code", "2.1.0", "medium", "claude-opus-5-5")
+    [skill] = rerun["skills"]
+    assert skill["skill"] == "review-skill" and skill["args"] == "the branch" and skill["origin"] == "missing"
+    body = client.get(f"/api/skill-versions/{skill['hash']}").json()
+    assert body["body"] == "# Review\nRead the diff." and body["base_dir"] == SKILL_DIR
+    assert client.get("/api/prompts/prompt-1").json()["rerun"]["skills"] == []
+    assert client.get("/api/skill-versions/nope").status_code == 404
+
+
+def test_skill_version_origin(tmp_path):
+    import subprocess
+    from rerunly.versions import body_hash, resolve, skill_body
+
+    git = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True, text=True).stdout.strip()
+    skill = tmp_path / "skills" / "review"
+    skill.mkdir(parents=True)
+    (tmp_path / ".claude-plugin").mkdir()
+    (tmp_path / ".claude-plugin" / "plugin.json").write_text('{"name": "kit", "version": "0.3.1"}')
+    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (skill / "SKILL.md").write_text("---\nname: review\n---\n# Review\nv1\n")
+    git("add", "-A"); git("commit", "-qm", "v1")
+    first = git("rev-parse", "HEAD")
+    (skill / "SKILL.md").write_text("---\nname: review\n---\n# Review\nv2\n")
+    git("commit", "-qam", "v2")
+    second = git("rev-parse", "HEAD")
+    v1 = resolve(str(skill), "# Review\nv1")
+    assert (v1["git_commit"], v1["git_state"], v1["git_path"], v1["plugin_version"]) == (first, "committed", "skills/review", "0.3.1")
+    assert resolve(str(skill), "# Review\nv2")["git_commit"] == second
+    (skill / "SKILL.md").write_text("---\nname: review\n---\n# Review\nv3\n")
+    assert resolve(str(skill), "# Review\nv3")["git_state"] == "uncommitted"
+    assert resolve(str(skill), "# Review\nv0")["git_state"] == "changed"
+    assert resolve("/tmp/x/bundled-skills/2.1.309/abc/dataviz", "x")["bundled_version"] == "2.1.309"
+    assert skill_body("---\na: b\n---\nbody\n") == "body" and body_hash(" body ") == body_hash("body")
+
+
+def test_replay(client, monkeypatch):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append((cwd, argv)) or "gnome-terminal")
+    r = client.post("/api/prompts/prompt-4/replay", json={"model": "claude-haiku-5-5", "effort": "high", "same_version": True, "mode": "terminal"})
+    out = r.json()
+    [(cwd, argv)] = launched
+    assert cwd == CWD and out["terminal"] == "gnome-terminal"
+    assert argv == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
+                    "--model", "claude-haiku-5-5", "--effort", "high", "write the release notes"]
+    # the installed Claude Code unless asked otherwise, and the prompt's own settings by default
+    client.post("/api/prompts/prompt-4/replay", json={"mode": "terminal"})
+    assert launched[1][1][:3] == ["claude", "--session-id", launched[1][1][2]] and launched[1][1][-1] == "write the release notes"
+    # only from the dashboard, with sane values
+    assert client.post("/api/prompts/prompt-4/replay", content="{}", headers={"content-type": "text/plain"}).status_code == 415
+    assert client.post("/api/prompts/prompt-4/replay", json={}, headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.post("/api/prompts/prompt-4/replay", json={"model": "x; rm -rf /"}).status_code == 400
+    assert client.post("/api/prompts/prompt-4/replay", json={"effort": "huge"}).status_code == 400
+    assert client.post("/api/prompts/nope/replay", json={}).status_code == 404
+    replays = client.get("/api/prompts/prompt-4").json()["replays"]
+    assert len(replays) == 2 and replays[0]["prompt"] is None  # not imported yet
+
+
+def test_replay_is_linked(projects, tmp_path):
+    conn = db.connect(tmp_path / "r.db")
+    db.save_settings(conn, {"claude_projects_dir": str(projects)})
+    ingest(conn)
+    client = TestClient(create_app(tmp_path / "r.db", background=False))
+    client.post("/api/tags/task:release/prompts", json={"prompt_ids": ["prompt-4"]})
+    total = client.get("/api/overview").json()["totals"]["prompts"]
+    # as if prompt-4 had been rerun in the fixture's session: its prompts are the rerun
+    with conn:
+        conn.execute("INSERT INTO replays(session_id, prompt_id, model, effort, harness_version, launched_at) VALUES (?,?,?,?,?,?)", (SESSION, "prompt-4", "claude-haiku-5-5", "high", "2.1.0", "2026-10-04T00:00:00Z"))
+    ingest(conn, force=True)
+    rerun = client.get("/api/prompts/prompt-1").json()
+    of = rerun["replay_of"]
+    assert of["id"] == "prompt-4" and of["first"]
+    # the configuration chosen when launching it
+    assert (of["model"], of["effort"], of["harness_version"]) == ("claude-haiku-5-5", "high", "2.1.0")
+    # studied on its own: the rerun tag on every prompt of the session, none of the original's tags
+    tags = {t["tag"]: t["kind"] for t in rerun["tags"]}
+    assert tags["rerun"] == "ai" and "task:release" not in tags
+    assert {p["id"] for p in client.get("/api/tags/rerun/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+    follow_up = client.get("/api/prompts/prompt-3").json()["replay_of"]
+    assert follow_up["id"] == "prompt-4" and not follow_up["first"]
+    assert client.get("/api/prompts/prompt-4").json()["replays"][0]["prompt"]["id"] == "prompt-1"
+    # the tag survives a new import, and reruns can be left out of the history
+    ingest(conn, force=True)
+    assert client.get("/api/setup/history").json()["reruns"] == [{"tag": "rerun", "prompts": 3, "excluded": False}]
+    client.put("/api/settings", json={"excluded_tags": ["rerun"]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - 3
+
+
+
+def test_rerun_queue(client, monkeypatch):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append(argv) or "gnome-terminal")
+    q = client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1", "prompt-4"], "model": "claude-haiku-5-5", "mode": "terminal"}).json()
+    assert q == {"added": 2, "queued": 2}
+    # queued again with the same settings: not twice; other settings: a new item
+    assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "model": "claude-haiku-5-5", "mode": "terminal"}).json()["added"] == 0
+    assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "effort": "high", "mode": "terminal"}).json()["queued"] == 3
+    assert client.post("/api/reruns/queue", json={"prompt_ids": ["nope"]}).status_code == 404
+    assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"]}, headers={"origin": "https://evil.example"}).status_code == 403
+    queue = client.get("/api/reruns").json()["queue"]
+    assert [(x["prompt_id"], x["model"], x["effort"]) for x in queue] == [
+        ("prompt-1", "claude-haiku-5-5", ""), ("prompt-4", "claude-haiku-5-5", ""), ("prompt-1", "", "high")]
+    assert queue[0]["prompt"]["text"].startswith("fix the flaky test")
+    client.delete(f"/api/reruns/queue/{queue[2]['id']}")
+    # launch two together: two terminals, out of the queue, listed as launched
+    out = client.post("/api/reruns/launch", json={"ids": [queue[0]["id"], queue[1]["id"]]}).json()["results"]
+    assert len(out) == 2 and len(launched) == 2 and all("--model" in a for a in launched)
+    data = client.get("/api/reruns").json()
+    assert data["queue"] == [] and len(data["launched"]) == 2 and data["launched"][0]["replay"] is None
+    assert {x["original"]["id"] for x in data["launched"]} == {"prompt-1", "prompt-4"}
+    assert client.post("/api/reruns/launch", json={"ids": [1]}, headers={"content-type": "text/plain"}).status_code == 415
+
+
+def test_rerun_with_reference_settings(client, monkeypatch):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append(argv) or "gnome-terminal")
+    client.post("/api/tags/task:ref/prompts", json={"prompt_ids": ["prompt-1", "prompt-4"]})
+    client.put("/api/tags/task:ref/reference", json={"prompt_id": "prompt-1"})
+    [ref] = client.get("/api/prompts/prompt-4").json()["references"]
+    assert (ref["tag"], ref["id"], ref["model"], ref["effort"], ref["harness_version"]) == ("task:ref", "prompt-1", "claude-opus-5-5", "medium", "2.1.0")
+    assert client.get("/api/prompts/prompt-1").json()["references"] == []  # the reference itself
+    # rerun with the reference's settings: its release pinned
+    client.post("/api/prompts/prompt-4/replay", json={"model": ref["model"], "effort": ref["effort"], "version": ref["harness_version"], "mode": "terminal"})
+    assert launched[-1][:3] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0"] and "--effort" in launched[-1]
+    assert client.post("/api/prompts/prompt-4/replay", json={"version": "latest; rm"}).status_code == 400
+    # queued with a release, launched with it
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-4"], "version": "2.1.0", "mode": "terminal"})
+    [q] = client.get("/api/reruns").json()["queue"]
+    assert q["release"] == "2.1.0"
+    client.post("/api/reruns/launch", json={"ids": [q["id"]]})
+    assert launched[-1][2] == "@anthropic-ai/claude-code@2.1.0"
+
+
+def test_rerun_outcome(tmp_path):
+    from rerunly.runner import outcome
+
+    def log(result):
+        path = tmp_path / "stream.jsonl"
+        path.write_text(json.dumps({"type": "system", "subtype": "init"}) + "\n" + json.dumps({"type": "result", **result}) + "\n")
+        return outcome(path)
+
+    done = log({"subtype": "success", "is_error": False, "result": "Notes written.\n\nRERUN STATUS: done", "total_cost_usd": 0.4, "permission_denials": []})
+    assert (done["status"], done["result"], done["cost_usd"]) == ("done", "Notes written.", 0.4)
+    denied = log({"subtype": "success", "is_error": False, "result": "Could not write.",
+                  "permission_denials": [{"tool_name": "Write", "tool_input": {"file_path": "/x"}}]})
+    assert denied["status"] == "needs_you" and denied["denials"] == [{"tool": "Write", "input": {"file_path": "/x"}}]
+    blocked = log({"subtype": "success", "is_error": False, "result": "Which branch?\nRERUN STATUS: blocked: the branch to review"})
+    assert (blocked["status"], blocked["blocked"]) == ("needs_you", "the branch to review")
+    assert log({"subtype": "error_max_budget_usd", "is_error": True, "result": ""})["status"] == "failed"
+    (tmp_path / "stream.jsonl").write_text("not json\n")
+    assert outcome(tmp_path / "stream.jsonl") is None
+
+
+def test_skills_plugin(tmp_path):
+    import subprocess
+    from rerunly.runner import build_skills_plugin
+
+    repo = tmp_path / "repo"
+    skill = repo / "skills" / "review"
+    skill.mkdir(parents=True)
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (skill / "SKILL.md").write_text("---\nname: review\ndescription: d\n---\nv1\n")
+    (skill / "check.py").write_text("print(1)\n")
+    git("add", "-A"); git("commit", "-qm", "v1")
+    commit = git("rev-parse", "HEAD")
+    (skill / "SKILL.md").write_text("---\nname: review\n---\nv2 in progress\n")
+    plugin = tmp_path / "plugin"
+    restored = build_skills_plugin(plugin, [
+        {"skill": "kit:review", "git_state": "committed", "git_repo": str(repo), "git_commit": commit, "git_path": "skills/review", "body": "v1"},
+        {"skill": "notes", "git_state": "uncommitted", "body": "Write notes."},
+    ])
+    assert restored == [{"skill": "kit:review", "pinned": "rerunly-pinned:review", "source": f"commit {commit[:7]}"},
+                        {"skill": "notes", "pinned": "rerunly-pinned:notes", "source": "snapshot"}]
+    # every file of the skill as committed, not the working copy
+    assert (plugin / "skills/review/SKILL.md").read_text().endswith("v1\n") and (plugin / "skills/review/check.py").exists()
+    assert "Write notes." in (plugin / "skills/notes/SKILL.md").read_text()
+    assert json.loads((plugin / ".claude-plugin/plugin.json").read_text())["name"] == "rerunly-pinned"
+    assert (skill / "SKILL.md").read_text().endswith("v2 in progress\n")  # the user's copy untouched
+
+
+def test_background_rerun(client, monkeypatch):
+    from rerunly import runner
+
+    started = {}
+    def fake_start(cwd, argv, log, on_exit):
+        started.update(cwd=cwd, argv=argv)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.21,
+                                   "result": "Release notes drafted.\nRERUN STATUS: done", "permission_denials": []}) + "\n")
+        started["finish"] = on_exit
+        return 999999
+    monkeypatch.setattr(runner, "start", fake_start)
+    out = client.post("/api/prompts/prompt-3/replay", json={"model": "claude-haiku-5-5", "permission": "edits", "budget_usd": 1.5}).json()
+    argv = started["argv"]
+    assert out["mode"] == "background" and argv[:2] == ["claude", "-p"]
+    for flag in ("--permission-prompts", "none", "--permission-mode", "acceptEdits", "--max-budget-usd", "1.50", "--session-id", out["session_id"]):
+        assert flag in argv
+    # prompt-3 ran review-skill, whose folder is gone: restored from its snapshot, and the agent told to use it
+    assert out["skills"] == [{"skill": "review-skill", "pinned": "rerunly-pinned:review-skill", "source": "snapshot"}]
+    assert "--plugin-dir" in argv and "rerunly-pinned:review-skill" in argv[argv.index("--append-system-prompt") + 1]
+    monkeypatch.setattr(runner, "alive", lambda pid: True)
+    [x] = client.get("/api/reruns").json()["launched"]
+    assert x["status"] == "running" and "pid" not in x
+    started["finish"]()  # the process ends: its outcome is read from its log
+    [x] = client.get("/api/reruns").json()["launched"]
+    assert (x["status"], x["result"], x["cost_usd"]) == ("done", "Release notes drafted.", 0.21)
+    # a rerun that ended while nobody watched is caught up on the next listing
+    out = client.post("/api/prompts/prompt-4/replay", json={}).json()
+    monkeypatch.setattr(runner, "alive", lambda pid: False)
+    assert next(x for x in client.get("/api/reruns").json()["launched"] if x["session_id"] == out["session_id"])["status"] == "done"
+    assert client.post("/api/prompts/prompt-3/replay", json={"permission": "everything"}).status_code == 400
+    assert client.post("/api/prompts/prompt-3/replay", json={"budget_usd": -1}).status_code == 400

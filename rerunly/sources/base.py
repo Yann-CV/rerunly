@@ -33,6 +33,17 @@ class AgentRecord:
 
 
 @dataclass
+class SkillRun:
+    """A skill as the agent loaded it during a prompt: enough to know, and restore, the exact version."""
+
+    name: str
+    base_dir: str = ""
+    # the skill's instructions as loaded (SKILL.md without its frontmatter): an exact snapshot
+    body: str = ""
+    args: str | None = None
+
+
+@dataclass
 class PromptRecord:
     """One user prompt and everything the main agent did to answer it."""
 
@@ -50,6 +61,15 @@ class PromptRecord:
     tools: Counter = field(default_factory=Counter)
     skills: set[str] = field(default_factory=set)
     agents: list[AgentRecord] = field(default_factory=list)
+    # what ran it, to run it again: the harness and its version, the reasoning effort, the model asked for
+    harness: str = ""
+    harness_version: str = ""
+    effort: str = ""
+    requested_model: str = ""
+    skill_runs: list[SkillRun] = field(default_factory=list)
+    # what it produced, to compare runs: the main agent's last message, and the files it edited
+    answer: str = ""
+    files: set[str] = field(default_factory=set)
 
 
 @dataclass

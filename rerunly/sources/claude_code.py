@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..pricing import Usage
-from .base import AgentRecord, ApiCall, PromptRecord, SessionRecord
+from .base import AgentRecord, ApiCall, PromptRecord, SessionRecord, SkillRun
 
 COMMAND_RE = re.compile(r"<command-name>/?([^<]+)</command-name>")
 COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
@@ -130,6 +130,23 @@ class _CallCollector:
             owner.calls.append(call)
 
 
+SKILL_HEADER = "Base directory for this skill: "
+# tools changing files: their paths tell what a run produced
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+def _skill_run(name: str, text: str) -> SkillRun | None:
+    """The skill's instructions Claude Code injects after a Skill call: its folder on the first line,
+    then SKILL.md without its frontmatter, then the arguments it was called with."""
+    if not text.startswith(SKILL_HEADER):
+        return None
+    base_dir, _, body = text[len(SKILL_HEADER):].partition("\n")
+    body, sep, args = body.rpartition("\n\nARGUMENTS: ")
+    if not sep:
+        body, args = args, None
+    return SkillRun(name=name, base_dir=base_dir.strip(), body=body.strip(), args=args)
+
+
 def _count_tools(owner, msg: dict) -> list[dict]:
     """Count the message's tool calls on `owner` and return them."""
     content = msg.get("content")
@@ -192,6 +209,7 @@ class ClaudeCodeSource:
         calls = _CallCollector()
         active_skill: str | None = None
         spawned_by_skill: dict[str, str | None] = {}  # Agent tool_use id -> skill active then
+        skill_uses: dict[str, str] = {}  # Skill tool_use id -> skill name, until its instructions are loaded
 
         for d in lines:
             t = d.get("type")
@@ -214,6 +232,8 @@ class ClaudeCodeSource:
                     cwd=cwd,
                     project=project_name(cwd),
                     git_branch=d.get("gitBranch", ""),
+                    harness="Claude Code",
+                    harness_version=d.get("version", ""),
                 )
                 prompts.append(current)
                 session.project = session.project or current.project
@@ -240,14 +260,30 @@ class ClaudeCodeSource:
                     _count_tools(agent, d.get("message") or {})
                 continue
             current.ended_at = _max_ts(current.ended_at, ts)
+            if t == "user" and d.get("isMeta") and d.get("sourceToolUseID") in skill_uses:
+                run = _skill_run(skill_uses.pop(d["sourceToolUseID"]), _content_text(d["message"].get("content")))
+                if run:
+                    current.skill_runs.append(run)
             if t == "assistant":
+                text = "\n".join(b.get("text", "") for b in (d.get("message") or {}).get("content") or []
+                                 if isinstance(b, dict) and b.get("type") == "text").strip()
+                if text:
+                    current.answer = text  # the last one is the answer
+                current.harness_version = current.harness_version or d.get("version", "")
+                current.effort = current.effort or d.get("effort") or ""
+                current.requested_model = current.requested_model or d.get("requestedModel") or ""
                 calls.add(current, d)
                 for use in _count_tools(current, d.get("message") or {}):
                     if use.get("name") == "Skill" and (use.get("input") or {}).get("skill"):
                         active_skill = use["input"]["skill"]
                         current.skills.add(active_skill)
+                        skill_uses[use.get("id")] = active_skill
                     elif use.get("name") in AGENT_TOOLS:
                         spawned_by_skill[use.get("id")] = active_skill
+                    elif use.get("name") in EDIT_TOOLS:
+                        path = (use.get("input") or {}).get("file_path") or (use.get("input") or {}).get("notebook_path")
+                        if path:
+                            current.files.add(path)
             elif t == "system" and d.get("subtype") == "turn_duration":
                 current.active_ms += d.get("durationMs") or 0
 
