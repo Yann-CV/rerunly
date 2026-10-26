@@ -1,4 +1,4 @@
-"""Harness-independent records produced by every source (Claude Code today, others later)."""
+"""Harness-independent records produced by every source (Claude Code, Codex and other adapters)."""
 
 from collections import Counter
 from dataclasses import dataclass, field

@@ -1087,18 +1087,19 @@ function rerunCommand(p) {
       lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
     }
   }
-  const agent = r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude";
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? ` --effort ${r.effort}` : ""} ${shellQuote(p.text)}`);
+  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${r.harness_version}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""} ${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }
 
-const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 /** Replay it with Claude Code from here, and the replays launched so far. */
 function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
-  if (r.harness && r.harness !== "Claude Code") return "";
+  if (r.harness && !["Claude Code", "Codex"].includes(r.harness)) return "";
+  const isCodex = r.harness === "Codex";
   const same = r.requested_model || Object.keys(p.models || {})[0] || "";
   const opt = (value, label, current) => `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
   const others = [...new Set([...models, ...p.references.map((x) => x.model).filter(Boolean)])].filter((m) => m !== same).sort();
@@ -1119,20 +1120,21 @@ function replayHtml(p, models, defaultJudge = "") {
         : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
   }).join("");
   return `<div class="replay">
-    <div class="replay-head"><strong>Rerun with Claude</strong>
+    <div class="replay-head"><strong>Rerun with ${esc(r.harness || "Claude Code")}</strong>
       <span class="muted">In <code>${esc(r.cwd || "your home folder")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}.
         <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
         <strong>In a terminal</strong>: you watch it and approve its actions.
         ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
+    ${isCodex ? '<p class="muted">Codex costs are API estimates. No USD budget cap is available. Read-only allows commands inside the read-only sandbox; read and edit allows workspace commands too. Restored skills are supplied by exact file path.</p>' : ""}
     <form id="replay-form" class="replay-form">
       ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
         opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
       <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
-      <label title="Through npx for a release other than the installed one">Claude Code <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
+      <label title="Through npx for a release other than the installed one">${esc(r.harness || "Claude Code")} <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
       <label>Run <select id="replay-mode">${opt("background", "Unattended, in the background", "background")}${opt("terminal", "In a terminal window", "")}</select></label>
       <label class="bg-only" title="Anything else it tries is denied, and reported">May <select id="replay-permission">${opt("ask", "only read", "ask")}${opt("edits", "read and edit files", "")}</select></label>
-      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>
+      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${isCodex ? "" : budget}" size="5" ${isCodex ? "disabled" : ""}></label>
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
       <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
@@ -1158,7 +1160,7 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
         <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
         <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
   ];
-  const command = r.harness === "Claude Code" ? rerunCommand(p) : "";
+  const command = ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
@@ -1180,6 +1182,15 @@ function bindRerun(p) {
     restore_skills: document.getElementById("replay-skills")?.checked ?? true,
     rate: document.getElementById("replay-rate").checked, judge_model: document.getElementById("replay-judge").value,
   });
+  const modelSelect = document.getElementById("replay-model");
+  const updateHarness = () => {
+    const selected = modelSelect.value;
+    const codex = selected.startsWith("codex:") || (!selected && p.rerun.harness === "Codex");
+    const budget = document.getElementById("replay-budget");
+    budget.disabled = codex;
+    if (codex) budget.value = "";
+  };
+  if (modelSelect) modelSelect.onchange = updateHarness;
   // permission and budget only apply to unattended reruns
   const mode = document.getElementById("replay-mode");
   if (mode) mode.onchange = () => form.querySelectorAll(".bg-only").forEach((el) => { el.hidden = mode.value !== "background"; });
@@ -1196,6 +1207,7 @@ function bindRerun(p) {
     set("replay-model", x?.model, p.rerun.requested_model);
     set("replay-effort", x?.effort, p.rerun.effort);
     set("replay-release", x?.harness_version, null);
+    updateHarness();
   };
   const queueButton = document.getElementById("queue-replay");
   if (queueButton) queueButton.onclick = async () => {
@@ -1383,7 +1395,7 @@ let promptSplit = "";
 
 async function viewPrompt(id, compare = {}) {
   let [p, allTags, settings] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags"), api("/api/settings")]);
-  const knownModels = allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const knownModels = (await api("/api/models")).map((m) => m.id);
   ruleSkills = skillsFromTags(allTags);
   // compare by tag only through one of this prompt's own human tags (a stale link falls back to similar)
   if (compare.scope && compare.scope !== "similar" && humanTags(p.tags).some((t) => t.tag === compare.tag)) {
@@ -2399,41 +2411,40 @@ function excludedCardHtml(scope) {
   </div>`;
 }
 
+function agentConnectionDetailsHtml(agent, settings, extra = "") {
+  const status = !agent.enabled ? "Not linked" : agent.directory_exists ? "Linked" : "Waiting for history";
+  const live = settings.auto_ingest_interval > 0 ? `Automatically scanned every ${settings.auto_ingest_interval}s while Rerunly runs.` : "Automatic scanning is off. Use Import now or set an auto-import interval below.";
+  return `<div class="agent-connection-details">
+    <div class="setup-row"><div><h3>${esc(agent.name)}</h3><span class="${agent.enabled && agent.directory_exists ? "status-ok" : "muted"}">${status}</span>
+      <p class="muted">${agent.transcript_count} transcript files found · ${agent.sessions} imported sessions · ${agent.prompts} prompts.
+        ${agent.installed ? "CLI installed; available for reruns." : "CLI not found; existing history can still be imported."}</p></div>
+      </div>
+    <form class="setup-row" data-agent-form="${esc(agent.id)}"><div><label for="agent-path-${esc(agent.id)}"><strong>Transcript directory</strong></label>
+      <p class="muted">${agent.directory_exists ? "Directory found." : "Directory not found. Start a session with this agent or change the path."}</p></div>
+      <input id="agent-path-${esc(agent.id)}" name="directory" size="50" required value="${esc(agent.directory)}">
+      <button class="btn">Save path</button></form>
+    <p class="muted">${esc(live)} Removing an agent stops future imports and keeps imported history.</p>
+    ${agent.id === "codex" ? '<p class="muted">CLI and IDE history are supported. Costs are API estimates, not subscription charges. Codex uses periodic import; Claude’s hook, retention setting and cost telemetry do not apply.</p>' : extra}
+  </div>`;
+}
+
 async function viewSetup() {
   const [st, settings, scope] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history")]);
   const ok = (cond) => (cond ? "status-ok" : "status-warn");
   const retentionOk = st.cleanup_period_days != null && st.cleanup_period_days >= 365;
-  // the checks below, in order: counted in the banner
-  const steps = [st.projects_dir_exists, st.prompts > 0, st.hook_installed, st.autostart.enabled, retentionOk,
-    st.telemetry.configured && st.telemetry.matched_events > 0];
-  app.innerHTML = `
-    <header class="home-hero page-hero">
-      <div class="hero-copy">
-        <h1><span class="hero-name">Setup · ${steps.filter(Boolean).length} of ${steps.length} done</span>Connect your agent once. <em>Every prompt shows up on its own.</em></h1>
-        <p>Rerunly reads what <strong>${esc(st.agent)}</strong> already writes on your machine: nothing leaves it. Import your history, then let the
-          <strong>hook</strong> bring each new prompt in as soon as the agent answers. What to leave out of the history, prices and similarity are below; tags and their rules live on the <a href="#/tags">Tags</a> page.</p>
-      </div>
-    </header>
-    <div class="card">
-      <div class="setup-row"><div class="${ok(st.projects_dir_exists)}"><strong>Transcripts</strong><br>
-        <span class="muted">The agent writes every session (and each subagent) to JSONL files. ${st.transcript_count} session files found in <code>${esc(st.projects_dir)}</code>.</span></div></div>
-      <div class="setup-row"><div class="${ok(st.prompts > 0)}"><strong>Imported</strong><br>
-        <span class="muted">${st.sessions} sessions · ${st.prompts} prompts · ${st.agents} subagent runs · last prompt ${fmtDate(st.last_prompt_at)}. Database <code>${esc(st.db_path)}</code></span></div>
-        <div><button class="btn primary" id="ingest">Import now</button> <button class="btn" id="reingest" title="Re-parse every session (after a price or rule change)">Re-import all</button></div></div>
-      <div class="setup-row"><div class="${ok(st.hook_installed)}"><strong>Live updates (agent hook)</strong><br>
+  const added = st.connections.filter((agent) => agent.enabled);
+  const available = st.connections.filter((agent) => !agent.enabled);
+  const claudeControls = `<details><summary>Claude Code live updates, retention and cost telemetry</summary>
+      <div class="setup-row"><div class="${ok(st.hook_installed)}"><strong>Live updates (Claude Code hook)</strong><br>
         <span class="muted">Without the hook the dashboard re-scans every ${settings.auto_ingest_interval}s while it runs. The hook imports right after each answer of the agent.
         It adds this command to <code>${esc(st.claude_settings_path)}</code> (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.hook_command)}</code></div>
         <div><button class="btn" id="hook">${st.hook_installed ? "Remove hook" : "Install hook"}</button></div></div>
-      <div class="setup-row"><div class="${ok(st.autostart.enabled)}"><strong>Start at login</strong><br>
-        <span class="muted">Starts the dashboard in the background when you log in, with an icon in the status bar to open it, import, or quit.
-        It writes <code>${esc(st.autostart.file)}</code>. To start it now without a terminal: <code>uv run rerunly start</code>.</span></div>
-        <div><button class="btn" id="autostart">${st.autostart.enabled ? "Don't start at login" : "Start at login"}</button></div></div>
       <div class="setup-row"><div class="${ok(retentionOk)}"><strong>Transcript retention</strong><br>
-        <span class="muted">The agent deletes transcripts older than <code>cleanupPeriodDays</code> (default 30). Imported prompts stay in the dashboard database,
+        <span class="muted">Claude Code deletes transcripts older than <code>cleanupPeriodDays</code> (default 30). Imported prompts stay in the dashboard database,
         but a longer retention lets you re-import with new prices or rules. Current: ${st.cleanup_period_days ?? "not set (30 days)"}.</span></div>
         <div><button class="btn" id="retention">Set to 3650 days</button></div></div>
-      <div class="setup-row"><div class="${ok(st.telemetry.configured && st.telemetry.matched_events > 0)}"><strong>Cost reported by the agent (OpenTelemetry)</strong><br>
-        <span class="muted">The agent can send its own cost for every API call, including internal calls the transcripts do not detail.
+      <div class="setup-row"><div class="${ok(st.telemetry.configured && st.telemetry.matched_events > 0)}"><strong>Claude Code cost telemetry</strong><br>
+        <span class="muted">Claude Code can send its own cost for every API call, including internal calls the transcripts do not detail.
         The dashboard then shows that cost for every prompt fully covered by telemetry, and the price-table estimate otherwise.
         Enabling it adds these entries to <code>env</code> in <code>${esc(st.claude_settings_path)}</code>; they apply to agent sessions started afterwards,
         and calls made while the dashboard is not running are not recorded.</span><br>
@@ -2441,7 +2452,47 @@ async function viewSetup() {
         <span class="muted">${st.telemetry.events} API calls received · ${st.telemetry.matched_events} linked to an imported prompt · last ${fmtDate(st.telemetry.last_event_at)}</span>
         ${Object.keys(st.telemetry.conflicts).length ? `<br><span class="status-warn">Already set to other values: ${Object.entries(st.telemetry.conflicts).map(([k, v]) => `<code>${esc(k)}=${esc(v)}</code>`).join(" ")}</span>` : ""}</div>
         <div><button class="btn" id="telemetry">${st.telemetry.configured ? "Disable telemetry" : "Enable telemetry"}</button></div></div>
-      ${st.unpriced_models.length ? `<div class="setup-row"><div class="status-warn"><strong>Models without a price</strong><br><span class="muted">${esc(st.unpriced_models.join(", "))} — add them to the price table below.</span></div></div>` : ""}
+    </details>`;
+  app.innerHTML = `
+    <header class="home-hero page-hero"><div class="hero-copy">
+      <h1><span class="hero-name">Setup · ${plural(added.length, "agent")} added</span>Connect your coding agents. <em>Keep every prompt in one history.</em></h1>
+      <p>Link Claude Code, OpenAI Codex, or both. Rerunly reads local transcripts; nothing leaves your machine during import.
+        Add agents using the selector, then manage their connections together below. Prices, automatic import and history settings are shared.</p>
+    </div></header>
+    <h2>Agents</h2>
+    <div class="card">
+      <form id="add-agent-form" class="inline-form">
+        <label for="add-agent">Add an agent</label>
+        <select id="add-agent" name="agent" required ${available.length ? "" : "disabled"}>
+          <option value="">${available.length ? "Choose an agent…" : "All supported agents are added"}</option>
+          ${available.map((agent) => `<option value="${esc(agent.id)}">${esc(agent.name)}</option>`).join("")}
+        </select>
+        <button class="btn primary" ${available.length ? "" : "disabled"}>Add agent</button>
+      </form>
+      ${added.length ? `<div class="table-scroll"><table class="agent-connections-table">
+        <thead><tr><th>Agent</th><th>Status</th><th>Imported history</th><th>Updates</th><th>Manage</th></tr></thead>
+        <tbody>${added.map((agent) => `<tr>
+          <td><strong>${esc(agent.name)}</strong><br><span class="muted">${agent.installed ? "CLI installed" : "CLI not found"}</span></td>
+          <td><span class="${agent.directory_exists ? "status-ok" : "status-warn"}">${agent.directory_exists ? "Connected" : "Waiting for history"}</span><br><span class="muted">${agent.transcript_count} transcript files</span></td>
+          <td>${plural(agent.sessions, "session")} · ${plural(agent.prompts, "prompt")}<br><span class="muted">Last prompt ${fmtDate(agent.last_prompt_at)}</span></td>
+          <td>${agent.id === "claude-code" && st.hook_installed ? "Hook + periodic import" : settings.auto_ingest_interval > 0 ? `Every ${settings.auto_ingest_interval}s` : "Manual import"}</td>
+          <td><button type="button" class="btn" data-agent-details="${esc(agent.id)}" aria-expanded="false" aria-controls="agent-details-${esc(agent.id)}">Details</button>
+            <button type="button" class="link-btn" data-remove-agent="${esc(agent.id)}">Remove</button></td>
+        </tr><tr id="agent-details-${esc(agent.id)}" hidden><td colspan="5">${agentConnectionDetailsHtml(agent, settings, claudeControls)}</td></tr>`).join("")}</tbody>
+      </table></div>` : '<p class="muted">No agents added yet. Choose an agent above to connect its local history.</p>'}
+      <p class="muted">Removing an agent keeps its imported history. Add it again to resume imports.</p>
+    </div>
+    <h2>Dashboard</h2>
+    <div class="card">
+      <div class="setup-row"><div class="${ok(st.prompts > 0)}"><strong>Imported history from all agents</strong><br>
+        <span class="muted">${st.sessions} sessions · ${st.prompts} prompts · ${st.agents} subagent runs · last prompt ${fmtDate(st.last_prompt_at)}.
+          Database <code>${esc(st.db_path)}</code></span></div>
+        <div><button class="btn primary" id="ingest">Import now</button> <button class="btn" id="reingest">Re-import all</button></div></div>
+      <div class="setup-row"><div class="${ok(st.autostart.enabled)}"><strong>Start at login</strong><br>
+        <span class="muted">Starts the dashboard in the background when you log in, with an icon in the status bar to open it, import, or quit.
+        It writes <code>${esc(st.autostart.file)}</code>. To start it now without a terminal: <code>uv run rerunly start</code>.</span></div>
+        <div><button class="btn" id="autostart">${st.autostart.enabled ? "Don't start at login" : "Start at login"}</button></div></div>
+      ${st.unpriced_models.length ? `<p class="status-warn">Models without a price: ${esc(st.unpriced_models.join(", "))}. Add them to the price table below.</p>` : ""}
     </div>
 
     <h2 id="excluded">Excluded from the history</h2>
@@ -2449,15 +2500,14 @@ async function viewSetup() {
 
     <h2>Settings</h2>
     <form id="settings" class="card">
-      <div class="setup-row"><div><strong>Transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir)}"></div>
-      <div class="setup-row"><div><strong>Cost shown</strong><br><span class="muted">The agent's own cost when telemetry covers the whole prompt, or always the price table.</span></div>
+      <div class="setup-row"><div><strong>Cost shown</strong><br><span class="muted">Claude Code’s reported cost when telemetry covers a prompt, or the price table. Codex always uses price estimates.</span></div>
         <select name="cost_source">
           <option value="claude-code" ${settings.cost_source === "claude-code" ? "selected" : ""}>The agent's own cost when available</option>
           <option value="prices" ${settings.cost_source === "prices" ? "selected" : ""}>Price table only</option></select></div>
       <div class="setup-row"><div><strong>Similarity threshold</strong><br><span class="muted">0–1 word overlap above which two prompts are shown together.</span></div>
         <input name="similarity_threshold" type="number" min="0" max="1" step="0.05" value="${settings.similarity_threshold}"></div>
       <div class="setup-row"><div><strong>Default LLM judge</strong><br><span class="muted">The model rating how much a rerun's output differs from its original's.
-        Empty uses Claude Code's default model. Each rerun, and the Compare page, can pick another.</span></div>
+        Use a Claude model ID or codex:MODEL for Codex. Empty uses Claude Code’s default model. Each rerun and comparison can pick another.</span></div>
         <input name="judge_model" size="24" value="${esc(settings.judge_model || "")}" placeholder="claude-haiku-5-5"></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
@@ -2467,10 +2517,39 @@ async function viewSetup() {
     </form>`;
 
   const busy = async (btn, fn) => { btn.disabled = true; try { await fn(); } catch (e) { alert(e.message); } finally { btn.disabled = false; } };
+  app.querySelectorAll("[data-agent-form]").forEach((form) => form.onsubmit = (event) => {
+    event.preventDefault();
+    busy(form.querySelector("button"), async () => {
+      await api(`/api/setup/agents/${form.dataset.agentForm}`, { method: "POST", body: { directory: new FormData(form).get("directory"), enabled: true } });
+      await api("/api/ingest", { method: "POST" });
+      await viewSetup();
+    });
+  });
+  document.getElementById("add-agent-form").onsubmit = (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const id = new FormData(form).get("agent");
+    if (!id) return;
+    busy(form.querySelector("button"), async () => {
+      await api(`/api/setup/agents/${id}`, { method: "POST", body: { enabled: true } });
+      await api("/api/ingest", { method: "POST" });
+      await viewSetup();
+    });
+  };
+  app.querySelectorAll("[data-remove-agent]").forEach((button) => button.onclick = () => busy(button, async () => {
+    await api(`/api/setup/agents/${button.dataset.removeAgent}`, { method: "POST", body: { enabled: false } });
+    await viewSetup();
+  }));
+  app.querySelectorAll("[data-agent-details]").forEach((button) => button.onclick = () => {
+    const row = document.getElementById(`agent-details-${button.dataset.agentDetails}`);
+    row.hidden = !row.hidden;
+    button.setAttribute("aria-expanded", String(!row.hidden));
+    button.textContent = row.hidden ? "Details" : "Hide details";
+  });
   document.getElementById("ingest").onclick = (e) => busy(e.target, async () => { await api("/api/ingest", { method: "POST" }); viewSetup(); });
   document.getElementById("reingest").onclick = (e) => busy(e.target, async () => { await api("/api/ingest?force=true", { method: "POST" }); viewSetup(); });
-  document.getElementById("hook").onclick = (e) => busy(e.target, async () => { await api(`/api/setup/hook?install=${!st.hook_installed}`, { method: "POST" }); viewSetup(); });
-  document.getElementById("telemetry").onclick = (e) => busy(e.target, async () => {
+  if (document.getElementById("hook")) document.getElementById("hook").onclick = (e) => busy(e.target, async () => { await api(`/api/setup/hook?install=${!st.hook_installed}`, { method: "POST" }); viewSetup(); });
+  if (document.getElementById("telemetry")) document.getElementById("telemetry").onclick = (e) => busy(e.target, async () => {
     const conflicts = Object.entries(st.telemetry.conflicts);
     if (!st.telemetry.configured && conflicts.length &&
         !confirm(`This replaces your current values:\n${conflicts.map(([k, v]) => `${k}=${v}`).join("\n")}`)) return;
@@ -2480,7 +2559,7 @@ async function viewSetup() {
   document.getElementById("autostart").onclick = (e) => busy(e.target, async () => {
     await api("/api/setup/autostart", { method: "POST", body: { enable: !st.autostart.enabled } }); viewSetup();
   });
-  document.getElementById("retention").onclick = (e) => busy(e.target, async () => { await api("/api/setup/retention", { method: "POST", body: { days: 3650 } }); viewSetup(); });
+  if (document.getElementById("retention")) document.getElementById("retention").onclick = (e) => busy(e.target, async () => { await api("/api/setup/retention", { method: "POST", body: { days: 3650 } }); viewSetup(); });
   // exclusions: a click saves the new list and redraws the page
   const exclude = (key, list) => api("/api/settings", { method: "PUT", body: { [key]: list } }).then(() => viewSetup());
   const excludedProjects = scope.projects.filter((x) => x.excluded).map((x) => x.project);
@@ -2507,7 +2586,6 @@ async function viewSetup() {
     let values;
     try {
       values = {
-        claude_projects_dir: f.get("claude_projects_dir"),
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
         judge_model: String(f.get("judge_model") || "").trim(),
@@ -2794,7 +2872,7 @@ async function viewCompare(query) {
   const a = query.get("a"), b = query.get("b");
   if (!a || !b) { app.innerHTML = '<div class="card status-warn">Pick two runs to compare: open a rerun, then Compare.</div>'; return; }
   const [data, tags, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/tags"), api("/api/settings")]);
-  const models = tags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const models = (await api("/api/models")).map((m) => m.id);
   const kindLabel = { original: "Original", rerun: "Rerun", reference: "Reference run" };
   const label = (pid) => kindLabel[data.candidates.find((x) => x.id === pid)?.kind] || "Run";
   const picker = (id, current) => `<select id="${id}">${data.candidates.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>

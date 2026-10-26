@@ -251,6 +251,7 @@ def get_settings(conn: sqlite3.Connection) -> dict:
     settings = dict(DEFAULT_SETTINGS)
     for row in conn.execute("SELECT key, value FROM settings"):
         settings[row["key"]] = json.loads(row["value"])
+    settings["prices"] = {**DEFAULT_SETTINGS["prices"], **settings["prices"]}
     return settings
 
 

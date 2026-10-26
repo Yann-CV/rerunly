@@ -941,3 +941,10 @@ a.hero-fact:hover { text-decoration: none; background: color-mix(in srgb, var(--
 .compare-pick select { max-width: min(360px, 80vw); }
 #compare-original .link-btn { font-size: 13px; font-weight: 400; margin-left: 8px; }
 .rr-result .rerun-status + .rerun-status { margin-top: 2px; }
+
+/* Agent connections share one list; details open beneath the selected row. */
+.agent-connections-table { width: 100%; margin-top: 16px; }
+.agent-connections-table [hidden] { display: none; }
+.agent-connection-details { padding: 8px 12px; white-space: normal; }
+.agent-connection-details input { max-width: 100%; box-sizing: border-box; }
+#add-agent-form { flex-wrap: wrap; }

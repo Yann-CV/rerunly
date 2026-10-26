@@ -14,6 +14,12 @@ WEB_SEARCH_USD = 0.01  # $10 per 1,000 searches
 
 # model id prefix -> {input, output, cache_read}
 DEFAULT_PRICES: dict[str, dict[str, float]] = {
+    # Standard, short-context API estimates; subscription credits are not USD charges.
+    "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
+    "gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.10},
+    "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_read": 0.05},
+    "gpt-6-luna": {"input": 0.10, "output": 0.50, "cache_read": 0.01},
+    "gpt-5.3-codex": {"input": 1.75, "output": 14.0, "cache_read": 0.175},
     "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
     "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_read": 0.25},
     "claude-opus-5-5": {"input": 4.0, "output": 20.0, "cache_read": 0.20},
