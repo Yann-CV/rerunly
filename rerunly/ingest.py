@@ -169,7 +169,12 @@ def session_texts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def sources_from_settings(settings: dict) -> list:
-    return [ClaudeCodeSource(settings["claude_projects_dir"]), CodexSource(settings["codex_sessions_dir"])]
+    sources = []
+    if settings.get("claude_enabled", True):
+        sources.append(ClaudeCodeSource(settings["claude_projects_dir"]))
+    if settings.get("codex_enabled", True):
+        sources.append(CodexSource(settings["codex_sessions_dir"]))
+    return sources
 
 
 def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:

@@ -18,6 +18,8 @@ def migrate_legacy_data() -> bool:
 
 # Settings stored in the database, editable from the Setup page.
 DEFAULT_SETTINGS = {
+    "claude_enabled": True,
+    "codex_enabled": True,
     "claude_projects_dir": str(Path.home() / ".claude/projects"),
     "codex_sessions_dir": str(Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"),
     "prices": DEFAULT_PRICES,

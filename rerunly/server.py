@@ -192,7 +192,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         otel.store(conn(), await request.json())
         return {}
 
-    # ---- setup: wiring Claude Code to the dashboard ---------------------------
+    # ---- setup: connecting local coding agents ---------------------------
 
     def hook_command() -> str:
         return f"curl -s -m 2 -X POST http://127.0.0.1:{port}/api/ingest >/dev/null 2>&1 || true # {HOOK_MARKER}"
@@ -238,11 +238,32 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         unpriced = set()
         for r in c.execute("SELECT unpriced_models FROM prompts WHERE unpriced_models != '[]'"):
             unpriced |= set(json.loads(r[0]))
+        connections = []
+        for agent_id, name, source, path_key, enabled_key, binary, pattern in (
+            ("claude-code", "Claude Code", "claude-code", "claude_projects_dir", "claude_enabled", "claude", "*/*.jsonl"),
+            ("codex", "OpenAI Codex", "codex", "codex_sessions_dir", "codex_enabled", "codex", "**/rollout-*.jsonl"),
+        ):
+            directory = Path(settings[path_key]).expanduser()
+            imported = c.execute(
+                "SELECT COUNT(*) prompts, COUNT(DISTINCT session_id) sessions, MAX(started_at) last_prompt_at "
+                "FROM prompts WHERE source=?", (source,)
+            ).fetchone()
+            connections.append({
+                "id": agent_id, "name": name, "enabled": settings[enabled_key],
+                "directory": str(directory), "directory_exists": directory.is_dir(),
+                "installed": shutil.which(binary) is not None,
+                "transcript_count": sum(1 for _ in directory.glob(pattern)) if directory.is_dir() else 0,
+                **dict(imported),
+                "updates": "hook-and-polling" if agent_id == "claude-code" else "polling",
+                "reported_cost": agent_id == "claude-code",
+            })
         wanted, env = otel.telemetry_env(port), cs.get("env") or {}
         events = c.execute(
             "SELECT COUNT(*) n, SUM(prompt_id IN (SELECT id FROM prompts)) matched, MAX(timestamp) last FROM otel_requests"
         ).fetchone()
         return {
+            "connections": connections,
+            "auto_ingest_interval": settings["auto_ingest_interval"],
             "telemetry": {
                 "configured": all(env.get(k) == v for k, v in wanted.items()),
                 "env": wanted,
@@ -274,6 +295,25 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "last_prompt_at": counts["last"],
             "unpriced_models": sorted(unpriced),
         }
+
+    @app.post("/api/setup/agents/{agent_id}")
+    def connect_agent(agent_id: str, body: dict = Body(...)):
+        keys = {"claude-code": ("claude_enabled", "claude_projects_dir"),
+                "codex": ("codex_enabled", "codex_sessions_dir")}
+        if agent_id not in keys:
+            raise HTTPException(404, "unknown agent")
+        enabled_key, path_key = keys[agent_id]
+        values = {}
+        if "enabled" in body:
+            if not isinstance(body["enabled"], bool):
+                raise HTTPException(400, "enabled must be true or false")
+            values[enabled_key] = body["enabled"]
+        if "directory" in body:
+            if not isinstance(body["directory"], str) or not body["directory"].strip():
+                raise HTTPException(400, "a transcript directory is required")
+            values[path_key] = body["directory"].strip()
+        db.save_settings(conn(), values)
+        return setup_status()
 
     @app.post("/api/setup/hook")
     def install_hook(install: bool = True):
