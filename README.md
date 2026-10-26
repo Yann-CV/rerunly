@@ -456,3 +456,20 @@ If a provider has not published a price or its page format changes, Rerunly keep
 existing estimates and reports the missing lookup rather than inventing a price.
 These are API token estimates, not subscription charges; pricing for long contexts,
 special service tiers, and hosted tools can differ.
+
+### Explore with examples
+
+**Setup → Examples → Add examples** loads eight illustrative records, all tagged
+`rerunly-examples`. Open that tag to browse the set, or use the smaller tags:
+
+- `example:prompt-tuning`: broad Claude request versus focused Codex prompt, with a reference and an illustrative equivalent-output verdict.
+- `example:cache`: the same task with cold and warm input caches.
+- `example:skills` and `example:subagents`: two skill snapshots and a delegated edge-case review, including persona and subagent cost.
+- `example:quality`: a cheaper rerun that misses a test case and receives an illustrative worse verdict.
+- `example:blocked`: an unattended rerun needing a release-version decision.
+
+All tokens, timings, outputs and ratings in this set are illustrative; no agents
+or LLM judges are run. They appear in totals while visible. Hide the set with
+**Setup → Excluded from the history → Examples**, or delete it with **Remove
+examples**. Adding the set again does not duplicate it. The CLI equivalents are
+`uv run rerunly examples` and `uv run rerunly examples --remove`.

@@ -22,6 +22,9 @@ def main() -> None:
     p_ingest = sub.add_parser("ingest", help="import transcripts once and exit")
     p_ingest.add_argument("--force", action="store_true", help="re-parse every session (e.g. after a price change)")
 
+    p_examples = sub.add_parser("examples", help="add illustrative dashboard examples tagged rerunly-examples")
+    p_examples.add_argument("--remove", action="store_true", help="remove the illustrative records")
+
     p_tray = sub.add_parser("tray", help="run the dashboard with an icon in the status bar (stays in the foreground)")
     p_start = sub.add_parser("start", help="run the dashboard and its status bar icon in the background")
     sub.add_parser("stop", help="stop the background dashboard")
@@ -51,6 +54,11 @@ def main() -> None:
         from .tray import run_tray
 
         run_tray(args.db, port)
+        return
+    if args.cmd == "examples":
+        from .examples import add_examples, remove_examples
+        with db.connect(args.db) as conn:
+            print(remove_examples(conn) if args.remove else add_examples(conn))
         return
     if args.cmd == "ingest":
         conn = db.connect(args.db)

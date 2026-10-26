@@ -1098,6 +1098,7 @@ const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 /** Replay it with Claude Code from here, and the replays launched so far. */
 function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
+  const isExample = p.source === "rerunly-examples";
   if (r.harness && !["Claude Code", "Codex"].includes(r.harness)) return "";
   const isCodex = r.harness === "Codex";
   const same = r.requested_model || Object.keys(p.models || {})[0] || "";
@@ -1126,7 +1127,7 @@ function replayHtml(p, models, defaultJudge = "") {
         <strong>In a terminal</strong>: you watch it and approve its actions.
         ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
     ${isCodex ? '<p class="muted">Codex costs are API estimates. No USD budget cap is available. Read-only allows commands inside the read-only sandbox; read and edit allows workspace commands too. Restored skills are supplied by exact file path.</p>' : ""}
-    <form id="replay-form" class="replay-form">
+    ${isExample ? '<p class="muted">Illustrative rerun history. Use a real prompt to launch or queue agent work.</p>' : `<form id="replay-form" class="replay-form">
       ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
         opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
@@ -1141,7 +1142,7 @@ function replayHtml(p, models, defaultJudge = "") {
         <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${opt("", `default (${defaultJudge || "Claude Code's"})`, "")}${[...new Set([same, ...models])].filter(Boolean).map((m) => opt(m, m, "")).join("")}</select></label>
       <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
         <button class="btn primary">↻ Rerun now</button></span>
-    </form>
+    </form>`}
     <p id="replay-status" class="replay-status" hidden></p>
     ${replays ? `<div class="replays"><span class="muted">Reruns</span><ul>${replays}</ul></div>` : ""}
   </div>`;
@@ -1160,7 +1161,7 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
         <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
         <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
   ];
-  const command = ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
+  const command = p.source !== "rerunly-examples" && ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
@@ -2400,6 +2401,7 @@ function excludedCardHtml(scope) {
       <div class="exclude-chips">${tagChips(scope.skills, "skill:") || '<span class="muted">No skill used yet.</span>'}</div></div></div>
     ${scope.reruns.length ? `<div class="setup-row"><div><strong>Reruns</strong><br><span class="muted">Leave out every prompt of the reruns launched from here, to keep the history to your own work.</span>
       <div class="exclude-chips">${tagChips(scope.reruns, "")}</div></div></div>` : ""}
+    ${(scope.examples || []).length ? `<div class="setup-row"><div><strong>Examples</strong><br><span class="muted">Hide the illustrative records from totals and history.</span><div class="exclude-chips">${tagChips(scope.examples, "")}</div></div></div>` : ""}
     <div class="setup-row"><div><strong>Subagent types</strong><br><span class="muted">Leave out every prompt that ran a kind of subagent.</span>
       <div class="exclude-chips">${tagChips(scope.agents, "agent:") || '<span class="muted">No subagent run yet.</span>'}</div></div></div>
     <div class="setup-row"><div><strong>Sessions</strong><br><span class="muted">Leave out one conversation, such as a test or an experiment.</span>
@@ -2482,6 +2484,10 @@ async function viewSetup() {
       </table></div>` : '<p class="muted">No agents added yet. Choose an agent above to connect its local history.</p>'}
       <p class="muted">Removing an agent keeps its imported history. Add it again to resume imports.</p>
     </div>
+    <h2>Examples</h2>
+    <div class="card"><div class="setup-row"><div><strong>Explore Rerunly with simple examples</strong><p class="muted">Prompt tuning, Claude versus Codex, cache savings, skill versions, subagents, quality verdicts and a blocked rerun.
+      Illustrative data only; no agents are run. All examples are tagged <code>rerunly-examples</code> and can be excluded from totals like any other tag.</p></div>
+      <div>${st.example_prompts ? '<a class="btn" href="#/tag/rerunly-examples">View examples</a> <button class="btn" id="remove-examples">Remove examples</button>' : '<button class="btn" id="load-examples">Add examples</button>'}</div></div></div>
     <h2>Dashboard</h2>
     <div class="card">
       <div class="setup-row"><div class="${ok(st.prompts > 0)}"><strong>Imported history from all agents</strong><br>
@@ -2534,6 +2540,16 @@ async function viewSetup() {
       await viewSetup();
     });
   });
+  const loadExamples = document.getElementById("load-examples");
+  if (loadExamples) loadExamples.onclick = () => busy(loadExamples, async () => {
+    await api("/api/examples", { method: "POST" });
+    await viewSetup();
+  });
+  const removeExamples = document.getElementById("remove-examples");
+  if (removeExamples) removeExamples.onclick = () => busy(removeExamples, async () => {
+    await api("/api/examples", { method: "DELETE" });
+    await viewSetup();
+  });
   document.getElementById("add-agent-form").onsubmit = (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -2577,7 +2593,7 @@ async function viewSetup() {
     const name = b.dataset.excludeProject;
     exclude("excluded_projects", excludedProjects.includes(name) ? excludedProjects.filter((x) => x !== name) : [...excludedProjects, name]);
   });
-  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns].filter((x) => x.excluded).map((x) => x.tag);
+  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns, ...(scope.examples || [])].filter((x) => x.excluded).map((x) => x.tag);
   app.querySelectorAll("[data-exclude-tag]").forEach((b) => b.onclick = () => {
     const tag = b.dataset.excludeTag;
     exclude("excluded_tags", excludedTags.includes(tag) ? excludedTags.filter((x) => x !== tag) : [...excludedTags, tag]);

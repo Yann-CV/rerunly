@@ -197,6 +197,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         otel.store(conn(), await request.json())
         return {}
 
+    @app.post("/api/examples")
+    def load_examples():
+        from .examples import add_examples
+        with ingest_lock:
+            return add_examples(conn())
+
+    @app.delete("/api/examples")
+    def delete_examples():
+        from .examples import remove_examples
+        with ingest_lock:
+            return remove_examples(conn())
+
     # ---- setup: connecting local coding agents ---------------------------
 
     def hook_command() -> str:
@@ -267,6 +279,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "SELECT COUNT(*) n, SUM(prompt_id IN (SELECT id FROM prompts)) matched, MAX(timestamp) last FROM otel_requests"
         ).fetchone()
         return {
+            "example_prompts": c.execute("SELECT COUNT(*) FROM prompts WHERE source='rerunly-examples'").fetchone()[0],
             "connections": connections,
             "auto_ingest_interval": settings["auto_ingest_interval"],
             "telemetry": {
@@ -377,6 +390,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         ]
         reruns = c.execute("SELECT COUNT(*) FROM tags WHERE tag = 'rerun' AND auto = 1").fetchone()[0]
         return {
+            "examples": [{"tag": "rerunly-examples", "prompts": n, "excluded": "rerunly-examples" in s["excluded_tags"]}
+                         for n in [c.execute("SELECT COUNT(*) FROM prompts WHERE source='rerunly-examples'").fetchone()[0]] if n],
             "reruns": [{"tag": "rerun", "prompts": reruns, "excluded": "rerun" in s["excluded_tags"]}] if reruns else [],
             # prompts left out by any exclusion, each counted once
             "hidden": c.execute("SELECT (SELECT COUNT(*) FROM prompts) - (SELECT COUNT(*) FROM pv)").fetchone()[0],
@@ -1015,9 +1030,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "rate": body.get("rate", True) is not False, "judge_model": judge_model}
 
     def replayable(c, prompt_id: str):
-        r = c.execute("SELECT text, cwd, harness, harness_version, requested_model, effort FROM pv WHERE id = ?", (prompt_id,)).fetchone()
+        r = c.execute("SELECT text, cwd, harness, harness_version, requested_model, effort, source FROM pv WHERE id = ?", (prompt_id,)).fetchone()
         if r is None:
             raise HTTPException(404, f"no prompt {prompt_id}")
+        if r["source"] == "rerunly-examples":
+            raise HTTPException(400, "Illustrative examples have no executable workspace; use a real prompt to launch a rerun.")
         if r["harness"] and r["harness"] not in ("Claude Code", "Codex"):
             raise HTTPException(400, "this harness does not support replay")
         return r
@@ -1161,8 +1178,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         queue = [{**dict(q), "prompt": prompt(q["prompt_id"])} for q in c.execute("SELECT * FROM replay_queue ORDER BY id")]
         launched = []
         for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC LIMIT 200"):
+            original = prompt(x["prompt_id"])
+            if original is None and x["prompt_id"].startswith("rerunly-example:"):
+                continue  # the examples are hidden
             done = c.execute(f"SELECT {prompt_cols} FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
-            launched.append({**rerun_row(x), "original": prompt(x["prompt_id"]), "replay": dict(done) if done else None,
+            launched.append({**rerun_row(x), "original": original, "replay": dict(done) if done else None,
                              "rating": rating_of(c, x["prompt_id"], done["id"]) if done else None})
         return {"queue": queue, "launched": launched}
 
@@ -1213,8 +1233,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             raise HTTPException(400, "unknown judge model")
         c = conn()
         for pid in (body.get("base"), body.get("other")):
-            if not c.execute("SELECT 1 FROM pv WHERE id = ?", (str(pid),)).fetchone():
+            r = c.execute("SELECT source FROM pv WHERE id = ?", (str(pid),)).fetchone()
+            if not r:
                 raise HTTPException(404, f"no prompt {pid}")
+            if r["source"] == "rerunly-examples":
+                raise HTTPException(400, "Illustrative examples keep their illustrative rating; rate real runs instead.")
         rating = start_rating(str(body["base"]), str(body["other"]), bool(body.get("force")), model)
         if rating is None:
             raise HTTPException(400, "both runs need a final answer to be rated (and two different runs)")
