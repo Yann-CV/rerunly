@@ -24,6 +24,17 @@ DEFAULT_PRICES: dict[str, dict[str, float]] = {
     "claude-sonnet-4": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
     "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cache_read": 0.01},
     "claude-haiku-4": {"input": 1.0, "output": 5.0, "cache_read": 0.10},
+    "claude-opus-4-6": {"input": 5.0, "output": 25.0, "cache_read": 0.50},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
+    "gemini-3.8-flash": {"input": 0.15, "output": 0.60, "cache_read": 0.0375},
+    "gemini-3.8-pro": {"input": 1.25, "output": 5.00, "cache_read": 0.3125},
+    "gemini-2.5-flash": {"input": 0.10, "output": 0.40, "cache_read": 0.025},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.00, "cache_read": 0.3125},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40, "cache_read": 0.025},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30, "cache_read": 0.01875},
+    "gemini-1.5-pro": {"input": 1.25, "output": 5.00, "cache_read": 0.3125},
+    "gemini-3": {"input": 0.50, "output": 2.00, "cache_read": 0.125},
+    "gpt-oss-120b": {"input": 0.40, "output": 1.20, "cache_read": 0.10},
 }
 
 

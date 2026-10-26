@@ -10,11 +10,12 @@
 </p>
 
 <p align="center">
-  <b>Cost, tokens and time for every prompt you give Claude Code,<br>so each rerun tells you if your last change made it cheaper, faster, or neither.</b>
+  <b>Cost, tokens and time for every prompt you give Claude Code or Antigravity,<br>so each rerun tells you if your last change made it cheaper, faster, or neither.</b>
 </p>
 
 <p align="center">
   <img alt="Claude Code" src="https://img.shields.io/badge/works%20with-Claude%20Code-6250d6">
+  <img alt="Antigravity" src="https://img.shields.io/badge/works%20with-Antigravity-4285f4">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-2a78d6">
   <img alt="Local first" src="https://img.shields.io/badge/data-stays%20on%20your%20machine-1baf7a">
   <img alt="Setup" src="https://img.shields.io/badge/setup-60%20seconds-eb6834">
@@ -26,7 +27,7 @@
 You tweak a skill, rewrite a `CLAUDE.md`, add a subagent… and then? Did the task get
 **cheaper**? **Faster**? Or did that clever persona just double your token bill?
 
-**Rerunly** reads the transcripts Claude Code already writes on your machine and turns them
+**Rerunly** reads the transcripts Claude Code and Antigravity's CLI (`agy`) already write on your machine and turns them
 into a living cost history: **per prompt, per subagent, per persona, per task**. Every rerun of
 a task lands next to the previous ones, so after each change you see, at a glance, whether it
 paid off.
@@ -96,8 +97,9 @@ uv run rerunly start   # runs in the background, with a status bar icon
 
 Open <http://127.0.0.1:8765>, go to **Setup**, and press:
 
-1. **Import now**: your whole Claude Code history appears.
-2. **Install hook**: new prompts show up the moment Claude answers.
+1. **Import now**: your whole Claude Code and Antigravity history appears.
+2. **Install hook**: new prompts show up the moment the agent answers (a `Stop` hook in
+   `~/.claude/settings.json`, and in `~/.gemini/config/hooks.json` when Antigravity is installed).
 3. **Enable telemetry** *(optional)*: switch to Claude Code's own cost figures.
 4. **Start at login** *(optional)*: never think about it again.
 
@@ -188,8 +190,12 @@ a timeline by creation date. Click one to open its charts in place.</p>
   original's in substance (0–100, wording aside), whether it is better, the same or worse, and
   whether you should read it: **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it**,
   with a one-line summary and the main differences. The badge shows wherever reruns are listed.
-  Pick the judge model per rerun or per comparison; the default (haiku) is set on the Setup
-  page. The judge runs in an empty scratch folder, saves no session and has a budget cap.
+  Pick the judge model per rerun or per comparison, among the models the agents can run: Claude
+  Code's aliases for its latest models (`fable`, `opus`, `sonnet`, read from `claude --help`), the
+  full Claude model ids, and the models `agy models` lists; the default (haiku) is set on the
+  Setup page. The judge runs in an empty scratch folder; through Claude Code it saves no session
+  and has a budget cap, through Antigravity it has a time limit, and its conversations are left
+  out of the history.
 - **Compare**: any two runs of a prompt (the original, its reruns, its tags' reference runs)
   side by side, with the judge's call and a button to judge them with the model of your choice.
 - **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
@@ -364,10 +370,30 @@ made while the dashboard is not running are lost; a prompt missing some of its c
 to the estimate.
 </details>
 
-## 🛣️ Beyond Claude Code
+## 🛣️ Antigravity, and beyond
 
-Claude Code is supported today. Parsing sits behind a small `Source` interface
-(`rerunly/sources/base.py`), so other agents and harnesses can plug in next.
+**Claude Code** and **Antigravity's CLI** (`agy`) are supported. Antigravity's history is read
+from `~/.gemini/antigravity-cli` (the folder is set on the Setup page):
+
+- `brain/<conversation>/.system_generated/logs/transcript.jsonl` gives the prompts (each
+  `USER_INPUT` step the user typed), their tokens (on `PLANNER_RESPONSE` steps), tools, files
+  edited, final answers and skills (a `SKILL.md` read in full is kept as the skill's version);
+  the model comes from the *Model Selection* setting the transcript records.
+- `conversation_summaries.db` gives each conversation's title and folder, and links subagents
+  to their parent conversation; each subagent goes to the prompt running when it started.
+- Costs come from the price table (Gemini, GPT-OSS and Claude models through Antigravity);
+  Antigravity reports no cost of its own. Its transcripts do not record its release either.
+
+Reruns of an Antigravity prompt run `agy`, with its own models. They differ from Claude Code's:
+`agy` picks the conversation id itself, so a rerun is linked once its stream names it (in a
+terminal, once its transcript is imported: same prompt and folder, started within the hour);
+it has no flag to add to the system prompt, so the unattended instructions follow the prompt
+after a `<rerunly-unattended-rerun>` mark, removed again at import; it has no budget cap, so
+an unattended rerun stops after an hour; and it can neither load skills for one run nor run
+an older release, so it uses the installed ones.
+
+Parsing sits behind a small `Source` interface (`rerunly/sources/base.py`), so other agents and
+harnesses can plug in next.
 
 ## 🛠️ Development
 

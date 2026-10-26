@@ -19,6 +19,7 @@ def migrate_legacy_data() -> bool:
 # Settings stored in the database, editable from the Setup page.
 DEFAULT_SETTINGS = {
     "claude_projects_dir": str(Path.home() / ".claude/projects"),
+    "antigravity_dir": str(Path.home() / ".gemini/antigravity-cli"),
     "prices": DEFAULT_PRICES,
     # Two prompts are "similar" when the Jaccard similarity of their word sets reaches this.
     "similarity_threshold": 0.6,

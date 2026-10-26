@@ -1082,13 +1082,16 @@ function rerunCommand(p) {
         `git -C ${shellQuote(k.git_repo)} checkout ${k.git_commit} -- ${shellQuote(k.git_path)}`);
       undo.push(`git -C ${shellQuote(k.git_repo)} checkout HEAD -- ${shellQuote(k.git_path)}`);
     } else if (k.origin === "bundled") {
-      lines.push(`# ${k.skill}: built into Claude Code ${k.bundled_version}, comes with the release below`);
+      lines.push(r.harness === "Antigravity" ? `# ${k.skill}: built into Antigravity`
+        : `# ${k.skill}: built into Claude Code ${k.bundled_version}, comes with the release below`);
     } else {
       lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
     }
   }
-  const agent = r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude";
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? ` --effort ${r.effort}` : ""} ${shellQuote(p.text)}`);
+  const isAg = r.harness === "Antigravity";
+  const agent = isAg ? "agy" : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
+  // agy's -i takes the prompt as its value
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? ` --effort ${r.effort}` : ""} ${isAg ? "-i " : ""}${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }
@@ -1096,19 +1099,24 @@ function rerunCommand(p) {
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
 /** Replay it with Claude Code from here, and the replays launched so far. */
-function replayHtml(p, models, defaultJudge = "") {
+function replayHtml(p, models, defaultJudge = "", agentModels = []) {
   const r = p.rerun;
-  if (r.harness && r.harness !== "Claude Code") return "";
+  if (r.harness && !["Claude Code", "Antigravity"].includes(r.harness)) return "";
+  const harnessName = r.harness || "Agent";
+  // Antigravity: its own models; no release to pin, skills to restore, or budget cap (it stops after an hour)
+  const isAg = r.harness === "Antigravity";
   const same = r.requested_model || Object.keys(p.models || {})[0] || "";
   const opt = (value, label, current) => `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
-  const others = [...new Set([...models, ...p.references.map((x) => x.model).filter(Boolean)])].filter((m) => m !== same).sort();
+  const runnable = isAg ? agentModels.filter((m) => m.kind === "agy").map((m) => m.id.slice("agy:".length))
+    : models.filter((m) => !m.startsWith("gemini-") && !m.startsWith("gpt-"));
+  const others = [...new Set([...runnable, ...p.references.map((x) => x.model).filter(Boolean)])].filter((m) => m !== same).sort();
   // releases to pin: the one this run used, and the reference runs' ones
   const releases = [];
   if (r.harness_version) releases.push([r.harness_version, "the release it ran with"]);
   for (const x of p.references) {
     if (x.harness_version && !releases.some(([v]) => v === x.harness_version)) releases.push([x.harness_version, `reference of ${x.tag}`]);
   }
-  const restorable = r.skills.filter((k) => k.origin !== "bundled");
+  const restorable = isAg ? [] : r.skills.filter((k) => k.origin !== "bundled");
   // a budget cap well above what the run cost, so it only stops runaways
   const budget = Math.max(0.5, Math.ceil((p.total_cost_usd || 0) * 3 * 2) / 2);
   const replays = p.replays.map((x) => {
@@ -1119,24 +1127,26 @@ function replayHtml(p, models, defaultJudge = "") {
         : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
   }).join("");
   return `<div class="replay">
-    <div class="replay-head"><strong>Rerun with Claude</strong>
+    <div class="replay-head"><strong>Rerun with ${esc(harnessName === "Claude Code" ? "Claude" : harnessName)}</strong>
       <span class="muted">In <code>${esc(r.cwd || "your home folder")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}.
-        <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
+        ${isAg ? "<strong>Unattended</strong>: it runs in the background with nobody to approve anything, is told to stop and report what it needed, and stops after an hour."
+          : "<strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed."}
         <strong>In a terminal</strong>: you watch it and approve its actions.
         ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
     <form id="replay-form" class="replay-form">
       ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
-        opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
+        opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `${harnessName} ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
       <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
-      <label title="Through npx for a release other than the installed one">Claude Code <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
+      <label title="Through npx for a release other than the installed one" ${isAg ? "hidden" : ""}>${esc(harnessName)} <select id="replay-release">${opt("", "Installed", "")}${isAg ? "" : releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
       <label>Run <select id="replay-mode">${opt("background", "Unattended, in the background", "background")}${opt("terminal", "In a terminal window", "")}</select></label>
       <label class="bg-only" title="Anything else it tries is denied, and reported">May <select id="replay-permission">${opt("ask", "only read", "ask")}${opt("edits", "read and edit files", "")}</select></label>
-      <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>
+      ${isAg ? '<input type="hidden" id="replay-budget" value="">'
+        : `<label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>`}
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
       <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
-        <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${opt("", `default (${defaultJudge || "Claude Code's"})`, "")}${[...new Set([same, ...models])].filter(Boolean).map((m) => opt(m, m, "")).join("")}</select></label>
+        <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${modelOptions(agentModels, "", `default (${defaultJudge || `${harnessName}'s`})`)}</select></label>
       <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
         <button class="btn primary">↻ Rerun now</button></span>
     </form>
@@ -1145,7 +1155,7 @@ function replayHtml(p, models, defaultJudge = "") {
   </div>`;
 }
 
-function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
+function rerunSectionHtml(p, knownModels = [], defaultJudge = "", agentModels = []) {
   const r = p.rerun;
   if (!r) return "";
   const models = Object.keys(p.models || {}).map((m) => m.replace("claude-", ""));
@@ -1158,11 +1168,11 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
         <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
         <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
   ];
-  const command = r.harness === "Claude Code" ? rerunCommand(p) : "";
+  const command = (r.harness === "Claude Code" || r.harness === "Antigravity") ? rerunCommand(p) : "";
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
-      ${replayHtml(p, knownModels, defaultJudge)}
+      ${replayHtml(p, knownModels, defaultJudge, agentModels)}
       ${command ? `<div class="rerun-cmd"><div class="rerun-cmd-head"><span>The same run, from a terminal</span>
           <button type="button" class="btn" id="copy-rerun">Copy</button></div><pre><code>${esc(command)}</code></pre></div>` : ""}
     </div>
@@ -1267,6 +1277,20 @@ function lineDiff(a, b) {
   return out;
 }
 
+/** A model menu from the agents' models (/api/agent/models): Claude Code's aliases for the latest models, its full
+    model ids, then Antigravity's models; `current` stays offered even when unknown. */
+function modelOptions(agentModels, current, defaultLabel) {
+  const opt = (m) => `<option value="${esc(m.id)}" ${m.id === current ? "selected" : ""}>${esc(m.label)}${m.used ? " · ran here" : ""}</option>`;
+  const known = agentModels.some((m) => m.id === current);
+  const aliases = agentModels.filter((m) => m.kind === "alias"), ids = agentModels.filter((m) => m.kind === "model"),
+    agy = agentModels.filter((m) => m.kind === "agy");
+  return `<option value="" ${!current ? "selected" : ""}>${esc(defaultLabel)}</option>
+    ${current && !known ? opt({ id: current, label: current }) : ""}
+    ${aliases.length ? `<optgroup label="Latest, as Claude Code names them">${aliases.map(opt).join("")}</optgroup>` : ""}
+    ${ids.length ? `<optgroup label="Claude Code models">${ids.map(opt).join("")}</optgroup>` : ""}
+    ${agy.length ? `<optgroup label="Antigravity models (agy)">${agy.map(opt).join("")}</optgroup>` : ""}`;
+}
+
 /** The LLM judge's call on a run against another: a badge telling whether to look at it. */
 function judgeBadge(r) {
   if (!r) return "";
@@ -1279,21 +1303,18 @@ function judgeBadge(r) {
 }
 
 /** The judge's rating in full, and a way to judge again with a model of your choice. */
-function judgeCardHtml(r, models, defaultModel) {
-  const opt = (v, label, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(label)}</option>`;
-  const current = r?.model || defaultModel || "";
-  const list = [...new Set([current, ...models].filter(Boolean))];
+function judgeCardHtml(r, agentModels, defaultModel) {
   const body = !r ? '<p class="muted">Not judged yet.</p>'
     : r.status === "rating" ? `<p class="muted">${esc(r.model || "The judge")} is comparing the two outputs…</p>`
     : r.status === "failed" ? `<p class="status-warn">The judge failed: ${esc(r.error || "no reason given")}</p>`
     : `<div class="judge-score"><span class="big">${r.score}</span><span class="unit">/ 100 same substance</span> ${judgeBadge(r)}</div>
        <p class="judge-summary">${esc(r.summary)}</p>
        ${r.differences.length ? `<ul class="judge-diffs">${r.differences.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
-       <p class="muted judge-meta">Judged by ${esc(r.model || "Claude Code's default model")} · ${esc(fmtDate(r.rated_at))}${r.cost_usd != null ? ` · ${fmtCost(r.cost_usd)}` : ""}</p>`;
+       <p class="muted judge-meta">Judged by ${esc(r.model ? r.model.replace(/^agy:(.*)$/, "$1 (Antigravity)") : "Claude Code's default model")} · ${esc(fmtDate(r.rated_at))}${r.cost_usd != null ? ` · ${fmtCost(r.cost_usd)}` : ""}</p>`;
   return `<div class="judge-card"><div class="judge-head"><strong>LLM judge</strong>
       <span class="muted">Says whether the second output keeps the first one's substance, so you know whether to read the differences.</span></div>
     ${body}
-    <form class="judge-form" id="judge-form"><label>Judge with <select id="judge-model">${opt("", `Default (${defaultModel || "Claude Code's"})`, "")}${list.map((m) => opt(m, m, "")).join("")}</select></label>
+    <form class="judge-form" id="judge-form"><label>Judge with <select id="judge-model">${modelOptions(agentModels, "", `Default (${defaultModel || "Claude Code's"})`)}</select></label>
       <button class="btn">${r && r.status !== "failed" ? "Judge again" : "Judge them"}</button></form></div>`;
 }
 
@@ -1353,12 +1374,12 @@ function pollJudge(rating, again) {
 }
 
 /** A rerun against its original: the judge, figures, files edited, and their final answers. */
-function compareOriginalHtml(p, models, defaultJudge) {
+function compareOriginalHtml(p, agentModels, defaultJudge) {
   const o = p.replay_of;
   const rerun = { ...p, answer: p.answer || o.result || "" };
   return `<h2 class="page-sec" id="compare-original">Compared with the original <a class="link-btn" href="#/compare?a=${encodeURIComponent(o.id)}&b=${encodeURIComponent(p.id)}">Open in Compare</a></h2>
     <div class="card compare-original">
-      ${judgeCardHtml(o.rating, models, defaultJudge)}
+      ${judgeCardHtml(o.rating, agentModels, defaultJudge)}
       ${compareRunsHtml(o, rerun)}
     </div>`;
 }
@@ -1382,8 +1403,12 @@ function rerunOfHtml(p) {
 let promptSplit = "";
 
 async function viewPrompt(id, compare = {}) {
-  let [p, allTags, settings] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags"), api("/api/settings")]);
-  const knownModels = allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  let [p, allTags, settings, { models: agentModels }] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags"),
+    api("/api/settings"), api("/api/agent/models")]);
+  const knownModels = allTags.filter((t) => t.tag.startsWith("model:")).map((t) => {
+    const m = t.tag.slice("model:".length);
+    return m.startsWith("gemini-") || m.startsWith("claude-") || m.startsWith("gpt-") ? m : `claude-${m}`;
+  });
   ruleSkills = skillsFromTags(allTags);
   // compare by tag only through one of this prompt's own human tags (a stale link falls back to similar)
   if (compare.scope && compare.scope !== "similar" && humanTags(p.tags).some((t) => t.tag === compare.tag)) {
@@ -1455,8 +1480,8 @@ async function viewPrompt(id, compare = {}) {
     ${unpriced}
     <div class="tags-hero prompt-facts">${facts.map(([label, value, sub, note]) => `<div class="hero-fact"><span class="label">${label}</span>
       <span class="value">${value}</span><span class="sub">${sub || "&nbsp;"}</span>${note ? `<span class="sub">${note}</span>` : ""}</div>`).join("")}</div>
-    ${p.replay_of?.first && p.replay_of.id ? compareOriginalHtml(p, knownModels, settings.judge_model) : ""}
-    ${rerunSectionHtml(p, knownModels, settings.judge_model)}
+    ${p.replay_of?.first && p.replay_of.id ? compareOriginalHtml(p, agentModels, settings.judge_model) : ""}
+    ${rerunSectionHtml(p, knownModels, settings.judge_model, agentModels)}
 
     <h2 class="page-sec">Cost per agent</h2>
     <div class="table-wrap"><table>
@@ -2400,7 +2425,8 @@ function excludedCardHtml(scope) {
 }
 
 async function viewSetup() {
-  const [st, settings, scope] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history")]);
+  const [st, settings, scope, { models: agentModels }] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history"),
+    api("/api/agent/models")]);
   const ok = (cond) => (cond ? "status-ok" : "status-warn");
   const retentionOk = st.cleanup_period_days != null && st.cleanup_period_days >= 365;
   // the checks below, in order: counted in the banner
@@ -2422,7 +2448,7 @@ async function viewSetup() {
         <div><button class="btn primary" id="ingest">Import now</button> <button class="btn" id="reingest" title="Re-parse every session (after a price or rule change)">Re-import all</button></div></div>
       <div class="setup-row"><div class="${ok(st.hook_installed)}"><strong>Live updates (agent hook)</strong><br>
         <span class="muted">Without the hook the dashboard re-scans every ${settings.auto_ingest_interval}s while it runs. The hook imports right after each answer of the agent.
-        It adds this command to <code>${esc(st.claude_settings_path)}</code> (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.hook_command)}</code></div>
+        It adds this command to <code>${esc(st.claude_settings_path)}</code>${st.antigravity_dir_exists ? ` and <code>${esc(st.antigravity_hooks_path)}</code>` : ""} (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.hook_command)}</code></div>
         <div><button class="btn" id="hook">${st.hook_installed ? "Remove hook" : "Install hook"}</button></div></div>
       <div class="setup-row"><div class="${ok(st.autostart.enabled)}"><strong>Start at login</strong><br>
         <span class="muted">Starts the dashboard in the background when you log in, with an icon in the status bar to open it, import, or quit.
@@ -2449,7 +2475,8 @@ async function viewSetup() {
 
     <h2>Settings</h2>
     <form id="settings" class="card">
-      <div class="setup-row"><div><strong>Transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir)}"></div>
+      <div class="setup-row"><div><strong>Claude transcripts directory</strong></div><input name="claude_projects_dir" size="50" value="${esc(settings.claude_projects_dir || "")}"></div>
+      <div class="setup-row"><div><strong>Antigravity directory</strong></div><input name="antigravity_dir" size="50" value="${esc(settings.antigravity_dir || "")}"></div>
       <div class="setup-row"><div><strong>Cost shown</strong><br><span class="muted">The agent's own cost when telemetry covers the whole prompt, or always the price table.</span></div>
         <select name="cost_source">
           <option value="claude-code" ${settings.cost_source === "claude-code" ? "selected" : ""}>The agent's own cost when available</option>
@@ -2457,8 +2484,8 @@ async function viewSetup() {
       <div class="setup-row"><div><strong>Similarity threshold</strong><br><span class="muted">0–1 word overlap above which two prompts are shown together.</span></div>
         <input name="similarity_threshold" type="number" min="0" max="1" step="0.05" value="${settings.similarity_threshold}"></div>
       <div class="setup-row"><div><strong>Default LLM judge</strong><br><span class="muted">The model rating how much a rerun's output differs from its original's.
-        Empty uses Claude Code's default model. Each rerun, and the Compare page, can pick another.</span></div>
-        <input name="judge_model" size="24" value="${esc(settings.judge_model || "")}" placeholder="claude-haiku-5-5"></div>
+        Any model Claude Code can run (its aliases for the latest models, or a full model id), or one of Antigravity's. Each rerun, and the Compare page, can pick another.</span></div>
+        <select name="judge_model">${modelOptions(agentModels, settings.judge_model || "", "Claude Code's default model")}</select></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
       <div class="setup-row"><div style="flex-basis:100%"><strong>Prices (USD per million tokens)</strong><br><span class="muted">Longest model-id prefix wins. Cache writes cost 1.25× (5 min) or 2× (1 h) input; fast mode 2×; web search $10/1k.</span>
@@ -2508,6 +2535,7 @@ async function viewSetup() {
     try {
       values = {
         claude_projects_dir: f.get("claude_projects_dir"),
+        antigravity_dir: f.get("antigravity_dir"),
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
         judge_model: String(f.get("judge_model") || "").trim(),
@@ -2793,8 +2821,7 @@ async function launchPicked(picked, estimate) {
 async function viewCompare(query) {
   const a = query.get("a"), b = query.get("b");
   if (!a || !b) { app.innerHTML = '<div class="card status-warn">Pick two runs to compare: open a rerun, then Compare.</div>'; return; }
-  const [data, tags, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/tags"), api("/api/settings")]);
-  const models = tags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const [data, { models: agentModels }, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/agent/models"), api("/api/settings")]);
   const kindLabel = { original: "Original", rerun: "Rerun", reference: "Reference run" };
   const label = (pid) => kindLabel[data.candidates.find((x) => x.id === pid)?.kind] || "Run";
   const picker = (id, current) => `<select id="${id}">${data.candidates.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>
@@ -2816,7 +2843,7 @@ async function viewCompare(query) {
         <span class="muted">The original, each rerun of it, and its tags' reference runs.</span>
       </div>
       <div class="card compare-original">
-        ${judgeCardHtml(data.rating, models, settings.judge_model)}
+        ${judgeCardHtml(data.rating, agentModels, settings.judge_model)}
         ${compareRunsHtml(data.a, data.b, labels)}
       </div>
       <p class="muted group-note"><a href="#/prompt/${encodeURIComponent(a)}">Open the first run</a> · <a href="#/prompt/${encodeURIComponent(b)}">Open the second run</a></p>

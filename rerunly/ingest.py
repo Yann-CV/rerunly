@@ -7,6 +7,7 @@ from datetime import datetime
 
 from .db import get_settings
 from .pricing import Usage, cost_usd
+from .sources.antigravity import AntigravitySource
 from .sources.base import AgentRecord, ApiCall, PromptRecord, SessionRecord
 from .sources.claude_code import ClaudeCodeSource
 from .tagging import ai_tags, rule_scope, rule_tags
@@ -112,13 +113,41 @@ def store_session(conn: sqlite3.Connection, session: SessionRecord, settings: di
         if conn.execute("SELECT 1 FROM prompts WHERE id=?", (prompt.id,)).fetchone():
             continue
         _insert_prompt(conn, prompt, session.source, settings)
-    _link_replay(conn, session.id)
+    if session.source == "antigravity":
+        _adopt_terminal_rerun(conn, session)
+    link_replay(conn, session.id)
 
 
 RERUN_TAG = "rerun"
 
 
-def _link_replay(conn: sqlite3.Connection, session_id: str) -> None:
+def _utc(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _adopt_terminal_rerun(conn: sqlite3.Connection, session: SessionRecord) -> None:
+    """Antigravity picks its own conversation ids: a rerun launched in a terminal is recognized by its first
+    prompt, the one it reran, in the same folder, started within the hour after the launch."""
+    if not session.prompts or conn.execute("SELECT 1 FROM replays WHERE session_id = ?", (session.id,)).fetchone():
+        return
+    first = min(session.prompts, key=lambda p: p.started_at)
+    started = _utc(first.started_at)
+    for x in conn.execute(
+        "SELECT x.session_id, x.launched_at FROM replays x JOIN prompts p ON p.id = x.prompt_id "
+        "WHERE x.status = 'interactive' AND p.harness = 'Antigravity' AND p.text = ? AND COALESCE(p.cwd, '') = ? "
+        "AND x.session_id NOT IN (SELECT id FROM sessions) ORDER BY x.launched_at DESC",
+        (first.text, first.cwd or ""),
+    ).fetchall():
+        launched = _utc(x["launched_at"])
+        if started and launched and 0 <= (started - launched).total_seconds() <= 3600:
+            conn.execute("UPDATE replays SET session_id = ? WHERE session_id = ?", (session.id, x["session_id"]))
+            return
+
+
+def link_replay(conn: sqlite3.Connection, session_id: str) -> None:
     """A session launched as a rerun is studied on its own: every prompt of it gets the `rerun` tag (an AI
     tag, so it can be filtered on or left out of the history), and none of the original's tags."""
     if conn.execute("SELECT 1 FROM replays WHERE session_id = ?", (session_id,)).fetchone():
@@ -168,7 +197,14 @@ def session_texts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def sources_from_settings(settings: dict) -> list:
-    return [ClaudeCodeSource(settings["claude_projects_dir"])]
+    srcs = []
+    claude_dir = settings.get("claude_projects_dir")
+    if claude_dir:
+        srcs.append(ClaudeCodeSource(claude_dir))
+    ag_dir = settings.get("antigravity_dir")
+    if ag_dir:
+        srcs.append(AntigravitySource(ag_dir))
+    return srcs
 
 
 def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:

@@ -35,6 +35,13 @@ USAGE = {"input_tokens": 10, "output_tokens": 100, "cache_read_input_tokens": 10
          "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2000}}
 
 
+@pytest.fixture(autouse=True)
+def isolate_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CLAUDE_SETTINGS", tmp_path / "claude-settings.json")
+    monkeypatch.setattr(server, "ANTIGRAVITY_HOOKS", tmp_path / "hooks.json")
+    monkeypatch.setattr(db, "DEFAULT_SETTINGS", {**db.DEFAULT_SETTINGS, "antigravity_dir": str(tmp_path / "antigravity")})
+
+
 @pytest.fixture
 def projects(tmp_path: Path) -> Path:
     proj = tmp_path / "projects" / "-work-repo"
@@ -780,3 +787,35 @@ def test_llm_judge(client, monkeypatch):
     # the compare view: both runs with their answers, and the runs to pick from
     data = client.get("/api/compare", params={"a": "prompt-1", "b": "prompt-4"}).json()
     assert data["a"]["answer"] == "done" and data["candidates"][0] == {**data["candidates"][0], "id": "prompt-1", "kind": "original"}
+
+
+def test_agent_models(client, monkeypatch):
+    from rerunly import replay
+
+    monkeypatch.setattr(replay, "model_aliases", lambda: ("fable", "opus", "sonnet"))
+    data = client.get("/api/agent/models").json()
+    ids = [m["id"] for m in data["models"]]
+    assert ids[:3] == ["fable", "opus", "sonnet"] and data["judge_default"] == "claude-haiku-5-5"
+    # full ids by family, newest first; the ones that ran here marked
+    assert ids.index("claude-fable-5-1") < ids.index("claude-fable-5") < ids.index("claude-opus-5-5") < ids.index("claude-opus-4")
+    used = {m["id"] for m in data["models"] if m["used"]}
+    assert used == {"claude-opus-5-5", "claude-haiku-5-5"}
+
+
+def test_judge_cut_off_restarts(client, monkeypatch, tmp_path):
+    from rerunly import judge
+
+    monkeypatch.setattr(judge, "rate", lambda *a, **k: {"score": 90, "verdict": "equivalent", "quality": "same", "look": False,
+                                                      "summary": "Same.", "differences": [], "cost_usd": 0.0})
+    # a judgement left "rating" by a dashboard stopped mid-way
+    conn = db.connect(tmp_path / "d.db")
+    with conn:
+        conn.execute("INSERT INTO run_ratings(base_id, other_id, status, model, rated_at) VALUES ('prompt-1','prompt-4','rating','fable','x')")
+    assert client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4", "model": "opus"}).status_code == 200
+    import time
+    for _ in range(50):
+        r = client.get("/api/compare", params={"a": "prompt-1", "b": "prompt-4"}).json()["rating"]
+        if r["status"] == "done":
+            break
+        time.sleep(0.05)
+    assert (r["status"], r["model"], r["score"]) == ("done", "opus", 90)

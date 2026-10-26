@@ -14,11 +14,13 @@ from fastapi.staticfiles import StaticFiles
 
 from . import background as bg, db, judge, otel, replay, runner
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
-from .ingest import apply_rules, ingest, session_texts
+from .ingest import apply_rules, ingest, link_replay, session_texts
 from .tagging import rule_matches, rule_scope, similarity, split_any
 
 STATIC = Path(__file__).parent / "static"
 CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
+ANTIGRAVITY_CONFIG_DIR = Path.home() / ".gemini/config"
+ANTIGRAVITY_HOOKS = ANTIGRAVITY_CONFIG_DIR / "hooks.json"
 HOOK_MARKER = "rerunly"
 LEGACY_HOOK_MARKERS = ("agent-dashboard",)  # hooks installed before the rename to Rerunly
 COMPARE_SCOPES = ("similar", "tag", "similar_tag")
@@ -87,6 +89,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     # ---- ratings: Claude says how much a run's output differs from another's ------------------
 
     rating_lock = threading.Lock()
+    # judgements this process runs: a "rating" row missing here was cut off (the dashboard stopped) and can restart
+    judging: set[tuple[str, str]] = set()
 
     def rating_of(c, base_id: str, other_id: str) -> dict | None:
         r = c.execute("SELECT * FROM run_ratings WHERE base_id = ? AND other_id = ?", (base_id, other_id)).fetchone()
@@ -106,8 +110,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             return None
         with rating_lock:
             current = rating_of(c, base_id, other_id)
-            if current and (current["status"] == "rating" or (current["status"] == "done" and not force)):
+            if current and ((base_id, other_id) in judging or (current["status"] == "done" and not force)):
                 return current
+            judging.add((base_id, other_id))
             model = model or db.get_settings(c)["judge_model"]
             with c:
                 c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at) VALUES (?,?,?,?,?)",
@@ -126,6 +131,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             with w:
                 w.execute("UPDATE run_ratings SET status=?, score=?, verdict=?, quality=?, look=?, summary=?, differences=?, cost_usd=?, "
                           "error=?, rated_at=? WHERE base_id=? AND other_id=?", (*values, runner.now(), base_id, other_id))
+            judging.discard((base_id, other_id))
 
         threading.Thread(target=work, daemon=True).start()
         return rating_of(c, base_id, other_id)
@@ -135,7 +141,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         for x in c.execute(
             "SELECT x.prompt_id base, x.judge_model, (SELECT id FROM prompts WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) other "
             "FROM replays x WHERE COALESCE(x.auto_rate, 1) = 1").fetchall():
-            if x["other"] and not rating_of(c, x["base"], x["other"]):
+            current = rating_of(c, x["base"], x["other"]) if x["other"] else None
+            if x["other"] and (not current or (current["status"] == "rating" and (x["base"], x["other"]) not in judging)):
                 start_rating(x["base"], x["other"], model=x["judge_model"] or "")
 
     def loop():
@@ -208,21 +215,63 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         CLAUDE_SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
 
+    def read_antigravity_hooks() -> dict:
+        if ANTIGRAVITY_HOOKS.exists():
+            return json.loads(ANTIGRAVITY_HOOKS.read_text() or "{}")
+        return {}
+
+    def write_antigravity_hooks(data: dict) -> None:
+        if ANTIGRAVITY_HOOKS.exists():
+            shutil.copy(ANTIGRAVITY_HOOKS, ANTIGRAVITY_HOOKS.with_suffix(".json.bak"))
+        ANTIGRAVITY_HOOKS.parent.mkdir(parents=True, exist_ok=True)
+        ANTIGRAVITY_HOOKS.write_text(json.dumps(data, indent=2) + "\n")
+
     def is_ours(hook) -> bool:
         return any(m in json.dumps(hook) for m in (HOOK_MARKER, *LEGACY_HOOK_MARKERS))
 
     def hook_installed(cs: dict) -> bool:
         return any(is_ours(h) for h in cs.get("hooks", {}).get("Stop", []))
 
+    def antigravity_hook_installed(gh: dict) -> bool:
+        return HOOK_MARKER in gh or any(is_ours(h) for h in gh.values())
+
+    def antigravity_hook_command() -> str:
+        # an Antigravity Stop hook answers with JSON on stdout: "{}" lets the agent stop
+        return f"curl -s -m 2 -X POST http://127.0.0.1:{port}/api/ingest >/dev/null 2>&1; echo '{{}}' # {HOOK_MARKER}"
+
+    def antigravity_installed(settings: dict) -> bool:
+        return Path(settings.get("antigravity_dir") or "").expanduser().is_dir() if settings.get("antigravity_dir") else False
+
     @app.get("/api/setup/status")
     def setup_status():
         c = conn()
         settings = db.get_settings(c)
         projects = Path(settings["claude_projects_dir"]).expanduser()
+        ag_dir = Path(settings.get("antigravity_dir") or Path.home() / ".gemini/antigravity-cli").expanduser()
         try:
             cs = read_claude_settings()
         except json.JSONDecodeError:
             cs = {}
+        try:
+            gh = read_antigravity_hooks()
+        except json.JSONDecodeError:
+            gh = {}
+        c_hook = hook_installed(cs)
+        a_hook = antigravity_hook_installed(gh)
+
+        ag_exists = ag_dir.is_dir()
+        ag_transcripts = len(list((ag_dir / "brain").glob("*/.system_generated/logs/transcript.jsonl"))) if (ag_dir / "brain").is_dir() else 0
+        claude_transcripts = len(list(projects.glob("*/*.jsonl"))) if projects.is_dir() else 0
+
+        has_claude = projects.is_dir()
+        has_ag = ag_exists
+        if has_claude and has_ag:
+            agent = "Claude Code & Antigravity"
+        elif has_ag:
+            agent = "Antigravity"
+        else:
+            agent = "Claude Code"
+
         counts = c.execute(
             "SELECT (SELECT COUNT(*) FROM sessions) s, (SELECT COUNT(*) FROM prompts) p, "
             "(SELECT COUNT(*) FROM agents) a, (SELECT MAX(started_at) FROM prompts) last"
@@ -246,13 +295,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "cost_source": settings["cost_source"],
             },
             "projects_dir": str(projects),
-            "projects_dir_exists": projects.is_dir(),
-            "transcript_count": len(list(projects.glob("*/*.jsonl"))) if projects.is_dir() else 0,
+            "projects_dir_exists": projects.is_dir() or ag_exists,
+            "transcript_count": claude_transcripts + ag_transcripts,
             # the connected agent: the page names it here only, the rest of the UI stays agent-neutral
-            "agent": "Claude Code",
+            "agent": agent,
             "claude_settings_path": str(CLAUDE_SETTINGS),
+            "antigravity_hooks_path": str(ANTIGRAVITY_HOOKS),
+            "antigravity_dir": str(ag_dir),
+            "antigravity_dir_exists": ag_exists,
+            "antigravity_transcript_count": ag_transcripts,
+            "antigravity_hook_installed": a_hook,
             "cleanup_period_days": cs.get("cleanupPeriodDays"),
-            "hook_installed": hook_installed(cs),
+            # installed for each agent there is
+            "hook_installed": c_hook and (a_hook or not ag_exists),
             "autostart": {"enabled": bg.autostart_enabled(), "file": str(bg.autostart_file())},
             "hook_command": hook_command(),
             "db_path": str(db_path),
@@ -265,6 +320,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.post("/api/setup/hook")
     def install_hook(install: bool = True):
+        # Claude Code hook
         cs = read_claude_settings()
         stop_hooks = [
             h for h in cs.setdefault("hooks", {}).get("Stop", []) if not is_ours(h)  # replaces a pre-rename hook too
@@ -278,6 +334,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             if not cs["hooks"]:
                 cs.pop("hooks")
         write_claude_settings(cs)
+
+        # Antigravity's hooks.json: one named hook per tool, ours named after the marker
+        gh = {k: h for k, h in read_antigravity_hooks().items() if k != HOOK_MARKER and not is_ours(h)}
+        if install and antigravity_installed(db.get_settings(conn())):
+            gh[HOOK_MARKER] = {"Stop": [{"type": "command", "command": antigravity_hook_command(), "timeout": 10}]}
+        if antigravity_installed(db.get_settings(conn())) or ANTIGRAVITY_HOOKS.exists():
+            write_antigravity_hooks(gh)
+
         return setup_status()
 
     @app.post("/api/setup/telemetry")
@@ -958,45 +1022,65 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "rate": body.get("rate", True) is not False, "judge_model": judge_model}
 
     def replayable(c, prompt_id: str):
-        r = c.execute("SELECT text, cwd, harness, harness_version FROM pv WHERE id = ?", (prompt_id,)).fetchone()
+        r = c.execute("SELECT text, cwd, harness, harness_version, requested_model, effort FROM pv WHERE id = ?", (prompt_id,)).fetchone()
         if r is None:
             raise HTTPException(404, f"no prompt {prompt_id}")
-        if r["harness"] and r["harness"] != "Claude Code":
-            raise HTTPException(400, "only Claude Code prompts can be replayed")
+        if r["harness"] and r["harness"] not in ("Claude Code", "Antigravity"):
+            raise HTTPException(400, "only Claude Code and Antigravity prompts can be replayed")
         return r
 
     reruns_dir = db_path.parent / "reruns"
+    adopted: dict[str, str] = {}  # the id an Antigravity rerun started with -> its conversation's
 
     def finish_rerun(session_id: str) -> None:
         """Record how a background rerun ended, from its log, and drop its restored skills."""
         c = conn()
+        session_id = adopted.get(session_id, session_id)
         x = c.execute("SELECT log_path, status FROM replays WHERE session_id = ?", (session_id,)).fetchone()
         if x is None or x["status"] != "running":
             return
         log = Path(x["log_path"])
         out = runner.outcome(log)
-        if out is None:  # no result: it crashed, or Claude Code could not start
+        if out is None:  # no result: it crashed, or the agent could not start
             try:
                 tail = log.read_text()[-600:].strip()
             except OSError:
                 tail = ""
             out = {"status": "failed", "result": tail or "It stopped without a result.", "denials": [], "cost_usd": None, "blocked": ""}
+        session_id = adopt_conversation(c, session_id, out.get("conversation_id") or runner.conversation_id(log))
         with c:
             c.execute("UPDATE replays SET status = ?, result = ?, denials = ?, cost_usd = ?, ended_at = ? WHERE session_id = ?",
                       (out["status"], out["result"], json.dumps({"denied": out["denials"], "blocked": out["blocked"]}),
                        out["cost_usd"], runner.now(), session_id))
         runner.remove_plugin(reruns_dir / session_id / "plugin")
 
+    def adopt_conversation(c, session_id: str, conversation_id: str | None) -> str:
+        """An Antigravity rerun takes the id of the conversation it runs in (its transcript's), and its prompts,
+        if already imported, the rerun tag."""
+        if not conversation_id or conversation_id == session_id:
+            return session_id
+        with c:
+            c.execute("UPDATE replays SET session_id = ? WHERE session_id = ?", (conversation_id, session_id))
+            link_replay(c, conversation_id)
+        adopted[session_id] = conversation_id
+        return conversation_id
+
     def refresh_reruns(c) -> None:
-        """Background reruns whose process ended while the dashboard was not watching it."""
-        for x in c.execute("SELECT session_id, pid FROM replays WHERE status = 'running'").fetchall():
+        """Background reruns whose process ended while the dashboard was not watching it; Antigravity's running
+        ones linked to their conversation."""
+        for x in c.execute("SELECT session_id, pid, log_path FROM replays WHERE status = 'running'").fetchall():
             if not runner.alive(x["pid"]):
                 finish_rerun(x["session_id"])
+            elif x["log_path"]:
+                adopt_conversation(c, x["session_id"], runner.conversation_id(Path(x["log_path"])))
 
     def start_replay(c, prompt_id: str, opts: dict) -> dict:
-        """Rerun a prompt with Claude Code: the same folder and prompt, the skills as they ran, the model,
-        effort and release asked for; in the background (unattended) or in a terminal window."""
+        """Rerun a prompt with Claude Code or Antigravity: the same folder and prompt, the skills as they ran,
+        the model, effort and release asked for; in the background (unattended) or in a terminal window."""
         r = replayable(c, prompt_id)
+        # "same" model and effort: the run's own, not whatever the agent defaults to now
+        opts = {**opts, "model": opts["model"] or (r["requested_model"] if replay.MODEL_RE.match(r["requested_model"] or "") else ""),
+                "effort": opts["effort"] or (r["effort"] if r["effort"] in replay.EFFORTS else "")}
         version = (r["harness_version"] or "") if opts["release"] == "same" else opts["release"]
         version = version if replay.VERSION_RE.match(version) else ""
         session_id = str(uuid.uuid4())
@@ -1004,13 +1088,44 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         # the skills as they ran, in a plugin for this session only: the user's copies stay untouched
         versions = [dict(v) for v in c.execute(
             "SELECT k.skill, v.* FROM prompt_skill_runs k JOIN skill_versions v ON v.hash = k.hash WHERE k.prompt_id = ? "
-            "AND v.origin != 'bundled' ORDER BY k.skill", (prompt_id,))] if opts["restore_skills"] else []
+            "AND v.origin != 'bundled' ORDER BY k.skill", (prompt_id,))] if opts["restore_skills"] and r["harness"] != "Antigravity" else []
         plugin = reruns_dir / session_id / "plugin" if versions else None
         skills = runner.build_skills_plugin(plugin, versions) if plugin else []
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
                "harness_version": version, "launched_at": runner.now(), "mode": opts["mode"], "skills": json.dumps(skills),
                "permission": opts["permission"], "budget_usd": opts["budget"], "auto_rate": int(opts.get("rate", True)),
                "judge_model": opts.get("judge_model", "")}
+
+        if r["harness"] == "Antigravity":
+            # Antigravity picks its own conversation id: the rerun is linked once its stream (or, in a terminal,
+            # its transcript) names it; it runs the installed release, with no budget cap
+            row.update(harness_version="", budget_usd=None)
+            if opts["mode"] == "terminal":
+                argv = replay.antigravity_argv(r["text"], opts["model"], opts["effort"])
+                launched = replay.launch(cwd, argv)
+                row.update(status="interactive")
+                with c:
+                    c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+                return {"prompt_id": prompt_id, "session_id": session_id, "mode": "terminal", "terminal": launched, "cwd": cwd,
+                        "skills": [], "command": f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"}
+            else:
+                argv = runner.antigravity_background_argv(r["text"], opts["model"], opts["effort"], opts["permission"])
+                log = reruns_dir / session_id / "stream.jsonl"
+                row.update(status="running", log_path=str(log))
+                with c:
+                    c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
+                try:
+                    pid = runner.start(cwd, argv, log, lambda: finish_rerun(session_id))
+                except OSError as e:
+                    with c:
+                        c.execute("UPDATE replays SET status = 'failed', result = ?, ended_at = ? WHERE session_id = ?",
+                                  (f"Antigravity could not start: {e}", runner.now(), session_id))
+                    raise HTTPException(500, f"Antigravity could not start: {e}") from None
+                with c:
+                    c.execute("UPDATE replays SET pid = ? WHERE session_id = ?", (pid, session_id))
+                return {"prompt_id": prompt_id, "session_id": session_id, "mode": "background", "terminal": None, "cwd": cwd,
+                        "skills": [], "command": f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"}
+
         if opts["mode"] == "terminal":
             note = "\n".join(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with."
                               for k in skills)
@@ -1128,6 +1243,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             with c:
                 c.execute("DELETE FROM replay_queue WHERE id = ?", (q["id"],))
         return {"results": results}
+
+    @app.get("/api/agent/models")
+    def agent_models():
+        """The models the agents can run here (for the judge and reruns): Claude Code's aliases, the price table's
+        Claude models and the ones that ran, and Antigravity's models."""
+        c = conn()
+        used = set()
+        # anywhere: the main agent's models, and the subagents'
+        for (models,) in c.execute("SELECT DISTINCT models FROM prompts UNION SELECT DISTINCT models FROM agents"):
+            used |= set(json.loads(models or "{}"))
+        return {"models": replay.agent_models(list(db.get_settings(c)["prices"]), sorted(used)),
+                "judge_default": db.get_settings(c)["judge_model"]}
 
     @app.post("/api/ratings")
     async def rate_pair(request: Request):
