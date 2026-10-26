@@ -36,4 +36,6 @@ DEFAULT_SETTINGS = {
     "excluded_projects": [],
     "excluded_sessions": [],
     "excluded_tags": [],
+    # the model rating how much a rerun's output differs from its original ("" = Claude Code's default)
+    "judge_model": "claude-haiku-5-5",
 }

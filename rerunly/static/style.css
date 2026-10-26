@@ -922,3 +922,22 @@ a.hero-fact:hover { text-decoration: none; background: color-mix(in srgb, var(--
 .diff-add { background: color-mix(in srgb, var(--good) 14%, transparent); }
 .diff-same { color: var(--text-secondary); }
 .replay-form [hidden] { display: none; }
+
+/* ---- LLM judge and the Compare page ------------------------------------------------------------ */
+
+.judge-card { display: grid; gap: 6px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 10px; background: color-mix(in srgb, var(--accent) 5%, var(--surface-1)); }
+.judge-head { display: grid; gap: 2px; font-size: 13px; }
+.judge-score { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.judge-score .big { font-size: 28px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.judge-score .unit { font-size: 12.5px; color: var(--text-muted); }
+.judge-summary { margin: 0; font-size: 14px; }
+.judge-diffs { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-secondary); }
+.judge-meta { margin: 0; font-size: 12px; }
+.judge-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.judge-form label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+.compare-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 14px; font-size: 13px; }
+.compare-pick label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+.compare-pick select { max-width: min(360px, 80vw); }
+#compare-original .link-btn { font-size: 13px; font-weight: 400; margin-left: 8px; }
+.rr-result .rerun-status + .rerun-status { margin-top: 2px; }

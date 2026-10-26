@@ -1096,7 +1096,7 @@ function rerunCommand(p) {
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
 /** Replay it with Claude Code from here, and the replays launched so far. */
-function replayHtml(p, models) {
+function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
   if (r.harness && r.harness !== "Claude Code") return "";
   const same = r.requested_model || Object.keys(p.models || {})[0] || "";
@@ -1114,7 +1114,7 @@ function replayHtml(p, models) {
   const replays = p.replays.map((x) => {
     const done = x.prompt;
     return `<li><span class="muted">${esc(fmtDate(x.launched_at))}</span> ${rerunStatusHtml(x, { details: false })}
-      ${done ? `<a href="#/prompt/${encodeURIComponent(done.id)}">${fmtCost(done.total_cost_usd)} · ${fmtMs(duration(done))} · compare</a> ${refDelta(done.total_cost_usd, p.total_cost_usd, { against: "original" })}`
+      ${done ? `${judgeBadge(x.rating)} <a href="#/compare?a=${encodeURIComponent(p.id)}&b=${encodeURIComponent(done.id)}">${fmtCost(done.total_cost_usd)} · ${fmtMs(duration(done))} · compare</a> ${refDelta(done.total_cost_usd, p.total_cost_usd, { against: "original" })}`
         : x.status === "running" ? '<span class="muted">running in the background</span>'
         : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
   }).join("");
@@ -1135,6 +1135,8 @@ function replayHtml(p, models) {
       <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${budget}" size="5"></label>
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
+      <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
+        <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${opt("", `default (${defaultJudge || "Claude Code's"})`, "")}${[...new Set([same, ...models])].filter(Boolean).map((m) => opt(m, m, "")).join("")}</select></label>
       <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
         <button class="btn primary">↻ Rerun now</button></span>
     </form>
@@ -1143,7 +1145,7 @@ function replayHtml(p, models) {
   </div>`;
 }
 
-function rerunSectionHtml(p, knownModels = []) {
+function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
   const r = p.rerun;
   if (!r) return "";
   const models = Object.keys(p.models || {}).map((m) => m.replace("claude-", ""));
@@ -1160,7 +1162,7 @@ function rerunSectionHtml(p, knownModels = []) {
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
-      ${replayHtml(p, knownModels)}
+      ${replayHtml(p, knownModels, defaultJudge)}
       ${command ? `<div class="rerun-cmd"><div class="rerun-cmd-head"><span>The same run, from a terminal</span>
           <button type="button" class="btn" id="copy-rerun">Copy</button></div><pre><code>${esc(command)}</code></pre></div>` : ""}
     </div>
@@ -1176,6 +1178,7 @@ function bindRerun(p) {
     version: document.getElementById("replay-release").value, mode: document.getElementById("replay-mode").value,
     permission: document.getElementById("replay-permission").value, budget_usd: document.getElementById("replay-budget").value,
     restore_skills: document.getElementById("replay-skills")?.checked ?? true,
+    rate: document.getElementById("replay-rate").checked, judge_model: document.getElementById("replay-judge").value,
   });
   // permission and budget only apply to unattended reruns
   const mode = document.getElementById("replay-mode");
@@ -1264,37 +1267,99 @@ function lineDiff(a, b) {
   return out;
 }
 
-/** A rerun against its original: figures, files edited, and their final answers. */
-function compareOriginalHtml(p) {
-  const o = p.replay_of;
-  const rerunAnswer = p.answer || o.result || "";
+/** The LLM judge's call on a run against another: a badge telling whether to look at it. */
+function judgeBadge(r) {
+  if (!r) return "";
+  if (r.status === "rating") return '<span class="rerun-status status-running" title="The LLM judge is comparing the two outputs">⏳ Judging…</span>';
+  if (r.status === "failed") return `<span class="rerun-status status-failed" title="${esc(r.error || "")}">✕ Judge failed</span>`;
+  const [icon, label, cls] = r.look || r.verdict === "major" ? ["⚠", "Look at it", "status-failed"]
+    : r.verdict === "minor" ? ["◐", "Minor differences", "status-needs"] : ["✓", "Good enough", "status-done"];
+  const quality = { better: " · better", worse: " · worse" }[r.quality] || "";
+  return `<span class="rerun-status ${cls}" title="${esc(r.summary || "")}">${icon} ${label} · ${r.score}${quality}</span>`;
+}
+
+/** The judge's rating in full, and a way to judge again with a model of your choice. */
+function judgeCardHtml(r, models, defaultModel) {
+  const opt = (v, label, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(label)}</option>`;
+  const current = r?.model || defaultModel || "";
+  const list = [...new Set([current, ...models].filter(Boolean))];
+  const body = !r ? '<p class="muted">Not judged yet.</p>'
+    : r.status === "rating" ? `<p class="muted">${esc(r.model || "The judge")} is comparing the two outputs…</p>`
+    : r.status === "failed" ? `<p class="status-warn">The judge failed: ${esc(r.error || "no reason given")}</p>`
+    : `<div class="judge-score"><span class="big">${r.score}</span><span class="unit">/ 100 same substance</span> ${judgeBadge(r)}</div>
+       <p class="judge-summary">${esc(r.summary)}</p>
+       ${r.differences.length ? `<ul class="judge-diffs">${r.differences.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+       <p class="muted judge-meta">Judged by ${esc(r.model || "Claude Code's default model")} · ${esc(fmtDate(r.rated_at))}${r.cost_usd != null ? ` · ${fmtCost(r.cost_usd)}` : ""}</p>`;
+  return `<div class="judge-card"><div class="judge-head"><strong>LLM judge</strong>
+      <span class="muted">Says whether the second output keeps the first one's substance, so you know whether to read the differences.</span></div>
+    ${body}
+    <form class="judge-form" id="judge-form"><label>Judge with <select id="judge-model">${opt("", `Default (${defaultModel || "Claude Code's"})`, "")}${list.map((m) => opt(m, m, "")).join("")}</select></label>
+      <button class="btn">${r && r.status !== "failed" ? "Judge again" : "Judge them"}</button></form></div>`;
+}
+
+/** Two runs side by side (`a` first): figures, files edited, and their final answers. */
+function compareRunsHtml(a, b, labels = ["Original", "Rerun"]) {
   const rows = [
-    ["Cost", o.total_cost_usd, p.total_cost_usd, fmtCost], ["Tokens", o.total_tokens, p.total_tokens, fmtTokens],
-    ["Active time", o.active_ms ?? o.wall_ms, duration(p), fmtMs], ["API calls", o.api_calls, p.api_calls, String],
-    ["Tool calls", o.tool_calls, p.tool_calls, String],
+    ["Cost", a.total_cost_usd, b.total_cost_usd, fmtCost], ["Tokens", a.total_tokens, b.total_tokens, fmtTokens],
+    ["Active time", a.active_ms ?? a.wall_ms, b.active_ms ?? b.wall_ms, fmtMs], ["API calls", a.api_calls, b.api_calls, String],
+    ["Tool calls", a.tool_calls, b.tool_calls, String],
   ];
-  const before = new Set(o.files || []), after = new Set(p.files || []);
+  const before = new Set(a.files || []), after = new Set(b.files || []);
   const files = [...new Set([...before, ...after])].sort().map((f) => {
-    const where = before.has(f) && after.has(f) ? ["both", "both"] : before.has(f) ? ["before", "only the original"] : ["after", "only the rerun"];
+    const where = before.has(f) && after.has(f) ? ["both", "both"] : before.has(f) ? ["before", `only the ${labels[0].toLowerCase()}`] : ["after", `only the ${labels[1].toLowerCase()}`];
     return `<li class="file-${where[0]}"><code>${esc(f)}</code> <span class="muted">${where[1]}</span></li>`;
   }).join("");
-  const sameAnswer = (o.answer || "").trim() === rerunAnswer.trim();
-  return `<h2 class="page-sec" id="compare-original">Compared with the original</h2>
-    <div class="card compare-original">
-      <table class="compare-figures"><thead><tr><th></th><th class="num">Original</th><th class="num">Rerun</th><th class="num">Change</th></tr></thead>
-        <tbody>${rows.map(([label, a, b, fmt]) => `<tr><td>${label}</td><td class="num">${a == null ? "–" : fmt(a)}</td><td class="num">${b == null ? "–" : fmt(b)}</td>
-          <td class="num">${a && b != null ? refDelta(b, a, { against: "" }) : ""}</td></tr>`).join("")}</tbody></table>
-      <div class="compare-files"><strong>Files edited</strong>${files ? `<ul>${files}</ul>` : '<p class="muted">Neither run edited a file.</p>'}</div>
-      <div class="compare-answers">
-        <div class="compare-answers-head"><strong>Final answers</strong>
-          ${sameAnswer ? '<span class="trend down">identical</span>' : '<button type="button" class="link-btn" id="toggle-diff">Show differences</button>'}</div>
-        <div class="answers" id="answers-side">
-          <div><span class="muted">Original</span><pre>${esc(o.answer || "(no answer recorded: re-import its transcript)")}</pre></div>
-          <div><span class="muted">Rerun</span><pre>${esc(rerunAnswer || "(no answer yet)")}</pre></div>
-        </div>
-        <pre class="answer-diff" id="answers-diff" hidden>${lineDiff(o.answer || "", rerunAnswer).map(([op, line]) =>
-          `<span class="diff-${op === "=" ? "same" : op === "-" ? "del" : "add"}">${op === "=" ? " " : op} ${esc(line) || " "}</span>`).join("")}</pre>
+  const same = (a.answer || "").trim() === (b.answer || "").trim();
+  return `<table class="compare-figures"><thead><tr><th></th><th class="num">${esc(labels[0])}</th><th class="num">${esc(labels[1])}</th><th class="num">Change</th></tr></thead>
+      <tbody>${rows.map(([label, x, y, fmt]) => `<tr><td>${label}</td><td class="num">${x == null ? "–" : fmt(x)}</td><td class="num">${y == null ? "–" : fmt(y)}</td>
+        <td class="num">${x && y != null ? refDelta(y, x, { against: "" }) : ""}</td></tr>`).join("")}</tbody></table>
+    <div class="compare-files"><strong>Files edited</strong>${files ? `<ul>${files}</ul>` : '<p class="muted">Neither run edited a file.</p>'}</div>
+    <div class="compare-answers">
+      <div class="compare-answers-head"><strong>Final answers</strong>
+        ${same ? '<span class="trend down">identical</span>' : '<button type="button" class="link-btn" id="toggle-diff">Show differences</button>'}</div>
+      <div class="answers" id="answers-side">
+        <div><span class="muted">${esc(labels[0])}</span><pre>${esc(a.answer || "(no answer recorded: re-import its transcript)")}</pre></div>
+        <div><span class="muted">${esc(labels[1])}</span><pre>${esc(b.answer || "(no answer yet)")}</pre></div>
       </div>
+      <pre class="answer-diff" id="answers-diff" hidden>${lineDiff(a.answer || "", b.answer || "").map(([op, line]) =>
+        `<span class="diff-${op === "=" ? "same" : op === "-" ? "del" : "add"}">${op === "=" ? " " : op} ${esc(line) || " "}</span>`).join("")}</pre>
+    </div>`;
+}
+
+/** Binds what compareRunsHtml and judgeCardHtml draw: the differences switch and the judge form. */
+function bindCompare(base, other, after) {
+  const toggleDiff = document.getElementById("toggle-diff");
+  if (toggleDiff) toggleDiff.onclick = () => {
+    const diff = document.getElementById("answers-diff"), side = document.getElementById("answers-side");
+    diff.hidden = !diff.hidden; side.hidden = !diff.hidden;
+    toggleDiff.textContent = diff.hidden ? "Show differences" : "Show side by side";
+  };
+  const form = document.getElementById("judge-form");
+  if (form) form.onsubmit = async (e) => {
+    e.preventDefault();
+    form.querySelector("button").disabled = true;
+    try {
+      await api("/api/ratings", { method: "POST", body: { base, other, model: document.getElementById("judge-model").value, force: true } });
+    } catch (err) { alert(err.message); }
+    after();
+  };
+}
+
+/** While the judge works, look again in a few seconds (only while the same page is shown). */
+function pollJudge(rating, again) {
+  if (rating?.status !== "rating") return;
+  const here = location.hash;
+  setTimeout(() => { if (location.hash === here) again(); }, 3000);
+}
+
+/** A rerun against its original: the judge, figures, files edited, and their final answers. */
+function compareOriginalHtml(p, models, defaultJudge) {
+  const o = p.replay_of;
+  const rerun = { ...p, answer: p.answer || o.result || "" };
+  return `<h2 class="page-sec" id="compare-original">Compared with the original <a class="link-btn" href="#/compare?a=${encodeURIComponent(o.id)}&b=${encodeURIComponent(p.id)}">Open in Compare</a></h2>
+    <div class="card compare-original">
+      ${judgeCardHtml(o.rating, models, defaultJudge)}
+      ${compareRunsHtml(o, rerun)}
     </div>`;
 }
 
@@ -1306,7 +1371,7 @@ function rerunOfHtml(p) {
     : "a prompt no longer in the history";
   return `<div class="rerun-of">
     <span class="ref-label">↻ Rerun</span>
-    ${rerunStatusHtml(o)}
+    ${rerunStatusHtml(o)}${o.first ? judgeBadge(o.rating) : ""}
     <span>${o.first ? `Rerun of ${original} ${o.id ? refDelta(p.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}` : `Follow-up in the rerun of ${original}`}</span>
     <span class="rerun-config"><span class="muted">launched ${esc(fmtDate(o.launched_at))} with</span> ${rerunSettings(o)}</span>
     <a class="link-btn" href="#/tag/rerun">All reruns</a>
@@ -1317,7 +1382,8 @@ function rerunOfHtml(p) {
 let promptSplit = "";
 
 async function viewPrompt(id, compare = {}) {
-  let [p, allTags] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags")]);
+  let [p, allTags, settings] = await Promise.all([api(`/api/prompts/${encodeURIComponent(id)}`), api("/api/tags"), api("/api/settings")]);
+  const knownModels = allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
   ruleSkills = skillsFromTags(allTags);
   // compare by tag only through one of this prompt's own human tags (a stale link falls back to similar)
   if (compare.scope && compare.scope !== "similar" && humanTags(p.tags).some((t) => t.tag === compare.tag)) {
@@ -1389,8 +1455,8 @@ async function viewPrompt(id, compare = {}) {
     ${unpriced}
     <div class="tags-hero prompt-facts">${facts.map(([label, value, sub, note]) => `<div class="hero-fact"><span class="label">${label}</span>
       <span class="value">${value}</span><span class="sub">${sub || "&nbsp;"}</span>${note ? `<span class="sub">${note}</span>` : ""}</div>`).join("")}</div>
-    ${p.replay_of?.first && p.replay_of.id ? compareOriginalHtml(p) : ""}
-    ${rerunSectionHtml(p, allTags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`))}
+    ${p.replay_of?.first && p.replay_of.id ? compareOriginalHtml(p, knownModels, settings.judge_model) : ""}
+    ${rerunSectionHtml(p, knownModels, settings.judge_model)}
 
     <h2 class="page-sec">Cost per agent</h2>
     <div class="table-wrap"><table>
@@ -1441,12 +1507,10 @@ async function viewPrompt(id, compare = {}) {
   };
   app.querySelectorAll("[data-split]").forEach((b) => b.onclick = () => { promptSplit = b.dataset.split; drawCompare(); });
   bindRerun(p);
-  const toggleDiff = document.getElementById("toggle-diff");
-  if (toggleDiff) toggleDiff.onclick = () => {
-    const diff = document.getElementById("answers-diff"), side = document.getElementById("answers-side");
-    diff.hidden = !diff.hidden; side.hidden = !diff.hidden;
-    toggleDiff.textContent = diff.hidden ? "Show differences" : "Show side by side";
-  };
+  if (p.replay_of?.first && p.replay_of.id) {
+    bindCompare(p.replay_of.id, p.id, () => route());
+    pollJudge(p.replay_of.rating, () => route());
+  }
   const makeRef = document.getElementById("make-reference");
   if (makeRef) makeRef.onclick = async () => {
     await api(`/api/tags/${encodeURIComponent(p.compare.tag)}/reference`, { method: "PUT", body: { prompt_id: p.id } });
@@ -2392,6 +2456,9 @@ async function viewSetup() {
           <option value="prices" ${settings.cost_source === "prices" ? "selected" : ""}>Price table only</option></select></div>
       <div class="setup-row"><div><strong>Similarity threshold</strong><br><span class="muted">0–1 word overlap above which two prompts are shown together.</span></div>
         <input name="similarity_threshold" type="number" min="0" max="1" step="0.05" value="${settings.similarity_threshold}"></div>
+      <div class="setup-row"><div><strong>Default LLM judge</strong><br><span class="muted">The model rating how much a rerun's output differs from its original's.
+        Empty uses Claude Code's default model. Each rerun, and the Compare page, can pick another.</span></div>
+        <input name="judge_model" size="24" value="${esc(settings.judge_model || "")}" placeholder="claude-haiku-5-5"></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
       <div class="setup-row"><div style="flex-basis:100%"><strong>Prices (USD per million tokens)</strong><br><span class="muted">Longest model-id prefix wins. Cache writes cost 1.25× (5 min) or 2× (1 h) input; fast mode 2×; web search $10/1k.</span>
@@ -2443,6 +2510,7 @@ async function viewSetup() {
         claude_projects_dir: f.get("claude_projects_dir"),
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
+        judge_model: String(f.get("judge_model") || "").trim(),
         auto_ingest_interval: parseInt(f.get("auto_ingest_interval"), 10),
         prices: JSON.parse(f.get("prices")),
       };
@@ -2663,8 +2731,8 @@ async function viewReruns() {
         return `<article class="rr-row launched">
           <span class="muted rr-added">${esc(fmtDate(x.launched_at))}</span>
           <div class="rr-body">${rerunPromptCell(o)}<div class="rr-settings">${rerunSettings(x)}</div></div>
-          <div class="rr-result">${rerunStatusHtml(x)}${r
-            ? `<a href="#/prompt/${encodeURIComponent(r.id)}"><strong>${fmtCost(r.total_cost_usd)}</strong> · ${fmtMs(duration(r))} · compare</a>${o ? refDelta(r.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}`
+          <div class="rr-result">${rerunStatusHtml(x)}${judgeBadge(x.rating)}${x.rating?.summary ? `<span class="rerun-needs">${esc(x.rating.summary)}</span>` : ""}${r
+            ? `<a href="#/compare?a=${encodeURIComponent(x.prompt_id)}&b=${encodeURIComponent(r.id)}"><strong>${fmtCost(r.total_cost_usd)}</strong> · ${fmtMs(duration(r))} · compare</a>${o ? refDelta(r.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}`
             : x.status === "running" ? '<span class="muted">running in the background</span>'
             : `<span class="muted">${x.cost_usd != null ? `${fmtCost(x.cost_usd)} · ` : ""}not imported yet</span>`}</div>
         </article>`;
@@ -2676,7 +2744,7 @@ async function viewReruns() {
   const page = app.querySelector(".reruns-page");
   // while reruns run, check again every few seconds (only while this page is shown)
   clearTimeout(rerunState.timer);
-  if (data.launched.some((x) => x.status === "running")) {
+  if (data.launched.some((x) => x.status === "running" || x.rating?.status === "rating")) {
     const here = location.hash;
     rerunState.timer = setTimeout(async () => {
       if (location.hash !== here) return;
@@ -2720,6 +2788,47 @@ async function launchPicked(picked, estimate) {
   status.hidden = false;
 }
 
+// ---- Compare page: any two runs of a prompt, and the LLM judge's call ------------------------
+
+async function viewCompare(query) {
+  const a = query.get("a"), b = query.get("b");
+  if (!a || !b) { app.innerHTML = '<div class="card status-warn">Pick two runs to compare: open a rerun, then Compare.</div>'; return; }
+  const [data, tags, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/tags"), api("/api/settings")]);
+  const models = tags.filter((t) => t.tag.startsWith("model:")).map((t) => `claude-${t.tag.slice("model:".length)}`);
+  const kindLabel = { original: "Original", rerun: "Rerun", reference: "Reference run" };
+  const label = (pid) => kindLabel[data.candidates.find((x) => x.id === pid)?.kind] || "Run";
+  const picker = (id, current) => `<select id="${id}">${data.candidates.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>
+    ${esc(kindLabel[x.kind])} · ${esc(fmtDate(x.started_at))} · ${fmtCost(x.total_cost_usd)}</option>`).join("")}</select>`;
+  const labels = [label(a), label(b)];
+  if (labels[0] === labels[1]) labels.splice(0, 2, `${labels[0]} 1`, `${labels[1]} 2`);
+  app.innerHTML = `
+    <div class="prompts-page compare-page">
+      <header class="home-hero page-hero">
+        <div class="hero-copy">
+          <h1><span class="hero-name">Compare</span>Two runs of one prompt. <em>Read the differences, or trust it.</em></h1>
+          <p>${esc(data.a.text.slice(0, 220))}${data.a.text.length > 220 ? "…" : ""}</p>
+        </div>
+      </header>
+      <div class="compare-pick card">
+        <label>First ${picker("pick-a", a)}</label>
+        <button type="button" class="btn" id="swap" title="Swap the two runs">⇄</button>
+        <label>Second ${picker("pick-b", b)}</label>
+        <span class="muted">The original, each rerun of it, and its tags' reference runs.</span>
+      </div>
+      <div class="card compare-original">
+        ${judgeCardHtml(data.rating, models, settings.judge_model)}
+        ${compareRunsHtml(data.a, data.b, labels)}
+      </div>
+      <p class="muted group-note"><a href="#/prompt/${encodeURIComponent(a)}">Open the first run</a> · <a href="#/prompt/${encodeURIComponent(b)}">Open the second run</a></p>
+    </div>`;
+  const go = (x, y) => { location.hash = `#/compare?${new URLSearchParams({ a: x, b: y })}`; };
+  document.getElementById("pick-a").onchange = (e) => go(e.target.value, b);
+  document.getElementById("pick-b").onchange = (e) => go(a, e.target.value);
+  document.getElementById("swap").onclick = () => go(b, a);
+  bindCompare(a, b, () => viewCompare(query));
+  pollJudge(data.rating, () => viewCompare(query));
+}
+
 // ---- router ----------------------------------------------------------------
 
 async function route() {
@@ -2731,7 +2840,7 @@ async function route() {
   // links from before the home page put the prompt filters on #/
   if (!view && ["q", "tag", "project", "sort", "order"].some((k) => query.has(k))) view = "prompts";
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active",
-    a.dataset.nav === ({ tag: "tags", session: "sessions", prompt: "prompts" }[view] || view || "home")));
+    a.dataset.nav === ({ tag: "tags", session: "sessions", prompt: "prompts", compare: "reruns" }[view] || view || "home")));
   try {
     if (view === "prompts") await viewPrompts(query);
     else if (view === "prompt") await viewPrompt(decodeURIComponent(arg), { scope: query.get("compare"), tag: query.get("tag") });
@@ -2741,6 +2850,7 @@ async function route() {
     else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)), query);
     else if (view === "setup") await viewSetup();
     else if (view === "reruns") await viewReruns();
+    else if (view === "compare") await viewCompare(query);
     else await viewHome(query);
   } catch (e) {
     if (e instanceof StaleNavigation) return; // the newer page renders itself

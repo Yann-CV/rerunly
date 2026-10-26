@@ -742,3 +742,41 @@ def test_background_rerun(client, monkeypatch):
     assert next(x for x in client.get("/api/reruns").json()["launched"] if x["session_id"] == out["session_id"])["status"] == "done"
     assert client.post("/api/prompts/prompt-3/replay", json={"permission": "everything"}).status_code == 400
     assert client.post("/api/prompts/prompt-3/replay", json={"budget_usd": -1}).status_code == 400
+
+
+def test_llm_judge(client, monkeypatch):
+    from rerunly import judge
+    from rerunly.judge import parse_rating, rating_prompt
+
+    # the reply: JSON, possibly wrapped in words; values kept in range
+    r = parse_rating('Here: {"score": 120, "verdict": "minor", "quality": "same", "look": false, "summary": "Same notes.", "differences": ["a", "b"]}')
+    assert (r["score"], r["verdict"], r["look"], r["differences"]) == (100, "minor", False, ["a", "b"])
+    assert parse_rating('{"score": 30}')["verdict"] == "major" and parse_rating('{"score": 30}')["look"]
+    with pytest.raises(ValueError):
+        parse_rating("no json here")
+    prompt = rating_prompt("write notes", {"answer": "A", "files": ["x.md"]}, {"answer": "B", "files": []})
+    assert "REFERENCE" in prompt and "Files it edited: x.md" in prompt and "B" in prompt
+
+    calls = []
+    def fake_rate(request, reference, rerun, model, workdir, budget=0.5):
+        calls.append(model)
+        return {"score": 72, "verdict": "minor", "quality": "same", "look": False, "summary": "Close enough.", "differences": ["shorter"], "cost_usd": 0.01}
+    monkeypatch.setattr(judge, "rate", fake_rate)
+    import time
+    def wait(base, other):
+        for _ in range(50):
+            r = client.get("/api/compare", params={"a": base, "b": other}).json()["rating"]
+            if r and r["status"] != "rating":
+                return r
+            time.sleep(0.05)
+    # the default judge, then another model chosen for this comparison
+    assert client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4"}).status_code == 200
+    assert wait("prompt-1", "prompt-4")["score"] == 72 and calls == ["claude-haiku-5-5"]
+    client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4", "model": "claude-opus-5-5", "force": True})
+    rated = wait("prompt-1", "prompt-4")
+    assert calls[-1] == "claude-opus-5-5" and rated["model"] == "claude-opus-5-5" and rated["differences"] == ["shorter"]
+    assert client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4", "model": "x; rm"}).status_code == 400
+    assert client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-1"}).status_code == 400
+    # the compare view: both runs with their answers, and the runs to pick from
+    data = client.get("/api/compare", params={"a": "prompt-1", "b": "prompt-4"}).json()
+    assert data["a"]["answer"] == "done" and data["candidates"][0] == {**data["candidates"][0], "id": "prompt-1", "kind": "original"}

@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, otel, replay, runner
+from . import background as bg, db, judge, otel, replay, runner
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .ingest import apply_rules, ingest, session_texts
 from .tagging import rule_matches, rule_scope, similarity, split_any
@@ -78,9 +78,65 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         with ingest_lock:
             c = conn()
             try:
-                return ingest(c, force=force)
+                out = ingest(c, force=force)
+                rate_pending(c)  # reruns just imported get their rating
+                return out
             finally:
                 c.close()
+
+    # ---- ratings: Claude says how much a run's output differs from another's ------------------
+
+    rating_lock = threading.Lock()
+
+    def rating_of(c, base_id: str, other_id: str) -> dict | None:
+        r = c.execute("SELECT * FROM run_ratings WHERE base_id = ? AND other_id = ?", (base_id, other_id)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["differences"] = json.loads(d["differences"] or "[]")
+        d["look"] = bool(d["look"]) if d["look"] is not None else None
+        return d
+
+    def start_rating(base_id: str, other_id: str, force: bool = False, model: str = "") -> dict | None:
+        """Have an LLM judge rate `other_id`'s output against `base_id`'s, in the background, with `model` (else the
+        default judge of the Setup page); None when one has no answer."""
+        c = conn()
+        runs = {r["id"]: dict(r) for r in c.execute("SELECT id, text, answer, files FROM prompts WHERE id IN (?, ?)", (base_id, other_id))}
+        if base_id == other_id or len(runs) != 2 or not runs[base_id]["answer"] or not runs[other_id]["answer"]:
+            return None
+        with rating_lock:
+            current = rating_of(c, base_id, other_id)
+            if current and (current["status"] == "rating" or (current["status"] == "done" and not force)):
+                return current
+            model = model or db.get_settings(c)["judge_model"]
+            with c:
+                c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at) VALUES (?,?,?,?,?)",
+                          (base_id, other_id, "rating", model, runner.now()))
+
+        def work():
+            files = lambda r: json.loads(r["files"] or "[]")
+            try:
+                out = judge.rate(runs[base_id]["text"], {"answer": runs[base_id]["answer"], "files": files(runs[base_id])},
+                                 {"answer": runs[other_id]["answer"], "files": files(runs[other_id])}, model, db_path.parent / "judge")
+                values = ("done", out["score"], out["verdict"], out["quality"], int(out["look"]), out["summary"],
+                          json.dumps(out["differences"]), out["cost_usd"], None)
+            except Exception as e:  # noqa: BLE001 - any failure is reported on the page
+                values = ("failed", None, None, None, None, None, None, None, str(e)[:300])
+            w = conn()
+            with w:
+                w.execute("UPDATE run_ratings SET status=?, score=?, verdict=?, quality=?, look=?, summary=?, differences=?, cost_usd=?, "
+                          "error=?, rated_at=? WHERE base_id=? AND other_id=?", (*values, runner.now(), base_id, other_id))
+
+        threading.Thread(target=work, daemon=True).start()
+        return rating_of(c, base_id, other_id)
+
+    def rate_pending(c) -> None:
+        """Reruns imported with an answer, to rate against their original, and not rated yet."""
+        for x in c.execute(
+            "SELECT x.prompt_id base, x.judge_model, (SELECT id FROM prompts WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) other "
+            "FROM replays x WHERE COALESCE(x.auto_rate, 1) = 1").fetchall():
+            if x["other"] and not rating_of(c, x["base"], x["other"]):
+                start_rating(x["base"], x["other"], model=x["judge_model"] or "")
 
     def loop():
         while not stop.is_set():
@@ -399,12 +455,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         ]
         # replays launched from here, and the prompt this one replays
         refresh_reruns(c)
-        prompt["replays"] = [
-            {**rerun_row(x), "prompt": (lambda q: dict(q) if q else None)(c.execute(
-                "SELECT id, started_at, total_cost_usd, total_tokens, active_ms, wall_ms FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1",
-                (x["session_id"],)).fetchone())}
-            for x in c.execute("SELECT * FROM replays WHERE prompt_id = ? ORDER BY launched_at DESC", (prompt_id,))
-        ]
+        prompt["replays"] = []
+        for x in c.execute("SELECT * FROM replays WHERE prompt_id = ? ORDER BY launched_at DESC", (prompt_id,)).fetchall():
+            done = c.execute("SELECT id, started_at, total_cost_usd, total_tokens, active_ms, wall_ms FROM pv WHERE session_id = ? "
+                             "ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
+            prompt["replays"].append({**rerun_row(x), "prompt": dict(done) if done else None,
+                                      "rating": rating_of(c, prompt_id, done["id"]) if done else None})
         # a prompt of a rerun session: the prompt it reruns, and the configuration chosen to launch it
         # with what the comparison needs: the original's answer, files and figures
         of = c.execute(
@@ -417,7 +473,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         ).fetchone()
         if of:
             o = _row(of)
-            o.update(first=bool(o["first"]), denials=json.loads(o["denials"] or "null"), skills=json.loads(o["skills"] or "[]"))
+            o.update(first=bool(o["first"]), denials=json.loads(o["denials"] or "null"), skills=json.loads(o["skills"] or "[]"),
+                     rating=rating_of(c, o["id"], prompt_id) if o["id"] and o["first"] else None)
             prompt["replay_of"] = o
         else:
             prompt["replay_of"] = None
@@ -893,8 +950,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             raise HTTPException(400, "budget must be a number") from None
         if budget is not None and not 0 < budget <= 1000:
             raise HTTPException(400, "budget must be between 0 and 1000 USD")
+        judge_model = str(body.get("judge_model") or "")
+        if judge_model and not replay.MODEL_RE.match(judge_model):
+            raise HTTPException(400, "unknown judge model")
         return {"model": model, "effort": effort, "release": release, "mode": mode, "permission": permission,
-                "budget": budget, "restore_skills": body.get("restore_skills", True) is not False}
+                "budget": budget, "restore_skills": body.get("restore_skills", True) is not False,
+                "rate": body.get("rate", True) is not False, "judge_model": judge_model}
 
     def replayable(c, prompt_id: str):
         r = c.execute("SELECT text, cwd, harness, harness_version FROM pv WHERE id = ?", (prompt_id,)).fetchone()
@@ -948,7 +1009,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         skills = runner.build_skills_plugin(plugin, versions) if plugin else []
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
                "harness_version": version, "launched_at": runner.now(), "mode": opts["mode"], "skills": json.dumps(skills),
-               "permission": opts["permission"], "budget_usd": opts["budget"]}
+               "permission": opts["permission"], "budget_usd": opts["budget"], "auto_rate": int(opts.get("rate", True)),
+               "judge_model": opts.get("judge_model", "")}
         if opts["mode"] == "terminal":
             note = "\n".join(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with."
                               for k in skills)
@@ -994,7 +1056,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         body = await dashboard_json(request)
         o = rerun_options(body)
         values = {"model": o["model"], "effort": o["effort"], "release": o["release"], "mode": o["mode"], "permission": o["permission"],
-                  "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"])}
+                  "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"]), "auto_rate": int(o["rate"]),
+                  "judge_model": o["judge_model"]}
         c = conn()
         ids = [str(i) for i in body.get("prompt_ids") or []]
         for i in ids:
@@ -1025,7 +1088,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         launched = []
         for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC LIMIT 200"):
             done = c.execute(f"SELECT {prompt_cols} FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
-            launched.append({**rerun_row(x), "original": prompt(x["prompt_id"]), "replay": dict(done) if done else None})
+            launched.append({**rerun_row(x), "original": prompt(x["prompt_id"]), "replay": dict(done) if done else None,
+                             "rating": rating_of(c, x["prompt_id"], done["id"]) if done else None})
         return {"queue": queue, "launched": launched}
 
     def rerun_row(x) -> dict:
@@ -1055,7 +1119,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             release = q["release"] if q["release"] is not None else ("same" if q["same_version"] else "")
             opts = {"model": q["model"] or "", "effort": q["effort"] or "", "release": release, "mode": q["mode"] or "background",
                     "permission": q["permission"] or "ask", "budget": q["budget_usd"],
-                    "restore_skills": q["restore_skills"] is None or bool(q["restore_skills"])}
+                    "restore_skills": q["restore_skills"] is None or bool(q["restore_skills"]),
+                    "rate": q["auto_rate"] is None or bool(q["auto_rate"]), "judge_model": q["judge_model"] or ""}
             try:
                 results.append({"id": q["id"], **start_replay(c, q["prompt_id"], opts)})
             except HTTPException as e:
@@ -1063,6 +1128,55 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             with c:
                 c.execute("DELETE FROM replay_queue WHERE id = ?", (q["id"],))
         return {"results": results}
+
+    @app.post("/api/ratings")
+    async def rate_pair(request: Request):
+        """Have an LLM judge rate how much run `other`'s output differs from run `base`'s: with `model` (else the
+        default judge), again with `force`."""
+        body = await dashboard_json(request)
+        model = str(body.get("model") or "")
+        if model and not replay.MODEL_RE.match(model):
+            raise HTTPException(400, "unknown judge model")
+        c = conn()
+        for pid in (body.get("base"), body.get("other")):
+            if not c.execute("SELECT 1 FROM pv WHERE id = ?", (str(pid),)).fetchone():
+                raise HTTPException(404, f"no prompt {pid}")
+        rating = start_rating(str(body["base"]), str(body["other"]), bool(body.get("force")), model)
+        if rating is None:
+            raise HTTPException(400, "both runs need a final answer to be rated (and two different runs)")
+        return rating
+
+    @app.get("/api/compare")
+    def compare_runs(a: str, b: str):
+        """Two runs side by side: their figures, files and answers, their rating, and the runs related to the
+        first (its original, every rerun of it, and its tags' reference runs) to pick from."""
+        c = conn()
+        refresh_reruns(c)
+        cols = (f"{LIST_COLS}, p.answer, p.files, p.session_id")
+        def run(pid):
+            r = c.execute(f"SELECT {cols} FROM pv p WHERE p.id = ?", (pid,)).fetchone()
+            if r is None:
+                raise HTTPException(404, f"no prompt {pid}")
+            d = _row(r)
+            x = c.execute("SELECT prompt_id, model, effort, harness_version, launched_at FROM replays WHERE session_id = ?", (d["session_id"],)).fetchone()
+            d["rerun_of"] = dict(x) if x else None
+            return d
+        first, second = run(a), run(b)
+        original = (first["rerun_of"] or {}).get("prompt_id") or a
+        related = [original] + [r[0] for r in c.execute(
+            "SELECT (SELECT id FROM pv WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) FROM replays x "
+            "WHERE x.prompt_id = ? ORDER BY x.launched_at", (original,)) if r[0]]
+        related += [r[0] for r in c.execute(
+            "SELECT r.prompt_id FROM tag_reference r JOIN tags t ON t.tag = r.tag AND t.prompt_id = ? JOIN pv p ON p.id = r.prompt_id",
+            (original,))]
+        candidates = []
+        for pid in dict.fromkeys([*related, a, b]):
+            r = c.execute("SELECT id, started_at, total_cost_usd, session_id FROM pv WHERE id = ?", (pid,)).fetchone()
+            if r:
+                is_rerun = c.execute("SELECT 1 FROM replays WHERE session_id = ?", (r["session_id"],)).fetchone()
+                candidates.append({"id": r["id"], "started_at": r["started_at"], "total_cost_usd": r["total_cost_usd"],
+                                   "kind": "original" if pid == original else "rerun" if is_rerun else "reference"})
+        return {"a": first, "b": second, "rating": rating_of(c, a, b), "candidates": candidates}
 
     @app.get("/api/skill-versions/{hash}")
     def skill_version(hash: str):

@@ -184,6 +184,14 @@ a timeline by creation date. Click one to open its charts in place.</p>
 - **Compared with the original**: a rerun's page sets its figures (cost, tokens, time, calls)
   next to the original's, lists the files each edited, and shows both final answers side by
   side or as differences.
+- **LLM judge**: once a rerun is imported, an LLM rates how close its output is to the
+  original's in substance (0–100, wording aside), whether it is better, the same or worse, and
+  whether you should read it: **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it**,
+  with a one-line summary and the main differences. The badge shows wherever reruns are listed.
+  Pick the judge model per rerun or per comparison; the default (haiku) is set on the Setup
+  page. The judge runs in an empty scratch folder, saves no session and has a budget cap.
+- **Compare**: any two runs of a prompt (the original, its reruns, its tags' reference runs)
+  side by side, with the judge's call and a button to judge them with the model of your choice.
 - **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
   it, or leave reruns out of the history on the Setup page) and none of the original's tags. A
   rerun's page says what it reruns, its cost against it, and the configuration chosen to launch

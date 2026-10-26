@@ -124,6 +124,16 @@ CREATE TABLE IF NOT EXISTS replay_queue (
     added_at TEXT NOT NULL
 );
 
+-- Claude's rating of how much a run's output (other_id) differs from another's (base_id).
+CREATE TABLE IF NOT EXISTS run_ratings (
+    base_id TEXT NOT NULL,
+    other_id TEXT NOT NULL,
+    status TEXT NOT NULL,             -- rating, done, failed
+    score INTEGER, verdict TEXT, quality TEXT, look INTEGER, summary TEXT, differences TEXT,
+    model TEXT, cost_usd REAL, rated_at TEXT, error TEXT,
+    PRIMARY KEY (base_id, other_id)
+);
+
 -- The run of a tag (yours or an AI tag) every other run of it is compared with.
 CREATE TABLE IF NOT EXISTS tag_reference (
     tag TEXT PRIMARY KEY,
@@ -184,6 +194,10 @@ ADDED_COLUMNS = [
     ("replays", "permission", "TEXT"), ("replays", "budget_usd", "REAL"),
     ("replay_queue", "mode", "TEXT"), ("replay_queue", "permission", "TEXT"), ("replay_queue", "budget_usd", "REAL"),
     ("replay_queue", "restore_skills", "INTEGER"),
+    # rate the rerun against its original once imported (1, the default) or not (0)
+    ("replays", "auto_rate", "INTEGER"), ("replay_queue", "auto_rate", "INTEGER"),
+    # the LLM judging the rerun ("" = the default judge of the Setup page)
+    ("replays", "judge_model", "TEXT"), ("replay_queue", "judge_model", "TEXT"),
 ]
 
 
