@@ -249,9 +249,12 @@ def create_prompt_view(conn: sqlite3.Connection, prefer_official: bool, settings
 
 def get_settings(conn: sqlite3.Connection) -> dict:
     settings = dict(DEFAULT_SETTINGS)
+    manual_prices = {}
     for row in conn.execute("SELECT key, value FROM settings"):
         settings[row["key"]] = json.loads(row["value"])
-    settings["prices"] = {**DEFAULT_SETTINGS["prices"], **settings["prices"]}
+        if row["key"] == "prices":
+            manual_prices = settings["prices"]
+    settings["prices"] = {**DEFAULT_SETTINGS["prices"], **settings["auto_prices"], **manual_prices}
     return settings
 
 

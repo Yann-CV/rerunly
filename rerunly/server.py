@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from . import background as bg, db, judge, otel, replay, runner
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .ingest import apply_rules, ingest, session_texts
+from .pricing import DEFAULT_PRICES
 from .tagging import rule_matches, rule_scope, similarity, split_any
 
 STATIC = Path(__file__).parent / "static"
@@ -177,6 +178,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     @app.put("/api/settings")
     def put_settings(values: dict = Body(...)):
         c = conn()
+        if isinstance(values.get("prices"), dict):
+            # Setup sends the whole table back: keep only what the user set, so found prices stay automatic.
+            found = {**DEFAULT_PRICES, **db.get_settings(c)["auto_prices"]}
+            values = {**values, "prices": {k: v for k, v in values["prices"].items() if found.get(k) != v}}
         db.save_settings(c, values)
         settings = db.get_settings(c)
         if "tag_rules" in values:

@@ -181,19 +181,44 @@ def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
     """Return counts of scanned and updated sessions."""
     settings = get_settings(conn)
     known = {r["path"]: r["signature"] for r in conn.execute("SELECT path, signature FROM sessions")}
-    scanned = updated = 0
-    for source in sources_from_settings(settings):
-        for key, signature in source.sessions():
-            scanned += 1
-            if not force and known.get(key) == signature:
-                continue
+    from .price_discovery import discover_prices
+    from .replay import codex_models
+
+    candidates = [(source, key, signature) for source in sources_from_settings(settings) for key, signature in source.sessions()]
+    loaded = {}
+    models = set()
+    for table in ("prompts", "agents"):
+        for row in conn.execute(f"SELECT models FROM {table}"):
+            models.update(json.loads(row[0] or "{}"))
+    if settings.get("codex_enabled", True):
+        models.update(codex_models())
+    models.add(settings.get("judge_model", ""))
+    for source, key, signature in candidates:
+        if force or known.get(key) != signature:
             session = source.load(key)
-            if session is None:
-                continue
-            session.signature = signature
-            with conn:
-                store_session(conn, session, settings)
-            updated += 1
+            if session is not None:
+                loaded[key] = session
+                for prompt in session.prompts:
+                    models.update(call.model for call in prompt.calls)
+                    for agent in prompt.agents:
+                        models.update(call.model for call in agent.calls)
+    if discover_prices(conn, models, settings):
+        settings = get_settings(conn)
+        # Reparse old sessions too: aggregate DB rows cannot reconstruct all cache TTL usage.
+        for source, key, signature in candidates:
+            if key not in loaded:
+                session = source.load(key)
+                if session is not None:
+                    loaded[key] = session
+    updated = 0
+    for source, key, signature in candidates:
+        session = loaded.get(key)
+        if session is None:
+            continue
+        session.signature = signature
+        with conn:
+            store_session(conn, session, settings)
+        updated += 1
     if updated:
         apply_rules(conn, settings["tag_rules"])
-    return {"scanned": scanned, "updated": updated}
+    return {"scanned": len(candidates), "updated": updated}

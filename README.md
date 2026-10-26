@@ -434,3 +434,25 @@ Model and CLI behavior were checked against the
 [official Codex model documentation](https://learn.chatgpt.com/docs/models),
 [CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli), and
 [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
+
+### Automatic model prices
+
+During import, Rerunly checks newly recorded models (including subagents), locally
+listed Codex models, and the configured judge for missing exact prices. It fetches
+public OpenAI or Claude pricing tables and saves standard short-context input,
+output, and cached-input estimates. A new version is looked up separately even
+when an older family prefix already supplies a fallback estimate. Dated snapshots
+can share the published base model price.
+
+Successful lookups cache the provider catalog for 24 hours; failures retry after
+one hour without blocking imports. Newly found prices also recalculate existing
+history for linked agents whose transcripts remain available. Manual price entries
+and edited family prefixes take precedence. No prompts or session data are sent;
+only the public pricing pages are requested, without API keys or an LLM call.
+
+Setup shows lookup status, missing prices, and source links under **Automatic model
+pricing**. Turn off **Find prices automatically** to keep pricing entirely local.
+If a provider has not published a price or its page format changes, Rerunly keeps
+existing estimates and reports the missing lookup rather than inventing a price.
+These are API token estimates, not subscription charges; pricing for long contexts,
+special service tiers, and hosted tools can differ.

@@ -23,6 +23,11 @@ DEFAULT_SETTINGS = {
     "claude_projects_dir": str(Path.home() / ".claude/projects"),
     "codex_sessions_dir": str(Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"),
     "prices": DEFAULT_PRICES,
+    "auto_price_lookup": True,
+    "auto_prices": {},
+    "price_catalogs": {},
+    "price_provenance": {},
+    "price_lookup_missing": [],
     # Two prompts are "similar" when the Jaccard similarity of their word sets reaches this.
     "similarity_threshold": 0.6,
     # User rules adding human tags automatically, either

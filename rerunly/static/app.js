@@ -2511,6 +2511,15 @@ async function viewSetup() {
         <input name="judge_model" size="24" value="${esc(settings.judge_model || "")}" placeholder="claude-haiku-5-5"></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
+      <div class="setup-row"><div><strong>Automatic model pricing</strong><br>
+        <span class="muted">When a new model appears, look up standard short-context token prices on the official OpenAI or Claude pricing page. No prompts are sent.
+          Published prices are cached for a day; failed lookups retry after an hour. Your price overrides take priority.</span>
+        ${Object.entries(settings.price_catalogs || {}).map(([provider, state]) => `<p class="muted">${esc(provider)} · checked ${fmtDate(new Date(state.checked_at * 1000).toISOString())}
+          ${state.error ? `<span class="status-warn">${esc(state.error)}</span>` : "· pricing page available"}</p>`).join("")}
+        ${(settings.price_lookup_missing || []).length ? `<p class="status-warn">No published price found for ${esc(settings.price_lookup_missing.join(", "))}. Existing prefix estimates apply where configured; other models remain unpriced.</p>` : ""}
+        ${Object.keys(settings.price_provenance || {}).length ? `<details><summary>Automatically found prices (${Object.keys(settings.price_provenance).length})</summary><ul>
+          ${Object.entries(settings.price_provenance).map(([model, info]) => `<li>${esc(model)} · <a href="${esc(info.source)}" target="_blank" rel="noopener noreferrer">Official pricing</a> · ${fmtDate(new Date(info.checked_at * 1000).toISOString())}</li>`).join("")}</ul></details>` : ""}
+        </div><label><input type="checkbox" name="auto_price_lookup" ${settings.auto_price_lookup ? "checked" : ""}> Find prices automatically</label></div>
       <div class="setup-row"><div style="flex-basis:100%"><strong>Prices (USD per million tokens)</strong><br><span class="muted">Longest model-id prefix wins. Cache writes cost 1.25× (5 min) or 2× (1 h) input; fast mode 2×; web search $10/1k.</span>
         <textarea name="prices" rows="12">${esc(JSON.stringify(settings.prices, null, 2))}</textarea></div></div>
       <div style="padding-top:10px"><button class="btn primary">Save &amp; re-import</button> <span id="saved" class="muted"></span></div>
@@ -2591,6 +2600,7 @@ async function viewSetup() {
         judge_model: String(f.get("judge_model") || "").trim(),
         auto_ingest_interval: parseInt(f.get("auto_ingest_interval"), 10),
         prices: JSON.parse(f.get("prices")),
+        auto_price_lookup: f.has("auto_price_lookup"),
       };
     } catch (err) { alert("Invalid JSON: " + err.message); return; }
     await api("/api/settings", { method: "PUT", body: values });
