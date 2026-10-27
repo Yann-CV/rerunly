@@ -10,7 +10,7 @@ from .pricing import Usage, cost_usd
 from .sources.base import AgentRecord, ApiCall, PromptRecord, SessionRecord
 from .sources.claude_code import ClaudeCodeSource
 from .sources.codex import CodexSource
-from .tagging import ai_tags, rule_scope, rule_tags
+from .tagging import ai_tags, rule_matches, rule_scope, rule_tags
 from .versions import body_hash, resolve
 
 
@@ -74,7 +74,7 @@ def _insert_prompt(conn: sqlite3.Connection, p: PromptRecord, source: str, setti
         len(p.agents), agent_tokens, agent_cost,
         usage.total_tokens + agent_tokens, cost + agent_cost,
         p.harness, p.harness_version, p.effort, p.requested_model,
-        p.answer, json.dumps(sorted(p.files)),
+        p.answer, json.dumps(sorted(p.files)), json.dumps(p.permissions),
     ))
     for run in p.skill_runs:
         h = _store_skill_version(conn, run, p.started_at)
@@ -158,12 +158,16 @@ def apply_rules(conn: sqlite3.Connection, rules: list[dict]) -> None:
                 if tags:
                     ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (session_id,))]
                     conn.executemany(insert, [(i, tag) for i in ids for tag in tags])
-        _curate(conn)
+        _curate(conn, rules)
 
 
 def apply_curation(conn: sqlite3.Connection) -> None:
     """Reapply tag exclusions and priorities without recomputing the rules: enough after a tag is
     added to or removed from some prompts, or a tag's priorities change."""
+    rules = get_settings(conn)["tag_rules"]
+    if any(r.get("include_tag") for r in rules):
+        apply_rules(conn, rules)
+        return
     with conn:
         _restore_suppressed(conn)
         _curate(conn)
@@ -175,12 +179,23 @@ def _restore_suppressed(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM tag_suppressed")
 
 
-def _curate(conn: sqlite3.Connection) -> None:
+def _curate(conn: sqlite3.Connection, rules: list[dict] | None = None) -> None:
     """Drop the prompts removed from a tag, then hold back a tag on prompts carrying a tag preferred to it."""
     conn.execute("DELETE FROM tags WHERE auto != 1 AND EXISTS (SELECT 1 FROM tag_exclusions e WHERE e.prompt_id=tags.prompt_id AND e.tag=tags.tag)")
     priorities = {}
     for tag, preferred in conn.execute("SELECT tag, preferred_tag FROM tag_priorities"):
         priorities.setdefault(tag, set()).add(preferred)
+    inclusions = {}
+    keyword_exclusions = {}
+    dependencies = {tag: set(preferred) for tag, preferred in priorities.items()}
+    rules = get_settings(conn)["tag_rules"] if rules is None else rules
+    for rule in rules:
+        if rule.get("exclude") and rule.get("tag"):
+            keyword_exclusions.setdefault(rule["tag"], []).append(rule)
+            dependencies.setdefault(rule["tag"], set())
+        if rule.get("include_tag"):
+            inclusions.setdefault(rule["tag"], []).append(rule)
+            dependencies.setdefault(rule["tag"], set()).add(rule["include_tag"])
     # Resolve preferred tags first so chains have deterministic behavior.
     ordered, visiting, visited = [], set(), set()
 
@@ -188,16 +203,29 @@ def _curate(conn: sqlite3.Connection) -> None:
         if tag in visited or tag in visiting:
             return
         visiting.add(tag)
-        for preferred in sorted(priorities.get(tag, ())):
+        for preferred in sorted(dependencies.get(tag, ())):
             visit(preferred)
         visiting.remove(tag)
         visited.add(tag)
         ordered.append(tag)
 
-    for tag in sorted(priorities):
+    for tag in sorted(dependencies):
         visit(tag)
     held = "FROM tags WHERE tag=? AND auto != 1 AND prompt_id IN (SELECT prompt_id FROM tags WHERE tag=?)"
+    prompt_texts = conn.execute("SELECT id, text, session_id FROM prompts").fetchall() if keyword_exclusions else []
+    sessions = session_texts(conn) if any(rule_scope(r) == "session" for rs in keyword_exclusions.values() for r in rs) else []
     for tag in ordered:
+        for rule in inclusions.get(tag, ()):
+            used = "SELECT prompt_id AS id FROM tags WHERE tag=?"
+            if rule_scope(rule) == "session":
+                used = "SELECT id FROM prompts WHERE session_id IN (SELECT p.session_id FROM prompts p JOIN tags t ON t.prompt_id=p.id WHERE t.tag=?)"
+            conn.execute(f"INSERT OR IGNORE INTO tags(prompt_id,tag,auto) SELECT id, ?, 2 FROM ({used}) WHERE NOT EXISTS (SELECT 1 FROM tag_exclusions e WHERE e.prompt_id=id AND e.tag=?)", (tag, rule["include_tag"], tag))
+        for rule in keyword_exclusions.get(tag, ()):
+            matching_sessions = {sid for sid, text in sessions if rule_matches(rule, text)} if rule_scope(rule) == "session" else None
+            ids = [pid for pid, text, sid in prompt_texts if (sid in matching_sessions if matching_sessions is not None else rule_matches(rule, text))]
+            for pid in ids:
+                conn.execute("INSERT OR IGNORE INTO tag_suppressed SELECT prompt_id, tag, auto FROM tags WHERE prompt_id=? AND tag=? AND auto!=1", (pid, tag))
+                conn.execute("DELETE FROM tags WHERE prompt_id=? AND tag=? AND auto!=1", (pid, tag))
         for preferred in priorities.get(tag, ()):
             conn.execute(f"INSERT OR IGNORE INTO tag_suppressed SELECT prompt_id, tag, auto {held}", (tag, preferred))
             conn.execute(f"DELETE {held}", (tag, preferred))
@@ -224,6 +252,7 @@ def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
     """Return counts of scanned and updated sessions."""
     settings = get_settings(conn)
     known = {r["path"]: r["signature"] for r in conn.execute("SELECT path, signature FROM sessions")}
+    missing_permissions = {r[0] for r in conn.execute("SELECT s.path FROM sessions s JOIN prompts p ON p.session_id=s.id WHERE p.permissions IS NULL")}
     from .price_discovery import discover_prices
     from .replay import codex_models
 
@@ -237,7 +266,7 @@ def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
         models.update(codex_models())
     models.add(settings.get("judge_model", ""))
     for source, key, signature in candidates:
-        if force or known.get(key) != signature:
+        if force or known.get(key) != signature or key in missing_permissions:
             session = source.load(key)
             if session is not None:
                 loaded[key] = session

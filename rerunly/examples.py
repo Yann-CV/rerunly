@@ -64,7 +64,17 @@ def add_examples(conn):
         prompts[key] = p
         return p
 
+    def rate(base, other, *, score=95, quality="same"):
+        """An illustrative judge verdict on `other` against `base`: any two runs can be compared."""
+        conn.execute("INSERT INTO run_ratings(base_id,other_id,status,score,verdict,quality,look,summary,differences,model,rated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (base.id, other.id, "done", score, "equivalent" if score >= 85 else "major", quality, int(score < 85),
+                 "Illustrative verdict: equivalent coverage of the required cases with less work." if score >= 85 else "Illustrative verdict: cheaper, but omits division-by-zero verification.",
+                 json.dumps([] if score >= 85 else ["The rerun omitted the division-by-zero check."]),
+                 "Illustrative rating (no LLM call)", created))
+
     def rerun(base, other=None, *, blocked="", score=95, quality="same"):
+        """`other` ran `base`'s own prompt again, as reruns do: never another text."""
+        assert other is None or other.text == base.text, "a rerun sends the same prompt"
         sid = other.session_id if other else PREFIX + "blocked-rerun:session"
         conn.execute("INSERT INTO replays(session_id,prompt_id,model,effort,launched_at,mode,status,result,denials,ended_at,skills,permission,auto_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, base.id, "codex:gpt-6.1-sol", "medium", (other or base).started_at, "background",
@@ -72,11 +82,7 @@ def add_examples(conn):
              json.dumps({"denied": [], "blocked": blocked}), (other or base).ended_at, "[]", "ask", 0))
         if other:
             conn.execute("INSERT OR IGNORE INTO tags(prompt_id,tag,auto) VALUES(?,?,1)", (other.id, "rerun"))
-            conn.execute("INSERT INTO run_ratings(base_id,other_id,status,score,verdict,quality,look,summary,differences,model,rated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (base.id, other.id, "done", score, "equivalent" if score >= 85 else "major", quality, int(score < 85),
-                 "Illustrative verdict: equivalent coverage of the required cases with less work." if score >= 85 else "Illustrative verdict: cheaper, but omits division-by-zero verification.",
-                 json.dumps([] if score >= 85 else ["The rerun omitted the division-by-zero check."]),
-                 "Illustrative rating (no LLM call)", created))
+            rate(base, other, score=score, quality=quality)
 
     with conn:
         broad = add("broad-prompt", "Fix the calculator bug. Explore the project and improve the tests.",
@@ -85,7 +91,8 @@ def add_examples(conn):
         focused = add("focused-prompt", "Fix divide(a, b) in example/calculator.py. Return a / b; test positive and negative numbers and division by zero. Limit changes to the calculator and its tests.",
             "Fixed divide(a, b). Tests cover positive numbers, negative numbers, and division by zero.",
             "example:prompt-tuning", codex=True, day=2, duration=18, inputs=3000, outputs=500)
-        rerun(broad, focused)
+        # two different prompts: compared through their tag's reference run, not as a rerun
+        rate(broad, focused)
         add("cache-cold", "Summarize the calculator module and list its public functions.", "Public functions: add, subtract, multiply, divide. No files changed.", "example:cache", day=2, inputs=12000, duration=25)
         add("cache-warm", "Summarize the calculator module and list its public functions.", "Public functions: add, subtract, multiply, divide. No files changed.", "example:cache", day=1, inputs=1000, cached=11000, duration=9)
         old = add("review-skill-v1", "Review divide(a, b) using the example-review skill.", "Checked normal arithmetic and negative inputs; division by zero is covered.",

@@ -7,3 +7,5 @@ from rerunly.config import DEFAULT_SETTINGS
 def isolate_codex_history(monkeypatch, tmp_path):
     monkeypatch.setitem(DEFAULT_SETTINGS, "codex_sessions_dir", str(tmp_path / "no-local-codex"))
     monkeypatch.setitem(DEFAULT_SETTINGS, "auto_price_lookup", False)
+    from rerunly import statusline
+    monkeypatch.setattr(statusline, "DIR", tmp_path / "rerunly-data")

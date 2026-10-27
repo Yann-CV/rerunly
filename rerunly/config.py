@@ -46,4 +46,6 @@ DEFAULT_SETTINGS = {
     "excluded_tags": [],
     # the model rating how much a rerun's output differs from its original ("" = Claude Code's default)
     "judge_model": "claude-haiku-5-5",
+    # its effort level ("" = the model's default)
+    "judge_effort": "",
 }

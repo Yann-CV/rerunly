@@ -6,6 +6,10 @@ let charts = [];
 // ---- helpers ---------------------------------------------------------------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const promptPreview = (text) => {
+  const opening = String(text ?? "").replace(/\s+/g, " ").trim();
+  return opening.length > 140 ? `${opening.slice(0, 140).trimEnd()}…` : opening;
+};
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
 // bumped on every navigation: a page still loading when the user moves on must not draw over the next one
@@ -14,9 +18,13 @@ class StaleNavigation extends Error {}
 // requests started by a page's own handlers (typing, timers) can also outlive it: nothing to report
 addEventListener("unhandledrejection", (e) => { if (e.reason instanceof StaleNavigation) e.preventDefault(); });
 
+// the example app is the same page served under /examples/, over its own illustrative records
+const EXAMPLES = location.pathname.startsWith("/examples");
+const BASE = EXAMPLES ? "/examples" : "";
+
 async function api(path, opts = {}) {
   const started = navigation;
-  const res = await fetch(path, {
+  const res = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
     ...opts,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -110,20 +118,36 @@ const ruleColor = (i) => `var(--rule-${i % RULE_COLORS})`;
 
 // skills seen in the history (their AI tags), offered by skill rules; set by the tag pages
 let ruleSkills = [];
+let ruleTags = [];
+let ruleTagKinds = new Map();
+const RULE_TAG_CATEGORIES = [["human", "Your tags"], ["project", "Projects"], ["model", "Models"], ["skill", "Skills"], ["agent", "Agents"], ["persona", "Personas"], ["cmd", "Commands"], ["ai", "Other"]];
+const ruleTagCategory = (tag) => ruleTagKinds.get(tag) === "human" ? "human"
+  : RULE_TAG_CATEGORIES.some(([cat]) => cat === tag.split(":")[0]) ? tag.split(":")[0] : "ai";
 const skillsFromTags = (tags) => tags.filter((t) => t.kind === "ai" && t.tag.startsWith("skill:")).map((t) => t.tag.slice("skill:".length)).sort();
 
-/** One rule: a keyword alone or several together (all or any), or a skill the agent used; in prompts or sessions. */
+/** One rule: match keywords, or include/exclude prompts carrying any chosen tag. */
 function ruleRowHtml(i, r = {}) {
   const opt = (value, label, current) => `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
-  const kind = r.skill ? "skill" : "keywords";
-  // a rule's skill stays offered even when it was not used lately
-  const skills = r.skill && !ruleSkills.includes(r.skill) ? [r.skill, ...ruleSkills] : ruleSkills;
+  const kind = r.preferred_tag ? "exclude" : r.include_tag || r.skill ? "include" : r.exclude ? "exclude_keywords" : "keywords";
+  const selected = r.preferred_tag || r.include_tag || (r.skill ? `skill:${r.skill}` : "");
+  const offeredTags = selected && !ruleTags.includes(selected) ? [selected, ...ruleTags] : ruleTags;
   return `<div class="rule-row" data-rule-row data-kind="${kind}" style="--rule-color:${ruleColor(i)}">
     <span class="rule-dot" aria-hidden="true"></span>
-    <select class="rr-kind" aria-label="Rule type" title="Match keywords in the text, or a skill the agent used">
-      ${opt("keywords", "Keywords", kind)}${opt("skill", "Skill", kind)}</select>
-    <select class="rr-skill" aria-label="Skill" title="Prompts where the agent used this skill">
-      ${skills.length ? skills.map((sk) => opt(sk, sk, r.skill)).join("") : '<option value="">no skill used yet</option>'}</select>
+    <select class="rr-kind" aria-label="Rule type" title="Match keywords, or include/exclude prompts by tag">
+      ${opt("keywords", "Include keywords", kind)}${opt("exclude_keywords", "Exclude keywords", kind)}${opt("include", "Include tag", kind)}${opt("exclude", "Exclude tag", kind)}</select>
+    <div class="rr-priority">
+      <input type="hidden" class="rr-priority-value" value="${esc(selected)}">
+      <div class="rr-tag-categories" role="group" aria-label="Filter tags by category">
+        <button type="button" class="chip" data-rule-category="all" aria-pressed="true">All tags</button>
+        ${RULE_TAG_CATEGORIES.filter(([cat]) => ruleTags.some((tag) => ruleTagCategory(tag) === cat)).map(([cat, label]) => `<button type="button" class="chip" data-rule-category="${cat}" aria-pressed="false">${label}</button>`).join("")}
+      </div>
+      <input type="search" class="rr-priority-search" aria-label="Search tags taking priority" placeholder="Search tags…" autocomplete="off">
+      <p class="rr-priority-selected" aria-live="polite">${selected ? `Selected: ${esc(selected)}` : "Choose a tag below"}</p>
+      <div class="rr-priority-options" role="group" aria-label="Choose a tag taking priority">
+        ${offeredTags.map((tag) => `<button type="button" class="chip cat-${esc(tagCategory({ tag, kind: ruleTagKinds.get(tag) }))}" data-priority-tag="${esc(tag)}" aria-pressed="${tag === selected}">${esc(tag)}</button>`).join("")}
+      </div>
+      <p class="rr-priority-empty muted" ${ruleTags.length ? "hidden" : ""}>No matching tags.</p>
+    </div>
     <input class="rr-keywords" value="${esc((r.keywords || []).join(", "))}" aria-label="Keywords of rule ${i + 1}"
       placeholder="a keyword, or several separated by commas: review, branch" title="Separate keywords with commas; words separated by spaces form one phrase. Case does not matter.">
     <select class="rr-match" aria-label="Match" title="With several keywords: all of them together, or any of them (saved as one rule per keyword)">
@@ -136,9 +160,12 @@ function ruleRowHtml(i, r = {}) {
 }
 
 function readRuleRow(row) {
-  if (row.dataset.kind === "skill") return { skill: row.querySelector(".rr-skill").value, scope: row.querySelector(".rr-scope").value };
+  const selected = row.querySelector(".rr-priority-value").value;
+  if (row.dataset.kind === "exclude") return { preferred_tag: selected };
+  if (row.dataset.kind === "include") return { include_tag: selected, scope: row.querySelector(".rr-scope").value };
   return {
     keywords: row.querySelector(".rr-keywords").value.split(",").map((k) => k.trim()).filter(Boolean),
+    ...(row.dataset.kind === "exclude_keywords" ? { exclude: true } : {}),
     match: row.querySelector(".rr-match").value,
     scope: row.querySelector(".rr-scope").value,
   };
@@ -146,19 +173,56 @@ function readRuleRow(row) {
 
 /** Live match count of a row. */
 function bindRuleRow(row) {
+  const search = row.querySelector(".rr-priority-search");
+  const choices = [...row.querySelectorAll("[data-priority-tag]")];
+  const categories = [...row.querySelectorAll("[data-rule-category]")];
+  let category = "all";
+  const filterChoices = () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    choices.forEach((button) => {
+      button.hidden = (category !== "all" && ruleTagCategory(button.dataset.priorityTag) !== category)
+        || !button.dataset.priorityTag.toLocaleLowerCase().includes(query);
+    });
+    row.querySelector(".rr-priority-empty").hidden = choices.some((button) => !button.hidden);
+    search.placeholder = "Search tags…";
+    search.setAttribute("aria-label", "Search tags to include or exclude");
+    row.querySelector(".rr-priority-options").setAttribute("aria-label", "Choose a tag to include or exclude");
+  };
+  search.addEventListener("input", filterChoices);
+  row.querySelector(".rr-tag-categories").addEventListener("click", (e) => {
+    const button = e.target.closest("[data-rule-category]");
+    if (!button) return;
+    category = button.dataset.ruleCategory;
+    categories.forEach((choice) => choice.setAttribute("aria-pressed", String(choice === button)));
+    filterChoices();
+  });
+  row.querySelector(".rr-priority-options").addEventListener("click", (e) => {
+    const button = e.target.closest("[data-priority-tag]");
+    if (!button) return;
+    row.querySelector(".rr-priority-value").value = button.dataset.priorityTag;
+    row.querySelector(".rr-priority-selected").textContent = `Selected: ${button.dataset.priorityTag}`;
+    choices.forEach((choice) => choice.setAttribute("aria-pressed", String(choice === button)));
+    row.dispatchEvent(new Event("change", { bubbles: true }));
+  });
   let timer;
   const update = () => {
     row.dataset.kind = row.querySelector(".rr-kind").value;
+    filterChoices();
     const { keywords = [], match, scope, skill } = readRuleRow(row);
     clearTimeout(timer);
     const out = row.querySelector(".rr-preview");
+    if (["include", "exclude"].includes(row.dataset.kind)) {
+      out.textContent = row.dataset.kind === "exclude" ? "Exclude prompts carrying the selected tag. Exclusions take priority over inclusion rules."
+        : row.querySelector(".rr-scope").value === "session" ? "Include every prompt in a session carrying the selected tag." : "Include prompts carrying the selected tag.";
+      return;
+    }
     if (!keywords.length && !skill) { out.textContent = ""; return; }
     timer = setTimeout(async () => {
       const query = skill ? { skill, scope } : { keywords: keywords.join(","), match, scope };
       const r = await api(`/api/rules/preview?${new URLSearchParams(query)}`);
       // "any" of several keywords is saved as one rule per keyword (the server splits it)
       const split = match === "any" && keywords.length > 1 ? ` · saved as ${keywords.length} rules, one per keyword` : "";
-      out.textContent = `${r.matches} ${scope}${r.matches === 1 ? "" : "s"}${split}`;
+      out.textContent = `${r.matches} ${scope}${r.matches === 1 ? "" : "s"} ${row.dataset.kind === "exclude_keywords" ? "matched for exclusion" : "matched for inclusion"}${split}`;
     }, 250);
   };
   row.addEventListener("input", update);
@@ -171,7 +235,6 @@ function bindRulesEditor(box, addButton) {
   const recolor = () => [...box.children].forEach((row, i) => {
     row.style.setProperty("--rule-color", ruleColor(i));
     row.querySelector(".rr-keywords").setAttribute("aria-label", `Keywords of rule ${i + 1}`);
-    row.querySelector("[data-remove-row]").hidden = box.children.length === 1;
   });
   const add = (focus) => {
     box.insertAdjacentHTML("beforeend", ruleRowHtml(box.children.length));
@@ -181,16 +244,26 @@ function bindRulesEditor(box, addButton) {
   };
   box.addEventListener("click", (e) => {
     const remove = e.target.closest("[data-remove-row]");
-    if (remove) { remove.closest("[data-rule-row]").remove(); recolor(); }
+    if (remove) {
+      const row = remove.closest("[data-rule-row]");
+      const next = row.nextElementSibling || row.previousElementSibling;
+      row.remove();
+      recolor();
+      (next?.querySelector("[data-remove-row]") || addButton).focus();
+    }
   });
   addButton.onclick = () => add(true);
   return {
     reset: () => { box.innerHTML = ""; add(false); },
-    read: () => [...box.children].map(readRuleRow).filter((r) => r.skill || r.keywords.length),
+    read: () => [...box.children].map(readRuleRow).filter((r) => r.include_tag || r.preferred_tag || r.skill || r.keywords?.length),
   };
 }
 
 function ruleText(r) {
+  if (r.exclude) return `Exclude ${r.scope === "session" ? "sessions" : "prompts"} matching ${r.keywords.map((k) => `<code>${esc(k)}</code>`).join(r.match === "any" ? " or " : " and ")}`;
+  if (r.include_tag) return `Include ${r.scope === "session" ? "sessions" : "prompts"} tagged <code>${esc(r.include_tag)}</code>`;
+  if (r.preferred_tag?.startsWith("skill:")) return `Exclude skill <code>${esc(r.preferred_tag.slice(6))}</code>`;
+  if (r.preferred_tag) return `Excluded when tagged <code>${esc(r.preferred_tag)}</code>`;
   if (r.skill) {
     const where = r.scope === "session" ? "sessions using skill" : "uses skill";
     return `<span class="rule-scope" title="${r.scope === "session" ? "Every prompt of a session where the agent used it" : "Prompts where the agent used it"}">${where}</span> <code>${esc(r.skill)}</code>`;
@@ -577,18 +650,27 @@ function promptRow(p, maxCost, { compact = false } = {}) {
   const isRef = Boolean(ref && ref.id === p.id);
   const starHtml = listState.lockTag && !compact
     ? `<button type="button" class="pref" data-ref="${esc(p.id)}" aria-pressed="${isRef}" title="${isRef ? "The reference run: click to clear it" : "Make this run the reference every other run is compared with"}">${isRef ? "★" : "☆"}</button>` : "";
+  const actionsHtml = listState.lockTag && !compact ? `<details class="pop prompt-actions">
+    <summary class="pill" aria-label="Actions for this prompt">Actions <span class="caret-d">▾</span></summary>
+    <div class="pop-panel">
+      <a class="menu-item" target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}">Open prompt</a>
+      <button type="button" class="menu-item" data-ref="${esc(p.id)}">${isRef ? "Clear reference" : "Set as reference"}</button>
+      <button type="button" class="menu-item" data-queue-prompt="${esc(p.id)}">Queue rerun</button>
+      ${listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button class="menu-item" type="button" data-exclude="${esc(p.id)}" ${isRef ? 'disabled title="Clear the reference before excluding this prompt"' : ""}>Exclude from tag</button>` : ""}
+      <span class="prompt-action-status muted" role="status"></span>
+    </div></details>` : "";
   return `<article class="prow ${compact ? "compact" : ""} ${picked ? "selected" : ""}" data-id="${esc(p.id)}">
     ${selectable ? `<div class="pwhen"><input type="checkbox" class="psel" data-select="${esc(p.id)}" ${picked ? "checked" : ""}
       aria-label="Select this prompt">${timeHtml}</div>` : timeHtml}
     <div class="pbody">
-      <a class="plink" href="#/prompt/${encodeURIComponent(p.id)}">${p.command ? `<span class="pcmd">/${esc(p.command)}</span> ` : ""}${esc(p.command ? p.text.replace(/^\/\S+\s*/, "") : p.text)}</a>
+      <a class="plink" target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}">${p.command ? `<span class="pcmd">/${esc(p.command)}</span> ` : ""}${esc(p.command ? p.text.replace(/^\/\S+\s*/, "") : p.text)}</a>
       ${compact ? "" : `<div class="pchips">${p.project ? `<span class="pproject">${esc(p.project)}</span>` : ""}${rowChips((p.tags || []).filter((t) => tagCategory(t) !== "project"))}</div>`}
     </div>
     <div class="pmetrics">
       <span class="pcost-line">${starHtml}<span class="pcost">${fmtCost(p.total_cost_usd)}</span></span>
       <span class="cost-bar" title="Cost relative to the most expensive prompt shown"><i style="width:${pct}%"></i></span>
       <span class="pmeta">${meta}</span>
-      ${listState.lockTag && !compact && listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button class="link-btn" type="button" data-untag="${esc(p.id)}">Remove from tag</button>` : ""}
+      ${actionsHtml}
       ${ref && !isRef ? refDelta(p.total_cost_usd, ref.total_cost_usd) : isRef ? '<span class="pdelta ref-badge">◆ Reference</span>' : ""}
     </div>
   </article>`;
@@ -688,7 +770,7 @@ function groupedPromptsHtml(items, maxCost) {
 
 /** The latest run inside a tag card: its text and cost; the whole block opens the prompt. */
 function latestRun(p) {
-  return `<a class="latest-run" href="#/prompt/${encodeURIComponent(p.id)}" title="Open the latest run">
+  return `<a class="latest-run" target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}" title="Open the latest run">
     <span class="latest-head"><span>Latest · <time datetime="${esc(p.started_at)}" title="${esc(fmtDate(p.started_at))}">${fmtAgo(p.started_at)}</time></span><strong>${fmtCost(p.total_cost_usd)}</strong></span>
     <span class="latest-text">${p.command ? `<span class="pcmd">/${esc(p.command)}</span> ` : ""}${esc(p.command ? p.text.replace(/^\/\S+\s*/, "") : p.text)}</span>
     <span class="pmeta">${fmtTokens(p.total_tokens)} tok · ${fmtMs(duration(p))}</span></a>`;
@@ -846,7 +928,7 @@ function selectBarHtml() {
     ${listState.lockTag && listState.reference ? `<button type="button" class="btn" data-queue-selected="reference" ${n ? "" : "disabled"}
       title="Rerun them with the reference run's model, effort and Claude Code release">↻ … with the reference's settings</button>` : ""}
     <button type="button" class="btn primary" data-new-tag ${n ? "" : "disabled"}>Tag ${n || ""} selected…</button>
-    ${listState.lockTag && listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button type="button" class="btn" data-untag-selected ${n ? "" : "disabled"}>Remove selected from tag</button>` : ""}
+    ${listState.lockTag && listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button type="button" class="btn" data-exclude-selected ${n ? "" : "disabled"}>Exclude selected from tag</button>` : ""}
     <button type="button" class="btn" data-toggle-select>Done</button>
   </div>`;
 }
@@ -892,7 +974,7 @@ function bindPromptResults() {
   renderSelectBar();
   // while selecting, a click on a row (its checkbox included) selects it instead of opening it
   results.onclick = (e) => {
-    if (e.target.closest("[data-ref], [data-untag]")) return; // the reference star and Remove from tag: handled by the page
+    if (e.target.closest("[data-ref], .prompt-actions")) return;
     if (!listState.selecting || e.target.closest("[data-filter-tag]")) return;
     const row = e.target.closest(".prow[data-id]");
     if (!row || !row.querySelector(".psel")) return;
@@ -1076,7 +1158,7 @@ function skillOrigin(k) {
 function rerunCommand(p) {
   const r = p.rerun, model = r.requested_model || Object.keys(p.models || {})[0] || "";
   const lines = [];
-  if (r.cwd) lines.push(`cd ${shellQuote(r.cwd)}`);
+  if (r.cwd) lines.push(`cd ${shellQuote(r.cwd)} || exit 1`);
   const undo = [];
   for (const k of r.skills) {
     if (k.origin === "git" && k.git_state === "committed") {
@@ -1090,7 +1172,8 @@ function rerunCommand(p) {
     }
   }
   const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${r.harness_version}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""} ${shellQuote(p.text)}`);
+  const permissions = (r.permission_args || []).map(shellQuote).join(" ");
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""}${permissions ? ` ${permissions}` : ""} ${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }
@@ -1124,7 +1207,7 @@ function replayHtml(p, models, defaultJudge = "") {
   }).join("");
   return `<div class="replay">
     <div class="replay-head"><strong>Rerun with ${esc(r.harness || "Claude Code")}</strong>
-      <span class="muted">In <code>${esc(r.cwd || "your home folder")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}.
+      <span class="muted">In <code>${esc(r.cwd || "directory not recorded")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}. Permissions default to those recorded for this run.
         <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
         <strong>In a terminal</strong>: you watch it and approve its actions.
         ${p.references.length ? "<em>Settings from</em> copies a reference run's model, effort and release." : ""}</span></div>
@@ -1135,13 +1218,17 @@ function replayHtml(p, models, defaultJudge = "") {
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
       <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
       <label title="Through npx for a release other than the installed one">${esc(r.harness || "Claude Code")} <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
-      <label>Run <select id="replay-mode">${opt("background", "Unattended, in the background", "background")}${opt("terminal", "In a terminal window", "")}</select></label>
-      <label class="bg-only" title="Anything else it tries is denied, and reported">May <select id="replay-permission">${opt("ask", "only read", "ask")}${opt("edits", "read and edit files", "")}</select></label>
+      <label>Run <select id="replay-mode">${opt("terminal", "In a terminal window", "terminal")}${opt("background", "Unattended, in the background", "terminal")}</select></label>
+      <label title="Restore recorded permissions, or explicitly override them">Permissions <select id="replay-permission">${opt("same", "Same as original", "same")}${opt("ask", "Read-only when unattended", "same")}${opt("edits", "Allow file edits", "same")}</select></label>
       <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${isCodex ? "" : budget}" size="5" ${isCodex ? "disabled" : ""}></label>
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
       <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
         <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${opt("", `default (${defaultJudge || "Claude Code's"})`, "")}${[...new Set([same, ...models])].filter(Boolean).map((m) => opt(m, m, "")).join("")}</select></label>
+      <section class="replay-impact" aria-label="Selected agent usage impact">
+        <div class="replay-impact-head"><strong>Rerun consumption & reset limits</strong><button class="btn" type="button" id="refresh-replay-impact">Refresh usage</button></div>
+        <div id="replay-impact-content" aria-live="polite"><p class="muted">Loading the selected agent's usage…</p></div>
+      </section>
       <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
         <button class="btn primary">↻ Rerun now</button></span>
     </form>`}
@@ -1156,6 +1243,8 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
   const models = Object.keys(p.models || {}).map((m) => m.replace("claude-", ""));
   const rows = [
     ["Agent", r.harness ? `${esc(r.harness)}${r.harness_version ? ` <code>${esc(r.harness_version)}</code>` : ""}` : '<span class="muted">unknown</span>'],
+    ["Directory", r.cwd ? `<code>${esc(r.cwd)}</code>` : '<span class="muted">not recorded</span>'],
+    ["Permissions", Object.keys(r.permissions || {}).length ? `<code>${esc(JSON.stringify(r.permissions))}</code>` : '<span class="muted">not recorded; re-import history or choose explicit permissions</span>'],
     ["Model", `${r.requested_model ? `<code>${esc(r.requested_model)}</code>` : ""}${models.length ? ` <span class="muted">answered by ${esc(models.join(", "))}</span>` : ""}${r.effort ? ` · effort ${esc(r.effort)}` : ""}`],
     ...r.skills.map((k) => [`Skill`, `<strong>${esc(k.skill)}</strong>${k.args ? ` <span class="muted">with “${esc(k.args.slice(0, 80))}${k.args.length > 80 ? "…" : ""}”</span>` : ""}
       <div class="skill-origin">${skillOrigin(k)}</div>
@@ -1163,7 +1252,7 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
         <button type="button" class="link-btn" data-download-skill="${esc(k.hash)}">Download SKILL.md</button>
         <span class="muted" title="Hash of the instructions as loaded">#${esc(k.hash.slice(0, 7))}</span></div>`]),
   ];
-  const command = p.source !== "rerunly-examples" && ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
+  const command = p.source !== "rerunly-examples" && r.cwd && r.permission_args && ["Claude Code", "Codex"].includes(r.harness) ? rerunCommand(p) : "";
   return `<h2 class="page-sec">Run it again</h2>
     <div class="card rerun">
       <dl class="rerun-list">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
@@ -1186,17 +1275,48 @@ function bindRerun(p) {
     rate: document.getElementById("replay-rate").checked, judge_model: document.getElementById("replay-judge").value,
   });
   const modelSelect = document.getElementById("replay-model");
+  const impactBox = document.getElementById("replay-impact-content");
+  let impactRequest = 0, impactTimer;
+  const updateImpact = async () => {
+    if (!impactBox?.isConnected || !modelSelect) return;
+    const request = ++impactRequest;
+    clearTimeout(impactTimer);
+    impactBox.innerHTML = '<p class="muted">Loading the selected agent’s usage…</p>';
+    try {
+      const data = await api(`/api/prompts/${encodeURIComponent(p.id)}/rerun-estimate?${new URLSearchParams({ model: modelSelect.value })}`);
+      if (!impactBox.isConnected || request !== impactRequest) return;
+      const estimate = data.estimate;
+      const reached = data.limits?.windows.some((w) => w.used_percent >= 100);
+      impactBox.innerHTML = `<div class="replay-impact-estimate"><strong>${esc(data.agent)}</strong>
+        ${estimate ? `<span>Estimated additional usage: <strong>≈ ${fmtTokens(estimate.total_tokens)} tokens</strong> · <strong>${estimate.cost_usd == null ? "Cost unavailable" : `≈ ${fmtCost(estimate.cost_usd)}`}</strong> · time baseline ${fmtMs(estimate.duration_ms)}</span>` : '<span>Consumption estimate unavailable.</span>'}</div>
+        ${reached ? '<p class="status-warn">A reported usage limit is reached. Check its reset time below.</p>' : ""}
+        <div class="replay-impact-limits">${data.limits ? homeLimits([data.limits]) : `<p class="muted">No usage report for ${esc(data.agent)}. Check its connection in <a href="#/setup">Setup</a>.</p>`}</div>
+        <p class="muted replay-impact-note">Usage and reset times are the latest reported values. Additional subscription percentage cannot be predicted from these reports. Token and API-cost estimates reuse original usage with a cold cache; actual usage varies. Judge calls are extra. Refreshes every minute.</p>`;
+    } catch (error) {
+      if (!(error instanceof StaleNavigation) && impactBox.isConnected && request === impactRequest) {
+        impactBox.innerHTML = `<p class="muted">Could not load usage impact: ${esc(error.message)}. Use Refresh usage to retry.</p>`;
+      }
+    } finally {
+      if (impactBox.isConnected && request === impactRequest) impactTimer = setTimeout(updateImpact, 60000);
+    }
+  };
+  document.getElementById("refresh-replay-impact")?.addEventListener("click", updateImpact);
   const updateHarness = () => {
     const selected = modelSelect.value;
-    const codex = selected.startsWith("codex:") || (!selected && p.rerun.harness === "Codex");
+    const codex = selected.startsWith("codex:") || (selected.startsWith("gpt-") && !selected.startsWith("gpt-oss")) || (!selected && p.rerun.harness === "Codex");
     const budget = document.getElementById("replay-budget");
     budget.disabled = codex;
     if (codex) budget.value = "";
+    updateImpact();
   };
   if (modelSelect) modelSelect.onchange = updateHarness;
+  updateImpact();
   // permission and budget only apply to unattended reruns
   const mode = document.getElementById("replay-mode");
-  if (mode) mode.onchange = () => form.querySelectorAll(".bg-only").forEach((el) => { el.hidden = mode.value !== "background"; });
+  if (mode) {
+    mode.onchange = () => form.querySelectorAll(".bg-only").forEach((el) => { el.hidden = mode.value !== "background"; });
+    mode.onchange();
+  }
   // a reference run's settings, copied into the menus (still editable)
   const from = document.getElementById("replay-from");
   if (from) from.onchange = () => {
@@ -1233,6 +1353,7 @@ function bindRerun(p) {
           ? `Claude Code opened in a new terminal window.${skills} Once it answers, the rerun shows up here (press Refresh).`
           : `No terminal window could be opened from here. Run this in a terminal: the rerun is linked to this prompt once imported.<pre><code>${esc(out.command)}</code></pre>`;
       status.hidden = false;
+      updateImpact();
       if (out.mode === "background" || out.terminal) setTimeout(() => route(), 1500);
     } catch (err) {
       status.textContent = err.message; status.hidden = false;
@@ -1382,15 +1503,55 @@ function compareOriginalHtml(p, models, defaultJudge) {
 function rerunOfHtml(p) {
   const o = p.replay_of;
   const original = o.id
-    ? `<a href="#/prompt/${encodeURIComponent(o.id)}">the run of ${esc(fmtDate(o.started_at))}</a> (${fmtCost(o.total_cost_usd)})`
+    ? `<a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(o.id)}">the run of ${esc(fmtDate(o.started_at))}</a> (${fmtCost(o.total_cost_usd)})`
     : "a prompt no longer in the history";
   return `<div class="rerun-of">
     <span class="ref-label">↻ Rerun</span>
     ${rerunStatusHtml(o)}${o.first ? judgeBadge(o.rating) : ""}
     <span>${o.first ? `Rerun of ${original} ${o.id ? refDelta(p.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}` : `Follow-up in the rerun of ${original}`}</span>
-    <span class="rerun-config"><span class="muted">launched ${esc(fmtDate(o.launched_at))} with</span> ${rerunSettings(o)}</span>
+    <a class="link-btn" href="#rerun-setup" data-jump="rerun-setup">Initial run and settings</a>
     <a class="link-btn" href="#/tag/rerun">All reruns</a>
   </div>`;
+}
+
+/** On a rerun's page: the initial run, the settings chosen to rerun it ("same" spelled out as the initial run's
+    value), and what the rerun actually ran with when it differs from what was asked. */
+function rerunSetupHtml(p) {
+  const o = p.replay_of, ran = p.rerun || {};
+  const dash = '<span class="muted">–</span>';
+  const val = (v) => (v ? esc(v) : dash);
+  const agent = (h, v) => (h ? esc(`${h}${v ? ` ${v}` : ""}`) : dash);
+  const model = (v) => (v ? esc(v.replace(/^codex:/, "")) : "");
+  const initialModel = o.original_model || (o.original_models || []).join(", ");
+  const skillList = (list, part) => list.length ? list.map((k) => `<span class="rr-chip">${esc(`${k.skill.split(":").pop()} @ ${part(k)}`)}</span>`).join("") : dash;
+  // the rerun's value: what was asked, then what ran when that says more ("same" resolved, a default made explicit)
+  const both = (asked, actual) => (actual && actual !== asked.text ? `${asked.html}<span class="muted"> → ran ${esc(actual)}</span>` : asked.html);
+  const same = (v, initial, fallback = "default") => (v ? { text: v, html: esc(v) } : { text: initial, html: `same <span class="muted">(${esc(initial || fallback)})</span>` });
+  const release = o.harness_version ? { text: o.harness_version, html: esc(o.harness_version) } : { text: "", html: '<span class="muted">(installed release)</span>' };
+  const rows = [
+    ["When", o.id ? `<a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(o.id)}">${esc(fmtDate(o.started_at))}</a>` : dash,
+      `launched ${esc(fmtDate(o.launched_at))}`],
+    ["Agent", agent(o.original_harness, o.original_harness_version),
+      both({ ...release, html: `${esc(ran.harness || o.original_harness || "")} ${release.html}` }, ran.harness_version)],
+    ["Model", val(model(initialModel)), both(same(model(o.model), model(initialModel), "the agent's default"), model(ran.requested_model))],
+    ["Effort", val(o.original_effort), both(same(o.effort, o.original_effort), ran.effort)],
+    ["Skills", skillList(o.original_skills || [], (k) => k.hash.slice(0, 7)),
+      (o.skills || []).length ? skillList(o.skills, (k) => k.source) : skillList(ran.skills || [], (k) => k.hash.slice(0, 7))],
+    ["How it ran", "by you", o.mode === "terminal" ? "in a terminal" : "unattended"],
+    ["Permissions", "as you granted them", o.permission === "edits" ? "may edit files" : o.permission === "ask" ? (o.mode === "terminal" ? "ask for approval" : "read-only")
+      : "the initial run's"],
+    ["Budget", dash, o.budget_usd ? `up to ${fmtCost(o.budget_usd)}` : "no cap"],
+    ["Cost", o.id ? fmtCost(o.total_cost_usd) : dash, `${fmtCost(p.total_cost_usd)} ${o.id && o.first ? refDelta(p.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}`],
+  ];
+  return `<h2 class="page-sec" id="rerun-setup">Initial run and rerun settings</h2>
+    <div class="card rerun-setup">
+      ${o.id ? `<p class="muted">Same prompt as the initial run${o.original_project ? `, in ${esc(o.original_project)}` : ""}. “Same” settings repeat the initial run's value, shown in brackets.</p>`
+        : '<p class="muted">The initial run is no longer in the history (excluded on the Setup page): only the rerun settings are known.</p>'}
+      <div class="table-wrap"><table>
+        <thead><tr><th scope="col">Setting</th><th scope="col">Initial run</th><th scope="col">This rerun</th></tr></thead>
+        <tbody>${rows.map(([label, initial, rerun]) => `<tr><th scope="row">${label}</th><td>${initial}</td><td>${rerun}</td></tr>`).join("")}</tbody>
+      </table></div>
+    </div>`;
 }
 
 // how a prompt page splits its history ("" or a SPLITS key): kept while moving from prompt to prompt
@@ -1466,6 +1627,7 @@ async function viewPrompt(id, compare = {}) {
         <div><span class="tag-kind">AI tags</span>${tagChips(aiTags(p.tags)) || '<span class="muted">none</span>'}</div>
       </div>
     </header>
+    ${p.replay_of ? rerunSetupHtml(p) : ""}
     <nav class="page-cards link-cards" aria-label="Related pages">${links}</nav>
     ${unpriced}
     <div class="tags-hero prompt-facts">${facts.map(([label, value, sub, note]) => `<div class="hero-fact"><span class="label">${label}</span>
@@ -1489,7 +1651,7 @@ async function viewPrompt(id, compare = {}) {
     ${p.compare.tag ? `<p class="ref-hint">${p.compare.reference
       ? (p.compare.reference.id === p.id
         ? `◆ This run is the reference of <strong>${esc(p.compare.tag)}</strong>.`
-        : `◆ Reference of <strong>${esc(p.compare.tag)}</strong>: <a href="#/prompt/${encodeURIComponent(p.compare.reference.id)}">${esc(fmtDate(p.compare.reference.started_at))} · ${fmtCost(p.compare.reference.total_cost_usd)}</a>.`)
+        : `◆ Reference of <strong>${esc(p.compare.tag)}</strong>: <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.compare.reference.id)}">${esc(fmtDate(p.compare.reference.started_at))} · ${fmtCost(p.compare.reference.total_cost_usd)}</a>.`)
       : `<span class="muted"><strong>${esc(p.compare.tag)}</strong> has no reference run yet.</span>`}
       ${p.compare.reference?.id === p.id ? "" : `<button type="button" class="link-btn" id="make-reference">Make this run the reference</button>`}</p>` : ""}
     ${sim.length ? `<div class="compare-picker split-picker" role="group" aria-label="Split by"><span class="muted">One line per</span>
@@ -1503,11 +1665,11 @@ async function viewPrompt(id, compare = {}) {
     </div>
     ${tagDialogHtml({ forPrompts: true })}`;
   document.getElementById("compare").onchange = (e) => { location.hash = promptHash(JSON.parse(e.target.value)); };
-  // the hash routes pages: the compare card scrolls instead of navigating
-  app.querySelector('[data-jump="compare-sec"]').onclick = (e) => {
+  // the hash routes pages: jump links (the compare card, a rerun's settings) scroll instead of navigating
+  app.querySelectorAll(".prompt-page [data-jump]").forEach((a) => a.onclick = (e) => {
     e.preventDefault();
-    document.getElementById("compare-sec").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
-  };
+    document.getElementById(a.dataset.jump).scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  });
   // the charts: the history, as one line or one per model (skill, project, tag of yours) among it
   const drawCompare = () => {
     if (!sim.length) return;
@@ -1535,7 +1697,8 @@ async function viewPrompt(id, compare = {}) {
   bindRowClicks();
   document.querySelectorAll("[data-remove-tag]").forEach((b) => b.onclick = async () => {
     const tag = b.dataset.removeTag;
-    await api(`/api/prompts/${encodeURIComponent(p.id)}/tags/${encodeURIComponent(tag)}`, { method: "DELETE" });
+    try { await api(`/api/prompts/${encodeURIComponent(p.id)}/tags/${encodeURIComponent(tag)}`, { method: "DELETE" }); }
+    catch (error) { if (!(error instanceof StaleNavigation)) alert(error.message); return; }
     // the comparison based on the removed tag no longer applies
     const c = p.compare.tag === tag ? {} : p.compare;
     if (location.hash === promptHash(c)) route(); else location.hash = promptHash(c);
@@ -1819,7 +1982,7 @@ async function openTagPanel(tag) {
     </div>
     ${block.html}
     <h3 class="subtype">Latest prompts</h3>
-    <ul class="recent-prompts">${recent.map((r) => `<li><a href="#/prompt/${encodeURIComponent(r.id)}">
+    <ul class="recent-prompts">${recent.map((r) => `<li><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(r.id)}">
       <span class="when">${fmtDate(r.started_at)}</span><span class="text">${esc(r.text)}</span>
       <span class="cost">${fmtCost(r.total_cost_usd)}</span></a></li>`).join("")}</ul>`;
   block.mount();
@@ -1854,8 +2017,8 @@ function tagDialogHtml({ forPrompts = false } = {}) {
           <div class="field"><span>Rules <em>optional</em></span>
             <div class="rules-editor" id="nt-rules"></div>
             <button type="button" class="link-btn add-rule-row" id="nt-add-rule">+ Add a rule</button>
-            <small>A rule is one keyword, or several together (“any of them” becomes one rule per keyword), or a <strong>skill</strong> the agent used.
-              Every prompt, past and future, matching <strong>any</strong> rule gets the tag. “In a session” tags every prompt of a session whose title or prompts match.
+            <small>Choose <strong>Include keywords</strong> or <strong>Exclude keywords</strong> to match text, or <strong>Include tag</strong> or <strong>Exclude tag</strong> to select any model, skill, project, agent, or tag of yours.
+              Include adds matching prompts; Exclude keeps them out and takes priority. Rules apply to existing and future prompts. “In a session” includes every prompt of a matching session.
               ${forPrompts ? "The chosen prompts get the tag either way." : "Without rules, add the tag to prompts by hand."}</small></div>
         </div>
         <p id="nt-error" class="status-warn" hidden></p>
@@ -1867,6 +2030,8 @@ function tagDialogHtml({ forPrompts = false } = {}) {
 /** Opens from any [data-new-tag] inside `page`. `tags`: every tag, to recognise yours. With `targets` (a function
     giving prompt ids), the chosen tag is given to those prompts; `exclude`: tags not offered; `title(n)`: the heading. */
 function bindTagDialog(page, { tags, targets = null, exclude = [], title = () => "New tag", done = null }) {
+  ruleTags = tags.map((t) => t.tag).sort();
+  ruleTagKinds = new Map(tags.map((t) => [t.tag, t.kind]));
   const dialog = document.getElementById("new-tag-dialog");
   const form = document.getElementById("new-tag-form");
   const name = document.getElementById("nt-name");
@@ -1980,7 +2145,20 @@ async function viewTags() {
   document.getElementById("tags-sort-select").onchange = (e) => { tagsState.sort = e.target.value; saveTagPrefs(); renderTagResults(); };
 }
 
-function tagHeadHtml(info, rules) {
+function tagRulesHtml(info, rules) {
+  return tagCategory(info) !== "human" ? "" : `<section class="rules-card" aria-labelledby="rules-title">
+      <div class="rules-head"><h2 id="rules-title">Tag rules</h2>
+        <span class="muted">Match keywords or skills to assign this tag, or give another tag priority to prevent assignment. Rules apply to existing and future prompts.</span></div>
+      ${rules.length ? `<div class="rule-chips">${rules.map((r, i) => `<span class="rule-chip" style="--rule-color:${ruleColor(i)}" data-rule-pos="${i}">
+        <button type="button" class="rule-edit" data-edit-rule="${i}" title="Change this rule"><span class="rule-dot" aria-hidden="true"></span>${ruleText(r)}</button>
+        <button type="button" class="rule-x" data-delete-rule="${r.index}" title="Remove this rule" aria-label="Remove this rule">✕</button></span>`).join("")}</div>` : ""}
+      <form id="rule-edit-form" class="rule-edit-form" hidden><div class="rules-editor"></div>
+        <div class="rule-edit-actions"><button class="btn primary">Save</button><button type="button" class="btn" data-cancel-rule>Cancel</button></div></form>
+      <button type="button" class="btn add-rule-btn" data-add-keywords>+ Add a rule</button>
+    </section>`;
+}
+
+function tagHeadHtml(info) {
   const cat = tagCategory(info);
   const [prefix, ...rest] = info.tag.split(":");
   const name = rest.length ? `<span class="tag-prefix">${esc(prefix)}:</span>${esc(rest.join(":"))}` : esc(info.tag);
@@ -1989,16 +2167,6 @@ function tagHeadHtml(info, rules) {
     `Created ${esc(fmtDate(info.created_at))}`,
     `last used <span title="${esc(fmtDate(info.last_used))}">${fmtAgo(info.last_used)}</span>`,
   ] : ["No prompt carries this tag yet"];
-  const rulesHtml = cat !== "human" ? "" : `<section class="rules-card" aria-labelledby="rules-title">
-      <div class="rules-head"><h2 id="rules-title">Auto-assign</h2>
-        <span class="muted">${rules.length ? "Every prompt (or session), past and future, matching one of these rules gets the tag:" : "No rule yet: only prompts you tagged by hand carry it."}</span></div>
-      ${rules.length ? `<div class="rule-chips">${rules.map((r, i) => `<span class="rule-chip" style="--rule-color:${ruleColor(i)}" data-rule-pos="${i}">
-        <button type="button" class="rule-edit" data-edit-rule="${i}" title="Change this rule"><span class="rule-dot" aria-hidden="true"></span>${ruleText(r)}</button>
-        <button type="button" class="rule-x" data-delete-rule="${r.index}" title="Stop assigning the tag with these keywords" aria-label="Remove this rule">✕</button></span>`).join("")}</div>` : ""}
-      <form id="rule-edit-form" class="rule-edit-form" hidden><div class="rules-editor"></div>
-        <div class="rule-edit-actions"><button class="btn primary">Save</button><button type="button" class="btn" data-cancel-rule>Cancel</button></div></form>
-      <button type="button" class="btn add-rule-btn" data-add-keywords>+ Add a rule</button>
-    </section>`;
   return `<header class="tag-head cat-${cat}">
       ${pageKicker("Tag", cat === "human"
         ? "Every run of this task: is it getting cheaper or faster? Select runs to regroup them under another tag."
@@ -2013,29 +2181,37 @@ function tagHeadHtml(info, rules) {
         : `<p class="tag-head-sub">${esc(help[0].toUpperCase() + help.slice(1))}</p>`}
       <div class="tag-head-meta">${meta.map((m) => `<span>${m}</span>`).join("")}
         ${cat === "human" ? '<button type="button" class="link-btn danger-link" id="delete-tag" title="Remove this tag from every prompt, with its rules">Delete tag</button>' : ""}</div>
-    </header>${rulesHtml}`;
+      <div id="tag-reference"></div>
+    </header>`;
 }
 
 function tagSummaryHtml(items, s) {
   const costs = [...items].reverse().map((p) => p.total_cost_usd || 0);
-  const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
-  return `<div class="tags-hero">
-    ${fact("Runs", s.count || 0, RANGES[listState.range][0].toLowerCase())}
-    ${fact("Total cost", fmtCost(s.cost_usd || 0), `${fmtTokens(s.tokens || 0)} tokens`)}
-    ${fact("Median cost", fmtCost(median(costs)), trendBadge(costs) || "per run")}
-    ${fact("Median time", fmtMs(median(items.map(duration))), "per run, active time")}
+  const fact = (label, value, sub = "", tone = "var(--accent)") => `<div class="tag-stat" style="--stat-color:${tone}"><dt>${label}</dt><dd class="tag-stat-value">${value}</dd><dd class="tag-stat-note">${sub}</dd></div>`;
+  return `<section class="tag-overview" aria-label="Tag summary">
+    <div class="tag-overview-head"><h2>At a glance</h2><span class="tag-overview-range">${esc(RANGES[listState.range][0])}</span></div>
+    <dl class="tag-stats">
+    ${fact("Runs", s.count || 0, "in this selection")}
+    ${fact("Total cost", fmtCost(s.cost_usd || 0), `${fmtTokens(s.tokens || 0)} tokens`, "var(--tag-model)")}
+    ${fact("Median cost", fmtCost(median(costs)), trendBadge(costs) || "per run", "var(--tag-skill)")}
+    ${fact("Median time", fmtMs(median(items.map(duration))), "per run, active time", "var(--tag-project)")}
     ${listState.reference ? fact("Median vs reference", refDelta(median(costs), listState.reference.total_cost_usd, { long: true }) || "–",
       `reference run ${fmtCost(listState.reference.total_cost_usd)}`) : ""}
-  </div>`;
+    </dl>
+  </section>`;
 }
 
 /** The tag's reference run, or how to pick one. */
 function referenceCardHtml() {
   const r = listState.reference;
   if (!r) return `<p class="ref-hint muted">No reference run yet: click ☆ on a run below to compare every other run with it.</p>`;
-  return `<div class="ref-card"><span class="ref-label">◆ Reference run</span>
-    <a class="ref-text" href="#/prompt/${encodeURIComponent(r.id)}">${esc(r.text)}</a>
-    <span class="pmeta">${fmtDate(r.started_at)} · ${fmtCost(r.total_cost_usd)} · ${fmtTokens(r.total_tokens)} tok · ${fmtMs(duration(r))}</span>
+  return `<div class="ref-card"><div class="ref-main"><span class="ref-label"><span class="ref-star" aria-hidden="true">★</span> Reference prompt</span>
+    <a class="ref-text" target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(r.id)}" title="${esc(r.text)}">${esc(r.text)}</a>
+    <span class="pmeta ref-metadata">${fmtDate(r.started_at)} · ${fmtTokens(r.total_tokens)} tokens</span></div>
+    <dl class="ref-metrics">
+      <div><dt>Cost</dt><dd>${fmtCost(r.total_cost_usd)}</dd></div>
+      <div><dt>${r.active_ms != null ? "Active time" : "Duration"}</dt><dd>${fmtMs(duration(r))}</dd></div>
+    </dl>
     <button type="button" class="link-btn" data-ref="${esc(r.id)}">Clear</button></div>`;
 }
 
@@ -2052,21 +2228,50 @@ async function viewTag(tag, query = new URLSearchParams()) {
   app.innerHTML = `
     <div class="prompts-page tag-page">
       <a class="crumb" href="#/tags">← All tags</a>
-      ${tagHeadHtml(info, rules)}
-      <div id="tag-curation"></div>
-      <div id="prompt-summary"></div>
-      <div id="prompt-highlights"></div>
-      <div id="tag-reference"></div>
-      <section class="tag-evolution" aria-labelledby="evo-title"><h2 id="evo-title" class="page-sec">How it evolves</h2><div id="tag-charts"></div></section>
-      <h2 class="page-sec">Runs</h2>
-      <div id="prompt-toolbar"></div>
-      <div id="select-bar"></div>
-      <div id="active-filters"></div>
-      <div id="prompt-results"></div>
+      ${tagHeadHtml(info)}
+      <details class="tag-page-section" open>
+        <summary><h2>Global summary</h2><span>Costs, time and highlights</span></summary>
+        <div class="tag-section-content"><div id="prompt-summary"></div><div id="prompt-highlights"></div></div>
+      </details>
+      <details class="tag-page-section tag-evolution" open>
+        <summary><h2>Evolution</h2><span>Compare runs over time</span></summary>
+        <div class="tag-section-content"><div id="tag-charts"></div></div>
+      </details>
+      <details class="tag-page-section" open>
+        <summary><h2>Prompts</h2><span>Rules, exclusions and all runs</span></summary>
+        <div class="tag-section-content">
+          ${tagRulesHtml(info, rules)}
+          <div id="tag-curation"></div>
+          <div id="prompt-toolbar"></div>
+          <div id="select-bar"></div>
+          <div id="active-filters"></div>
+          <div id="prompt-results"></div>
+        </div>
+      </details>
     </div>
     ${tagDialogHtml({ forPrompts: true })}`;
   Object.assign(listState, { selecting: false, selected: new Set() });
+  app.querySelectorAll(".tag-page-section").forEach((section) => {
+    section.addEventListener("toggle", () => {
+      if (section.open) requestAnimationFrame(() => charts.forEach((chart) => chart.resize()));
+    });
+  });
   bindSelection(app.querySelector(".tag-page"), { tags, exclude: [tag] });
+  app.querySelector(".tag-page").addEventListener("click", async (e) => {
+    const button = e.target.closest("[data-queue-prompt]");
+    if (!button) return;
+    e.preventDefault();
+    button.disabled = true;
+    const status = button.closest(".prompt-actions").querySelector(".prompt-action-status");
+    try {
+      const result = await api("/api/reruns/queue", { method: "POST", body: { prompt_ids: [button.dataset.queuePrompt] } });
+      status.textContent = result.added ? "Rerun queued" : "Already queued";
+    } catch (error) {
+      if (!(error instanceof StaleNavigation)) { status.textContent = error.message; button.disabled = false; }
+    }
+  });
+  // the curation card is filled once the page is usable (below, human tags only); the reference changes what it flags
+  let refreshCuration = () => {};
   // ☆ on a run makes it the reference, ★ (or Clear on the card) clears it
   app.querySelector(".tag-page").addEventListener("click", async (e) => {
     const b = e.target.closest("[data-ref]");
@@ -2075,54 +2280,115 @@ async function viewTag(tag, query = new URLSearchParams()) {
     const id = listState.reference?.id === b.dataset.ref ? null : b.dataset.ref;
     listState.reference = (await api(`/api/tags/${enc}/reference`, { method: "PUT", body: { prompt_id: id } })).reference;
     renderPrompts({ reload: false });
+    refreshCuration();
   });
   rerenderToolbar();
   await renderPrompts();
   if (tagCategory(info) !== "human") return;
-  // duplicates and priorities come after the page is usable: the check can take a while on a large tag
-  let duplicates = [];
-  const removePrompts = async (ids) => {
-    await api(`/api/tags/${enc}/prompts`, { method: "DELETE", body: { prompt_ids: ids } });
-    route();
+  // flagged prompts and excluded examples come after the page is usable: the check can take a while on a large tag
+  let flagged = [], redundantExclusions = [];
+  const selectedExclusions = new Set();
+  const syncExcludedSelection = () => {
+    const box = document.getElementById("tag-curation");
+    box.querySelectorAll("[data-pick-exclusion]").forEach((input) => { input.checked = selectedExclusions.has(input.dataset.pickExclusion); });
+    const count = box.querySelector("[data-exclusion-count]");
+    if (count) count.textContent = `${selectedExclusions.size} selected`;
+    box.querySelectorAll("[data-exclusions-action]").forEach((button) => { button.disabled = !selectedExclusions.size; });
   };
+  app.querySelector(".tag-page").addEventListener("change", (e) => {
+    const input = e.target.closest("[data-pick-exclusion]");
+    if (!input) return;
+    selectedExclusions[input.checked ? "add" : "delete"](input.dataset.pickExclusion);
+    syncExcludedSelection();
+  });
+  const failed = (error) => { if (!(error instanceof StaleNavigation)) alert(error.message); };
   app.querySelector(".tag-page").addEventListener("click", async (e) => {
-    const button = e.target.closest("[data-untag], [data-untag-selected], #remove-duplicates");
+    const button = e.target.closest("[data-exclude], [data-exclude-selected], #exclude-flagged, [data-restore], [data-example], #forget-redundant, [data-exclusions-select], [data-exclusions-action]");
     if (!button) return;
     e.preventDefault();
-    const ids = button.id === "remove-duplicates" ? duplicates.map((p) => p.id)
-      : button.hasAttribute("data-untag-selected") ? [...listState.selected] : [button.dataset.untag];
-    await removePrompts(ids);
+    if (button.hasAttribute("data-exclusions-select")) {
+      selectedExclusions.clear();
+      if (button.dataset.exclusionsSelect === "all") document.querySelectorAll("[data-pick-exclusion]").forEach((input) => selectedExclusions.add(input.dataset.pickExclusion));
+      syncExcludedSelection();
+      return;
+    }
+    try {
+      if (button.hasAttribute("data-exclusions-action")) {
+        const ids = [...selectedExclusions];
+        if (!ids.length) return;
+        button.disabled = true;
+        if (button.dataset.exclusionsAction === "restore") {
+          await api(`/api/tags/${enc}/exclusions/restore`, { method: "POST", body: { prompt_ids: ids } });
+        } else {
+          await api(`/api/tags/${enc}/exclusions`, { method: "PUT", body: { prompt_ids: ids, example: false } });
+        }
+        selectedExclusions.clear();
+        await renderPrompts();
+        refreshCuration();
+        return;
+      }
+      if (button.hasAttribute("data-restore")) {
+        await api(`/api/tags/${enc}/exclusions/restore`, { method: "POST", body: { prompt_ids: [button.dataset.restore] } });
+      } else if (button.hasAttribute("data-example") || button.id === "forget-redundant") {
+        const ids = button.id === "forget-redundant" ? redundantExclusions.map((p) => p.id) : [button.dataset.example];
+        await api(`/api/tags/${enc}/exclusions`, { method: "PUT", body: { prompt_ids: ids, example: button.dataset.use === "1" } });
+      } else {
+        const ids = button.id === "exclude-flagged" ? flagged.map((p) => p.id)
+          : button.hasAttribute("data-exclude-selected") ? [...listState.selected] : [button.dataset.exclude];
+        const out = await api(`/api/tags/${enc}/prompts`, { method: "DELETE", body: { prompt_ids: ids } });
+        if (out.skipped_reference) alert("The reference run stays in the tag: clear it as the reference to exclude it.");
+      }
+      route();
+    } catch (error) { syncExcludedSelection(); failed(error); }
   });
   const loadCuration = async () => {
     const box = document.getElementById("tag-curation");
     let curation;
     try { curation = await api(`/api/tags/${enc}/curation`); }
-    catch (error) { if (box) box.innerHTML = `<p class="muted">Could not check this tag for duplicates: ${esc(error.message)}</p>`; return; }
+    catch (error) { if (box && !(error instanceof StaleNavigation)) box.innerHTML = `<p class="muted">Could not check this tag for irrelevant prompts: ${esc(error.message)}</p>`; return; }
     if (!box?.isConnected) return; // the page changed meanwhile
-    duplicates = curation.duplicates;
+    const exclusionsOpen = box.querySelector(".tag-exclusions")?.open;
+    flagged = curation.flagged;
+    redundantExclusions = curation.redundant_exclusions;
+    const examples = curation.excluded.filter((p) => p.example).length;
     box.innerHTML = `
       <section class="card" aria-label="Tag curation">
-        ${duplicates.length ? `<div role="status"><strong>⚠ ${duplicates.length} potentially duplicate prompt${duplicates.length === 1 ? "" : "s"}</strong>
-          <p>These prompts have at least ${Math.round(curation.threshold * 100)}% word overlap with a retained prompt. Review the differences before removing them. The reference is retained when available; otherwise the earliest prompt is retained. Removing only changes this tag and persists after rescans.</p>
-          <button class="btn" type="button" id="remove-duplicates">Remove all ${duplicates.length} flagged prompts from tag</button>
-          ${duplicates.map((p) => `<div class="setup-row"><div><a href="#/prompt/${encodeURIComponent(p.id)}">${esc(p.text)}</a>
-            <p class="muted">${Math.round(p.similarity * 100)}% overlap with retained prompt: <a href="#/prompt/${encodeURIComponent(p.similar_to.id)}">${esc(p.similar_to.text)}</a></p></div>
-            <button class="btn" type="button" data-untag="${esc(p.id)}">Remove from tag</button></div>`).join("")}</div>`
-          : '<p>No potentially duplicate prompts found. Existing and newly added prompts are checked whenever you open this page.</p>'}
-        <form id="tag-priorities"><strong>Tags that take priority over this tag</strong>
-          <p>If a prompt has any selected tag, it will be excluded from this tag. Applies to existing and future prompts. Clearing a priority restores eligible prompts.</p>
-          <select id="preferred-tags" multiple aria-label="Tags taking priority">${tags.filter((t) => t.tag !== tag).map((t) => `<option value="${esc(t.tag)}" ${curation.preferred_tags.includes(t.tag) ? "selected" : ""}>${esc(t.tag)}</option>`).join("")}</select>
-          <button class="btn" type="submit">Save priorities</button><span id="priority-error" role="alert"></span>
-        </form>
+        ${flagged.length ? `<div role="status"><strong>⚠ ${flagged.length} possibly irrelevant prompt${flagged.length === 1 ? "" : "s"}</strong>
+          <p>These prompts resemble examples you excluded as irrelevant (${Math.round(curation.threshold * 100)}% word overlap or more). Review their meaning before excluding them. Your reference run is never flagged.</p>
+          <button class="btn" type="button" id="exclude-flagged">Exclude all ${flagged.length} flagged prompts</button>
+          ${flagged.map((p) => `<div class="setup-row"><div><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}">${esc(promptPreview(p.text))}</a>
+            <p class="muted">${Math.round(p.similarity * 100)}% overlap with excluded example: <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.similar_to.id)}">${esc(promptPreview(p.similar_to.text))}</a></p></div>
+            <button class="btn" type="button" data-exclude="${esc(p.id)}">Exclude from tag</button></div>`).join("")}</div>`
+          : '<p>No prompts resemble your excluded examples. Existing and new prompts are checked when you open this page.</p>'}
+        <details class="tag-exclusions" ${exclusionsOpen ? "open" : ""}>
+          <summary><strong>${curation.excluded.length} prompt${curation.excluded.length === 1 ? "" : "s"} excluded as irrelevant</strong><span class="muted">${examples} used as example${examples === 1 ? "" : "s"}</span><span class="muted">Manage exclusions</span></summary>
+          <div class="tag-exclusions-body">
+        <p>These prompts stay out of this tag; ${examples === curation.excluded.length ? "all" : examples} of them serve as examples for relevance warnings. Restore puts a prompt back the way it had the tag: by hand, or through your rules if they still match. Older exclusions with no recorded assignment are restored by hand. A tag priority can still hold it back. Similarity alone never excludes a prompt.</p>
+        ${curation.excluded.length ? `<div class="excluded-selection" role="group" aria-label="Selected excluded prompts">
+          <strong data-exclusion-count aria-live="polite">0 selected</strong>
+          <button class="link-btn" type="button" data-exclusions-select="all">Select all</button>
+          <button class="link-btn" type="button" data-exclusions-select="none">Clear selection</button>
+          <button class="btn" type="button" data-exclusions-action="ignore" disabled title="Keep these prompts excluded but stop using them for relevance warnings">Ignore selected as examples</button>
+          <button class="btn" type="button" data-exclusions-action="restore" disabled>Restore selected to tag</button>
+        </div>` : ""}
+        ${redundantExclusions.length ? `<p role="status">${redundantExclusions.length} example${redundantExclusions.length === 1 ? " resembles" : "s resemble"} another excluded example. They can stop serving as examples and stay excluded.</p>
+          <button class="btn" type="button" id="forget-redundant">Stop using ${redundantExclusions.length} redundant example${redundantExclusions.length === 1 ? "" : "s"}</button>` : ""}
+        ${curation.excluded.map((p) => {
+          const redundant = redundantExclusions.find((r) => r.id === p.id);
+          const note = !p.example ? '<p class="muted">Excluded, not used as an example.</p>'
+            : redundant ? `<p class="muted">Similar to excluded example: <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(redundant.similar_to.id)}">${esc(promptPreview(redundant.similar_to.text))}</a></p>` : "";
+          return `<div class="setup-row excluded-prompt-row"><input type="checkbox" data-pick-exclusion="${esc(p.id)}" aria-label="Select excluded prompt: ${esc(promptPreview(p.text))}"><div class="excluded-prompt-text"><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}">${esc(promptPreview(p.text))}</a>${note}</div>
+            <div><button class="btn" type="button" data-example="${esc(p.id)}" data-use="${p.example ? 0 : 1}">${p.example ? "Stop using as example" : "Use as example"}</button>
+            <button class="btn" type="button" data-restore="${esc(p.id)}">Restore to tag</button></div></div>`;
+        }).join("")}
+          </div>
+        </details>
       </section>`;
-    document.getElementById("tag-priorities").onsubmit = async (e) => {
-      e.preventDefault();
-      try {
-        await api(`/api/tags/${enc}/priorities`, { method: "PUT", body: { preferred_tags: [...document.getElementById("preferred-tags").selectedOptions].map((o) => o.value) } });
-        route();
-      } catch (error) { document.getElementById("priority-error").textContent = error.message; }
-    };
+    const available = new Set(curation.excluded.map((p) => p.id));
+    for (const id of selectedExclusions) if (!available.has(id)) selectedExclusions.delete(id);
+    syncExcludedSelection();
   };
+  refreshCuration = loadCuration;
   loadCuration();
   document.getElementById("delete-tag").onclick = async () => {
     const n = info.prompts || 0;
@@ -2152,7 +2418,7 @@ async function viewTag(tag, query = new URLSearchParams()) {
     bindRuleRow(editBox.firstElementChild);
     app.querySelectorAll(".rule-chip").forEach((c) => c.classList.toggle("editing", Number(c.dataset.rulePos) === pos));
     editForm.hidden = false;
-    editBox.querySelector(".rr-keywords").focus();
+    editBox.querySelector(".rr-kind").focus();
   };
   app.querySelectorAll("[data-edit-rule]").forEach((b) => b.onclick = () => openEditor(Number(b.dataset.editRule)));
   app.querySelector("[data-add-keywords]").onclick = () => openEditor(null);
@@ -2163,10 +2429,11 @@ async function viewTag(tag, query = new URLSearchParams()) {
   editForm.onsubmit = async (e) => {
     e.preventDefault();
     const values = readRuleRow(editBox.firstElementChild);
-    if (!values.skill && !values.keywords.length) return;
-    await (editing == null
+    if (!values.include_tag && !values.preferred_tag && !values.skill && !values.keywords?.length) return;
+    try { await (editing == null
       ? api(`/api/tags/${enc}/rules`, { method: "POST", body: values })
-      : api(`/api/tags/${enc}/rules/${rules[editing].index}`, { method: "PUT", body: values }));
+      : api(`/api/tags/${enc}/rules/${rules[editing].index}`, { method: "PUT", body: values })); }
+    catch (error) { failed(error); return; }
     route();
   };
   app.querySelectorAll("[data-delete-rule]").forEach((b) => b.onclick = async () => {
@@ -2449,7 +2716,6 @@ function excludedCardHtml(scope) {
       <div class="exclude-chips">${tagChips(scope.skills, "skill:") || '<span class="muted">No skill used yet.</span>'}</div></div></div>
     ${scope.reruns.length ? `<div class="setup-row"><div><strong>Reruns</strong><br><span class="muted">Leave out every prompt of the reruns launched from here, to keep the history to your own work.</span>
       <div class="exclude-chips">${tagChips(scope.reruns, "")}</div></div></div>` : ""}
-    ${(scope.examples || []).length ? `<div class="setup-row"><div><strong>Examples</strong><br><span class="muted">Hide the illustrative records from totals and history.</span><div class="exclude-chips">${tagChips(scope.examples, "")}</div></div></div>` : ""}
     <div class="setup-row"><div><strong>Subagent types</strong><br><span class="muted">Leave out every prompt that ran a kind of subagent.</span>
       <div class="exclude-chips">${tagChips(scope.agents, "agent:") || '<span class="muted">No subagent run yet.</span>'}</div></div></div>
     <div class="setup-row"><div><strong>Sessions</strong><br><span class="muted">Leave out one conversation, such as a test or an experiment.</span>
@@ -2478,8 +2744,31 @@ function agentConnectionDetailsHtml(agent, settings, extra = "") {
   </div>`;
 }
 
+/** Choices for the default LLM judge: the models of the linked agents, grouped by agent, the saved one kept even when no
+    linked agent lists it. */
+function judgeModelOptions(models, linked, current) {
+  const sel = (v) => (v === current ? "selected" : "");
+  const groups = [["claude", "Claude Code"], ["codex", "Codex"]].filter(([agent]) => linked.has(agent)).map(([agent, name]) => {
+    const list = models.filter((m) => m.agent === agent);
+    const fallback = agent === "claude" ? `<option value="" ${sel("")}>Claude Code's default model</option>` : "";
+    return `<optgroup label="${name}">${fallback}${list.map((m) => `<option value="${esc(m.id)}" ${sel(m.id)}>${esc(m.label)}</option>`).join("")}</optgroup>`;
+  }).join("");
+  const known = (current === "" && linked.has("claude")) || models.some((m) => m.id === current && linked.has(m.agent));
+  return (known ? "" : `<option value="${esc(current)}" selected>${esc(current || "Claude Code's default model")} (saved; not from a linked agent)</option>`) + groups;
+}
+
+/** Effort levels the judge `model` accepts, "" being the model's own default. */
+function judgeEffortOptions(models, model, current) {
+  const m = models.find((x) => x.id === model) || (model === "" ? models.find((x) => x.agent === "claude") : null);
+  const efforts = m?.efforts?.length ? m.efforts : EFFORTS;
+  const pick = efforts.includes(current) ? current : "";
+  return `<option value="" ${pick ? "" : "selected"}>${m?.default_effort ? `Model default (${esc(m.default_effort)})` : "Model default"}</option>`
+    + efforts.map((e) => `<option value="${esc(e)}" ${e === pick ? "selected" : ""}>${esc(e)}</option>`).join("");
+}
+
 async function viewSetup() {
-  const [st, settings, scope] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history")]);
+  const [st, settings, scope, models] = await Promise.all([api("/api/setup/status"), api("/api/settings"), api("/api/setup/history"), api("/api/models")]);
+  const linked = new Set(st.connections.filter((agent) => agent.enabled).map((agent) => (agent.id === "claude-code" ? "claude" : agent.id)));
   const ok = (cond) => (cond ? "status-ok" : "status-warn");
   const retentionOk = st.cleanup_period_days != null && st.cleanup_period_days >= 365;
   const added = st.connections.filter((agent) => agent.enabled);
@@ -2489,6 +2778,11 @@ async function viewSetup() {
         <span class="muted">Without the hook the dashboard re-scans every ${settings.auto_ingest_interval}s while it runs. The hook imports right after each answer of the agent.
         It adds this command to <code>${esc(st.claude_settings_path)}</code> (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.hook_command)}</code></div>
         <div><button class="btn" id="hook">${st.hook_installed ? "Remove hook" : "Install hook"}</button></div></div>
+      <div class="setup-row"><div class="${ok(st.statusline_installed)}"><strong>Usage limits (Claude Code statusline)</strong><br>
+        <span class="muted">Claude Code reports how much of its 5-hour and weekly limits you used to its statusline only. This saves that statusline input in Rerunly's data folder,
+        then runs your own statusline command, unchanged, so it looks the same. Removing it puts your statusline back.
+        It sets this command in <code>${esc(st.claude_settings_path)}</code> (a <code>.bak</code> copy is kept):</span><br><code>${esc(st.statusline_command)}</code></div>
+        <div><button class="btn" id="statusline">${st.statusline_installed ? "Remove" : "Capture usage"}</button></div></div>
       <div class="setup-row"><div class="${ok(retentionOk)}"><strong>Transcript retention</strong><br>
         <span class="muted">Claude Code deletes transcripts older than <code>cleanupPeriodDays</code> (default 30). Imported prompts stay in the dashboard database,
         but a longer retention lets you re-import with new prices or rules. Current: ${st.cleanup_period_days ?? "not set (30 days)"}.</span></div>
@@ -2534,8 +2828,8 @@ async function viewSetup() {
     </div>
     <h2>Examples</h2>
     <div class="card"><div class="setup-row"><div><strong>Explore Rerunly with simple examples</strong><p class="muted">Prompt tuning, Claude and Codex records, cache savings, skill versions, subagents, quality verdicts and a blocked rerun.
-      Illustrative data only; no agents are run. All examples are tagged <code>rerunly-examples</code> and can be excluded from totals like any other tag.</p></div>
-      <div>${st.example_prompts ? '<a class="btn" href="#/tag/rerunly-examples">View examples</a> <button class="btn" id="remove-examples">Remove examples</button>' : '<button class="btn" id="load-examples">Add examples</button>'}</div></div></div>
+      They open in a separate example app holding only these illustrative records: no agents are run, and your own history never shows them.</p></div>
+      <div><a class="btn" href="/examples/" target="_blank" rel="noopener">Open the example app ↗</a></div></div></div>
     <h2>Dashboard</h2>
     <div class="card">
       <div class="setup-row"><div class="${ok(st.prompts > 0)}"><strong>Imported history from all agents</strong><br>
@@ -2560,9 +2854,12 @@ async function viewSetup() {
           <option value="prices" ${settings.cost_source === "prices" ? "selected" : ""}>Price table only</option></select></div>
       <div class="setup-row"><div><strong>Similarity threshold</strong><br><span class="muted">0–1 word overlap above which two prompts are shown together.</span></div>
         <input name="similarity_threshold" type="number" min="0" max="1" step="0.05" value="${settings.similarity_threshold}"></div>
-      <div class="setup-row"><div><strong>Default LLM judge</strong><br><span class="muted">The model rating how much a rerun's output differs from its original's.
-        Use a Claude model ID or codex:MODEL for Codex. Empty uses Claude Code’s default model. Each rerun and comparison can pick another.</span></div>
-        <input name="judge_model" size="24" value="${esc(settings.judge_model || "")}" placeholder="claude-haiku-5-5"></div>
+      <div class="setup-row"><div><strong>Default LLM judge</strong><br><span class="muted">The model, and its effort, rating how much a rerun's output differs from its original's.
+        Any model of your linked agents; the efforts are the ones that model accepts. Each rerun and comparison can pick another model.</span></div>
+        <div class="judge-pick">
+          <label>Model <select name="judge_model" id="judge-model-setting">${judgeModelOptions(models, linked, settings.judge_model || "")}</select></label>
+          <label>Effort <select name="judge_effort" id="judge-effort-setting">${judgeEffortOptions(models, settings.judge_model || "", settings.judge_effort || "")}</select></label>
+        </div></div>
       <div class="setup-row"><div><strong>Auto-import interval (seconds)</strong><br><span class="muted">0 disables periodic scanning.</span></div>
         <input name="auto_ingest_interval" type="number" min="0" value="${settings.auto_ingest_interval}"></div>
       <div class="setup-row"><div><strong>Automatic model pricing</strong><br>
@@ -2588,16 +2885,6 @@ async function viewSetup() {
       await viewSetup();
     });
   });
-  const loadExamples = document.getElementById("load-examples");
-  if (loadExamples) loadExamples.onclick = () => busy(loadExamples, async () => {
-    await api("/api/examples", { method: "POST" });
-    await viewSetup();
-  });
-  const removeExamples = document.getElementById("remove-examples");
-  if (removeExamples) removeExamples.onclick = () => busy(removeExamples, async () => {
-    await api("/api/examples", { method: "DELETE" });
-    await viewSetup();
-  });
   document.getElementById("add-agent-form").onsubmit = (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -2621,6 +2908,7 @@ async function viewSetup() {
   });
   document.getElementById("ingest").onclick = (e) => busy(e.target, async () => { await api("/api/ingest", { method: "POST" }); viewSetup(); });
   document.getElementById("reingest").onclick = (e) => busy(e.target, async () => { await api("/api/ingest?force=true", { method: "POST" }); viewSetup(); });
+  if (document.getElementById("statusline")) document.getElementById("statusline").onclick = (e) => busy(e.target, async () => { await api(`/api/setup/statusline?install=${!st.statusline_installed}`, { method: "POST" }); viewSetup(); });
   if (document.getElementById("hook")) document.getElementById("hook").onclick = (e) => busy(e.target, async () => { await api(`/api/setup/hook?install=${!st.hook_installed}`, { method: "POST" }); viewSetup(); });
   if (document.getElementById("telemetry")) document.getElementById("telemetry").onclick = (e) => busy(e.target, async () => {
     const conflicts = Object.entries(st.telemetry.conflicts);
@@ -2641,7 +2929,7 @@ async function viewSetup() {
     const name = b.dataset.excludeProject;
     exclude("excluded_projects", excludedProjects.includes(name) ? excludedProjects.filter((x) => x !== name) : [...excludedProjects, name]);
   });
-  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns, ...(scope.examples || [])].filter((x) => x.excluded).map((x) => x.tag);
+  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns].filter((x) => x.excluded).map((x) => x.tag);
   app.querySelectorAll("[data-exclude-tag]").forEach((b) => b.onclick = () => {
     const tag = b.dataset.excludeTag;
     exclude("excluded_tags", excludedTags.includes(tag) ? excludedTags.filter((x) => x !== tag) : [...excludedTags, tag]);
@@ -2653,6 +2941,12 @@ async function viewSetup() {
     const id = document.getElementById("exclude-session").value;
     if (id) exclude("excluded_sessions", [...excludedSessions, id]);
   };
+  // another judge model accepts other efforts: keep the chosen one when it still can
+  const judgeModel = document.getElementById("judge-model-setting");
+  judgeModel.onchange = () => {
+    const effort = document.getElementById("judge-effort-setting");
+    effort.innerHTML = judgeEffortOptions(models, judgeModel.value, effort.value);
+  };
   document.getElementById("settings").onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -2662,6 +2956,7 @@ async function viewSetup() {
         cost_source: f.get("cost_source"),
         similarity_threshold: parseFloat(f.get("similarity_threshold")),
         judge_model: String(f.get("judge_model") || "").trim(),
+        judge_effort: String(f.get("judge_effort") || ""),
         auto_ingest_interval: parseInt(f.get("auto_ingest_interval"), 10),
         prices: JSON.parse(f.get("prices")),
         auto_price_lookup: f.has("auto_price_lookup"),
@@ -2733,25 +3028,71 @@ function homeHighlights(o) {
 }
 
 /** The most used tag of each category, with its two runners-up. */
-function homeTopTags(o) {
-  const total = o.totals.prompts || 0;
+/** The top tags of each category, by number of prompts or, with `by: "cost"`, by total cost (shown first, in large). */
+function homeTopTags(o, { by = "prompts" } = {}) {
+  const byCost = by === "cost";
+  const total = (byCost ? o.totals.cost_usd : o.totals.prompts) || 0;
+  const value = (t) => (byCost ? t.cost_usd || 0 : t.prompts);
   return TAG_CATEGORIES.map(([cat, label, help]) => {
-    const list = o.tags.filter((t) => tagCategory(t) === cat).slice(0, 3);
+    // the server lists tags by prompts, then cost: the stable sort keeps that order among equal costs
+    const list = o.tags.filter((t) => tagCategory(t) === cat && value(t) > 0).sort((a, b) => value(b) - value(a)).slice(0, 3);
     if (!list.length) {
-      return cat !== "human" ? "" : `<div class="top-tag cat-human empty"><span class="hl-label"><span class="tag-dot"></span>${label}</span>
+      return cat !== "human" || byCost ? "" : `<div class="top-tag cat-human empty"><span class="hl-label"><span class="tag-dot"></span>${label}</span>
         <p class="muted">No tag of yours yet: add one on a prompt page to follow a task across runs.</p></div>`;
     }
     const [top, ...rest] = list;
     const [prefix, ...name] = top.tag.split(":");
     const title = name.length ? `<span class="tag-prefix">${esc(prefix)}:</span>${esc(name.join(":"))}` : esc(top.tag);
-    const share = (t) => (total ? Math.round((t.prompts / total) * 100) : 0);
-    const shareText = (t) => (share(t) === 0 && t.prompts ? "<1" : share(t));
+    const share = (t) => (total ? Math.round((value(t) / total) * 100) : 0);
+    const shareText = (t) => (share(t) === 0 && value(t) ? "<1" : share(t));
+    const prompts = `${top.prompts} prompt${top.prompts === 1 ? "" : "s"}`;
     return `<div class="top-tag cat-${cat}">
       <span class="hl-label" title="${esc(help)}"><span class="tag-dot"></span>${label}</span>
+      ${byCost ? `<span class="hl-value top-cost"><span class="big">${fmtCost(top.cost_usd)}</span><span class="unit">total</span></span>` : ""}
       <a class="top-name" href="#/tag/${encodeURIComponent(top.tag)}">${title}</a>
-      <span class="top-share"><span class="share-bar" aria-hidden="true"><i style="width:${Math.max(2, share(top))}%"></i></span>${shareText(top)}% of prompts</span>
-      <span class="pmeta">${top.prompts} prompt${top.prompts === 1 ? "" : "s"} · ${fmtCost(top.cost_usd)} total · ${fmtCost(top.avg_cost_usd)} each</span>
-      ${rest.length ? `<ol class="runners-up" start="2">${rest.map((t) => `<li><a href="#/tag/${encodeURIComponent(t.tag)}">${esc(t.tag)}</a><span class="mi-count">${t.prompts}</span></li>`).join("")}</ol>` : ""}
+      <span class="top-share"><span class="share-bar" aria-hidden="true"><i style="width:${Math.max(2, share(top))}%"></i></span>${shareText(top)}% of ${byCost ? "cost" : "prompts"}</span>
+      <span class="pmeta">${byCost ? `${prompts} · ${fmtCost(top.avg_cost_usd)} each` : `${prompts} · ${fmtCost(top.cost_usd)} total · ${fmtCost(top.avg_cost_usd)} each`}</span>
+      ${rest.length ? `<ol class="runners-up" start="2">${rest.map((t) => `<li><a href="#/tag/${encodeURIComponent(t.tag)}">${esc(t.tag)}</a><span class="mi-count">${byCost ? fmtCost(t.cost_usd) : t.prompts}</span></li>`).join("")}</ol>` : ""}
+    </div>`;
+  }).join("");
+}
+
+/** "2 d 4 h", "3 h 12 min", "8 min": how long until `date`. */
+function fmtUntil(date) {
+  const min = Math.max(0, Math.round((date - Date.now()) / 60000));
+  if (min < 60) return `${min} min`;
+  const h = Math.floor(min / 60);
+  return h < 24 ? `${h} h ${min % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
+}
+
+/** "5 h", "Week"…: the length of a usage window, short. */
+function windowLabel(minutes) {
+  if (minutes === 10080) return "Week";
+  if (minutes === 1440) return "Day";
+  if (!minutes) return "Usage";
+  return minutes % 60 ? `${minutes} min` : `${minutes / 60} h`;
+}
+
+/** Subscription usage of each connected agent, beside the home title: share of each window used, and when it resets. */
+function homeLimits(limits) {
+  return limits.map((a) => {
+    const rows = a.windows.map((w) => {
+      const pct = Math.max(0, Math.min(100, Math.round(w.used_percent)));
+      const resets = w.resets_at ? new Date(w.resets_at) : null;
+      const at = resets && resets.toLocaleString(undefined,
+        w.window_minutes >= 1440 ? { weekday: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+      const label = `${a.agent} ${windowLabel(w.window_minutes).toLowerCase()} limit used`;
+      return `<div class="limit-row">
+        <span class="limit-name">${windowLabel(w.window_minutes)}</span>
+        <span class="limit-bar ${pct >= 80 ? "high" : ""}" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="${esc(label)}"><i style="width:${Math.max(1, pct)}%"></i></span>
+        <strong class="limit-pct">${pct}%</strong>
+        <span class="limit-reset">${w.reset ? "reset since last seen" : resets ? `resets in ${fmtUntil(resets)} · ${at}` : ""}</span>
+      </div>`;
+    }).join("");
+    const empty = !a.capture ? `<a href="#/setup">Capture its usage in Setup</a>` : "No usage reported yet";
+    return `<div class="limit-agent" ${a.observed_at ? `title="${esc(`As of the last ${a.agent} activity, ${fmtAgo(a.observed_at)}`)}"` : ""}>
+      <span class="limit-head"><strong>${esc(a.agent)}</strong>${a.plan ? ` <span class="muted">${esc(a.plan)}</span>` : ""}${a.observed_at ? `<span class="muted">${esc(fmtAgo(a.observed_at))}</span>` : ""}</span>
+      ${rows || `<span class="limit-reset">${empty}</span>`}
     </div>`;
   }).join("");
 }
@@ -2759,7 +3100,10 @@ function homeTopTags(o) {
 async function viewHome(query = new URLSearchParams()) {
   const range = RANGES[query.get("range")] ? query.get("range") : "all";
   const since = RANGES[range][1];
-  const o = await api(`/api/overview${since ? `?${new URLSearchParams({ since: since().toISOString() })}` : ""}`);
+  const [o, limits] = await Promise.all([
+    api(`/api/overview${since ? `?${new URLSearchParams({ since: since().toISOString() })}` : ""}`),
+    api("/api/limits").catch((error) => { if (error instanceof StaleNavigation) throw error; return []; }),
+  ]);
   const t = o.totals;
   const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
   const rangeQuery = range === "all" ? "" : `?range=${range}`;
@@ -2772,6 +3116,7 @@ async function viewHome(query = new URLSearchParams()) {
           <p>Cost, tokens and time for every prompt you give your coding agent, so each rerun tells you if your last change made it
             <strong>cheaper</strong>, <strong>faster</strong>, or neither.</p>
         </div>
+        ${limits.length ? `<aside class="hero-limits" aria-label="Usage limits"><span class="hl-label">Usage limits</span>${homeLimits(limits)}</aside>` : ""}
       </header>
       <div class="home-range segmented" role="group" aria-label="Period">${Object.entries(RANGES).map(([key, [label]]) =>
         `<button type="button" data-range="${key}" aria-pressed="${key === range}">${label}</button>`).join("")}</div>
@@ -2785,11 +3130,13 @@ async function viewHome(query = new URLSearchParams()) {
         <h2 class="page-sec">Highlights</h2>
         <div class="highlights">${homeHighlights(o)}</div>
         <h2 class="page-sec">Most used in each tag category</h2>
-        <div class="top-tags">${homeTopTags(o)}</div>`
+        <div class="top-tags">${homeTopTags(o)}</div>
+        ${t.cost_usd ? `<h2 class="page-sec">Most expensive in each tag category</h2>
+        <div class="top-tags">${homeTopTags(o, { by: "cost" })}</div>` : ""}`
       : `<div class="empty-state"><div class="empty-icon">⌕</div><p>${range === "all" ? "Nothing imported yet." : "No prompt in this period."}</p>
           ${range === "all" ? '<p>Go to <a href="#/setup">Setup</a> and press <strong>Import now</strong>.</p>' : ""}</div>`}
       <h2 class="page-sec">Pages</h2>
-      <nav class="page-cards" aria-label="Pages">${HOME_PAGES.map(([id, label, text, stat]) =>
+      <nav class="page-cards" aria-label="Pages">${HOME_PAGES.filter(([id]) => !(EXAMPLES && id === "setup")).map(([id, label, text, stat]) =>
         `<a class="page-card" href="#/${id}${id === "prompts" ? rangeQuery : ""}"><span class="pc-head"><strong>${label}</strong><span class="mi-count">${esc(stat(o))}</span></span>
           <span class="pc-text">${text}</span><span class="hl-link">Open ${label} →</span></a>`).join("")}</nav>
     </div>`;
@@ -2823,7 +3170,7 @@ const rerunState = { picked: new Set() };
 
 function rerunSettings(x) {
   const skills = Array.isArray(x.skills) ? x.skills : [];
-  const parts = [x.mode === "terminal" ? "in a terminal" : "unattended", x.mode !== "terminal" ? (x.permission === "edits" ? "may edit files" : "read-only") : "",
+  const parts = [x.mode === "terminal" ? "in a terminal" : "unattended", x.permission === "same" || !x.permission ? "same permissions as original" : x.permission === "edits" ? "may edit files" : x.mode !== "terminal" ? "read-only" : "ask for approval",
     x.budget_usd ? `up to ${fmtCost(x.budget_usd)}` : "",
     ...skills.map((k) => `${k.skill.split(":").pop()} @ ${k.source}`),
     x.model || "same model", x.effort ? `effort ${x.effort}` : "same effort",
@@ -2835,15 +3182,44 @@ function rerunSettings(x) {
 
 function rerunPromptCell(p) {
   if (!p) return '<span class="muted">This prompt left the history (excluded on the Setup page).</span>';
-  return `<a class="rr-text" href="#/prompt/${encodeURIComponent(p.id)}">${esc(p.text)}</a>
+  return `<a class="rr-text" target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(p.id)}">${esc(p.text)}</a>
     <span class="pmeta">${[p.project, `ran ${fmtDate(p.started_at)}`, fmtCost(p.total_cost_usd)].filter(Boolean).map(esc).join(" · ")}</span>`;
 }
 
+function rerunEstimateTotal(items) {
+  const estimates = items.map((q) => q.estimate).filter(Boolean);
+  const priced = estimates.filter((e) => e.cost_usd != null);
+  const durations = estimates.map((e) => e.duration_ms).filter((ms) => ms != null);
+  return { count: items.length, missing: items.length - estimates.length, unpriced: items.length - priced.length,
+    cost: priced.reduce((sum, e) => sum + e.cost_usd, 0),
+    tokens: estimates.reduce((sum, e) => sum + e.total_tokens, 0),
+    parallel_ms: durations.length ? Math.max(...durations) : null,
+    work_ms: durations.length ? durations.reduce((sum, ms) => sum + ms, 0) : null,
+    missing_time: items.length - durations.length };
+}
+
+function rerunEstimateCost(total) {
+  return total.unpriced === total.count && total.count ? "Cost unavailable"
+    : `≈ ${fmtCost(total.cost)}${total.unpriced ? ` + ${total.unpriced} unpriced` : ""}`;
+}
+
+function rerunEstimateSummary(title, total) {
+  return `<div class="rr-estimate-summary"><strong>${title} · ${total.count} run${total.count === 1 ? "" : "s"}</strong>
+    <span class="rr-estimate-cost">${rerunEstimateCost(total)}</span>
+    <span>≈ ${fmtTokens(total.tokens)} tokens${total.missing ? ` + ${total.missing} unknown` : ""}</span>
+    <span class="muted">Concurrent duration baseline: ${fmtMs(total.parallel_ms)}${total.missing_time ? ` · ${total.missing_time} unknown` : ""} · combined run time: ${fmtMs(total.work_ms)}</span></div>`;
+}
+
 async function viewReruns() {
-  const data = await api("/api/reruns");
+  clearTimeout(rerunState.limitsTimer);
+  const [data, limits] = await Promise.all([
+    api("/api/reruns"),
+    api("/api/limits").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; }),
+  ]);
   rerunState.picked = new Set([...rerunState.picked].filter((id) => data.queue.some((q) => q.id === id)));
   const picked = data.queue.filter((q) => rerunState.picked.has(q.id));
-  const estimate = picked.reduce((t, q) => t + (q.prompt?.total_cost_usd || 0), 0);
+  const estimate = rerunEstimateTotal(picked);
+  const fullEstimate = rerunEstimateTotal(data.queue);
   const done = data.launched.filter((x) => x.replay);
   app.innerHTML = `
     <div class="prompts-page reruns-page">
@@ -2851,25 +3227,39 @@ async function viewReruns() {
         <div class="hero-copy">
           <h1><span class="hero-name">Reruns · ${data.queue.length} queued</span>Queue reruns, launch them together. <em>Did your change pay off?</em></h1>
           <p>Queue a prompt from its page (<strong>Add to queue</strong>), or many from the Prompts page or a tag's page (<strong>Select prompts</strong>, then
-            <strong>Queue reruns</strong>). Launching opens one Claude Code window per rerun, interactively: you approve their actions.
+            <strong>Queue reruns</strong>). Run one, several selected prompts, or the whole queue together, using each rerun's saved settings.
             Once imported, each rerun is linked to its original, with what it cost against it.</p>
         </div>
       </header>
 
+      <section class="card rerun-limits" aria-labelledby="rerun-limits-title">
+        <div class="rerun-limits-head"><h2 id="rerun-limits-title">Usage limits & reset status</h2>
+          <button type="button" class="btn" data-refresh-limits>Refresh status</button></div>
+        <p class="muted">Latest reported usage and reset times. Updates every minute while this page is open.</p>
+        <div class="rerun-limits-agents" id="rerun-limits-status" aria-live="polite">${limits === null ? '<p class="muted">Could not load usage limits. Try refreshing the status.</p>' : limits.length ? homeLimits(limits) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>'}</div>
+        <p class="muted" id="rerun-limits-error" role="status" hidden></p>
+      </section>
+
       <h2 class="page-sec">Queue <span class="muted">${data.queue.length}</span></h2>
       ${data.queue.length ? `
+        <div class="rr-estimate-grid">${rerunEstimateSummary("Entire queue", fullEstimate)}${picked.length ? rerunEstimateSummary("Selected", estimate) : ""}</div>
+        <p class="muted rr-estimate-note">Estimates reuse the original token volume at the chosen model's current configured prices, assuming a cold cache and unchanged subagent models. Duration uses original run times; concurrent duration assumes all runs start together. Actual usage can vary with model, effort, tools and caching. Judge calls are extra. API estimates are not subscription charges; subscription percentage impact cannot be calculated from the reported limits.</p>
         <div class="select-bar rerun-bar">
           <strong>${picked.length} selected</strong>
           <button type="button" class="btn" data-rr-all ${picked.length === data.queue.length ? "disabled" : ""}>Select all ${data.queue.length}</button>
           ${picked.length ? '<button type="button" class="link-btn" data-rr-none>Clear</button>' : ""}
           <span class="toolbar-spacer"></span>
-          ${picked.length ? `<span class="muted select-hint">their originals cost ${fmtCost(estimate)} together</span>` : ""}
           <button type="button" class="btn primary" data-rr-launch ${picked.length ? "" : "disabled"}>↻ Run ${picked.length || ""} selected</button>
+          <button type="button" class="btn" data-rr-launch-all>↻ Run all ${data.queue.length}</button>
         </div>
         <p id="rr-status" class="replay-status" hidden></p>
         <div class="rr-list">${data.queue.map((q) => `<article class="rr-row ${rerunState.picked.has(q.id) ? "selected" : ""}" data-rr="${q.id}">
           <input type="checkbox" class="psel" data-rr-pick="${q.id}" ${rerunState.picked.has(q.id) ? "checked" : ""} aria-label="Select this rerun">
-          <div class="rr-body">${rerunPromptCell(q.prompt)}<div class="rr-settings">${rerunSettings(q)}</div></div>
+          <div class="rr-body">${rerunPromptCell(q.prompt)}<div class="rr-settings">${rerunSettings(q)}</div>
+            ${q.prompt?.cwd ? `<span class="pmeta">Directory: <code>${esc(q.prompt.cwd)}</code></span>` : '<span class="pmeta">Original directory unavailable</span>'}
+            <div class="rr-consumption">${q.estimate ? `<strong>${rerunEstimateCost(rerunEstimateTotal([q]))}</strong><span>≈ ${fmtTokens(q.estimate.total_tokens)} tokens</span><span>${fmtTokens(q.estimate.input_tokens)} input · ${fmtTokens(q.estimate.output_tokens)} output</span><span>Time baseline ${fmtMs(q.estimate.duration_ms)}</span><span>${esc(q.estimate.model || "Model unknown")}</span>` : '<span>Estimate unavailable: original prompt is outside the current history.</span>'}</div>
+            <button type="button" class="link-btn" data-rr-launch-one="${q.id}">Run this rerun</button>
+          </div>
           <span class="muted rr-added" title="${esc(fmtDate(q.added_at))}">queued ${esc(fmtAgo(q.added_at))}</span>
           <button type="button" class="rr-remove" data-rr-remove="${q.id}" title="Take it out of the queue" aria-label="Take it out of the queue">✕</button>
         </article>`).join("")}</div>`
@@ -2894,6 +3284,31 @@ async function viewReruns() {
     </div>`;
 
   const page = app.querySelector(".reruns-page");
+  const limitStatus = page.querySelector("#rerun-limits-status");
+  const refreshLimits = async () => {
+    if (!limitStatus.isConnected) return;
+    clearTimeout(rerunState.limitsTimer);
+    const button = page.querySelector("[data-refresh-limits]");
+    const errorBox = page.querySelector("#rerun-limits-error");
+    button.disabled = true;
+    try {
+      const latest = await api("/api/limits");
+      if (!limitStatus.isConnected) return;
+      limitStatus.innerHTML = latest.length ? homeLimits(latest) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>';
+      errorBox.hidden = true;
+    } catch (error) {
+      if (error instanceof StaleNavigation || !limitStatus.isConnected) return;
+      errorBox.textContent = "Could not refresh reset status. Displayed figures are from the last successful check.";
+      errorBox.hidden = false;
+    } finally {
+      if (limitStatus.isConnected) {
+        button.disabled = false;
+        rerunState.limitsTimer = setTimeout(refreshLimits, 60000);
+      }
+    }
+  };
+  page.querySelector("[data-refresh-limits]").onclick = refreshLimits;
+  rerunState.limitsTimer = setTimeout(refreshLimits, 60000);
   // while reruns run, check again every few seconds (only while this page is shown)
   clearTimeout(rerunState.timer);
   if (data.launched.some((x) => x.status === "running" || x.rating?.status === "rating")) {
@@ -2913,6 +3328,12 @@ async function viewReruns() {
     if (e.target.closest("[data-rr-all]")) { data.queue.forEach((q) => rerunState.picked.add(q.id)); return viewReruns(); }
     if (e.target.closest("[data-rr-none]")) { rerunState.picked.clear(); return viewReruns(); }
     if (e.target.closest("[data-rr-launch]")) return launchPicked(picked, estimate);
+    if (e.target.closest("[data-rr-launch-all]")) return launchPicked(data.queue, fullEstimate);
+    const single = e.target.closest("[data-rr-launch-one]");
+    if (single) {
+      const items = data.queue.filter((q) => q.id === Number(single.dataset.rrLaunchOne));
+      return launchPicked(items, rerunEstimateTotal(items));
+    }
     // a click on a queued row (not its links) picks it
     if (row && (pick || !e.target.closest("a"))) {
       const id = Number(row.dataset.rr);
@@ -2924,18 +3345,21 @@ async function viewReruns() {
 
 async function launchPicked(picked, estimate) {
   const n = picked.length;
-  if (!n || !confirm(`Open ${n} terminal window${n === 1 ? "" : "s"}, each running Claude Code on one prompt?\n\nThey run at the same time, ` +
-      `and you approve each one's actions. Their originals cost ${fmtCost(estimate)} together.`)) return;
+  const terminals = picked.filter((q) => q.mode === "terminal").length;
+  if (!n || !confirm(`Launch ${n} rerun${n === 1 ? "" : "s"} together?\n\n${n - terminals} in the background · ${terminals} in terminal windows.\n` +
+      `Estimated consumption: ${rerunEstimateCost(estimate)}, ≈ ${fmtTokens(estimate.tokens)} tokens${estimate.missing ? ` + ${estimate.missing} unknown` : ""}.\nConcurrent duration baseline: ${fmtMs(estimate.parallel_ms)}${estimate.missing_time ? ` (${estimate.missing_time} unknown)` : ""}.\nActual consumption may differ; judge calls are extra.`)) return;
   const { results } = await api("/api/reruns/launch", { method: "POST", body: { ids: picked.map((q) => q.id) } });
   rerunState.picked.clear();
   await viewReruns();
-  const opened = results.filter((r) => r.terminal), manual = results.filter((r) => !r.terminal && !r.error), failed = results.filter((r) => r.error);
+  const opened = results.filter((r) => r.terminal), running = results.filter((r) => r.mode === "background" && !r.error),
+    manual = results.filter((r) => r.mode !== "background" && !r.terminal && !r.error), failed = results.filter((r) => r.error);
   const status = document.getElementById("rr-status") || document.getElementById("rr-status-empty");
   status.innerHTML = [
-    opened.length ? `${plural(opened.length, "Claude Code window")} opened.` : "",
+    opened.length ? `${plural(opened.length, "terminal window")} opened.` : "",
+    running.length ? `${plural(running.length, "rerun")} started in the background.` : "",
     manual.length ? `No terminal window could be opened for ${manual.length}: run ${manual.length === 1 ? "this" : "these"} yourself (they are linked once imported):
       <pre><code>${esc(manual.map((r) => r.command).join("\n"))}</code></pre>` : "",
-    failed.length ? `${plural(failed.length, "rerun")} could not start: ${failed.map((r) => esc(r.error)).join("; ")}.` : "",
+    failed.length ? `${plural(failed.length, "rerun")} could not start and stayed queued: ${failed.map((r) => esc(r.error)).join("; ")}.` : "",
   ].filter(Boolean).join(" ");
   status.hidden = false;
 }
@@ -2971,7 +3395,7 @@ async function viewCompare(query) {
         ${judgeCardHtml(data.rating, models, settings.judge_model)}
         ${compareRunsHtml(data.a, data.b, labels)}
       </div>
-      <p class="muted group-note"><a href="#/prompt/${encodeURIComponent(a)}">Open the first run</a> · <a href="#/prompt/${encodeURIComponent(b)}">Open the second run</a></p>
+      <p class="muted group-note"><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(a)}">Open the first run</a> · <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(b)}">Open the second run</a></p>
     </div>`;
   const go = (x, y) => { location.hash = `#/compare?${new URLSearchParams({ a: x, b: y })}`; };
   document.getElementById("pick-a").onchange = (e) => go(e.target.value, b);
@@ -3000,7 +3424,7 @@ async function route() {
     else if (view === "sessions") await viewSessions(query);
     else if (view === "session") await viewSession(decodeURIComponent(arg));
     else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)), query);
-    else if (view === "setup") await viewSetup();
+    else if (view === "setup" && !EXAMPLES) await viewSetup();
     else if (view === "reruns") await viewReruns();
     else if (view === "compare") await viewCompare(query);
     else await viewHome(query);
@@ -3024,10 +3448,20 @@ document.querySelectorAll("[data-cost-source]").forEach((b) => b.onclick = async
   await route(); // every cost on the page changes
 });
 
-// not through api(): it belongs to the top bar, not to a page, and must survive the first navigation
-fetch("/api/settings").then((r) => r.json()).then((s) => showCostSource(s.cost_source));
+// the example app has nothing to import nor set up: a banner says what it is and leads back
+if (EXAMPLES) {
+  document.title = "Rerunly examples";
+  document.querySelector('[data-nav="setup"]').remove();
+  document.getElementById("refresh").remove();
+  document.querySelector(".topbar").insertAdjacentHTML("afterend", `<div class="examples-banner" role="note">
+    <strong>Example app</strong><span>Illustrative records only: no agent was run, and your own history is not shown here.</span>
+    <a href="/">Back to your Rerunly →</a></div>`);
+}
 
-document.getElementById("refresh").onclick = async (e) => {
+// not through api(): it belongs to the top bar, not to a page, and must survive the first navigation
+fetch(BASE + "/api/settings").then((r) => r.json()).then((s) => showCostSource(s.cost_source));
+
+if (!EXAMPLES) document.getElementById("refresh").onclick = async (e) => {
   e.target.disabled = true;
   try { await api("/api/ingest", { method: "POST" }); await route(); } finally { e.target.disabled = false; }
 };
