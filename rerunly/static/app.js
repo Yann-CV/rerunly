@@ -2485,7 +2485,7 @@ async function viewSetup() {
       <p class="muted">Removing an agent keeps its imported history. Add it again to resume imports.</p>
     </div>
     <h2>Examples</h2>
-    <div class="card"><div class="setup-row"><div><strong>Explore Rerunly with simple examples</strong><p class="muted">Prompt tuning, Claude versus Codex, cache savings, skill versions, subagents, quality verdicts and a blocked rerun.
+    <div class="card"><div class="setup-row"><div><strong>Explore Rerunly with simple examples</strong><p class="muted">Prompt tuning, Claude and Codex records, cache savings, skill versions, subagents, quality verdicts and a blocked rerun.
       Illustrative data only; no agents are run. All examples are tagged <code>rerunly-examples</code> and can be excluded from totals like any other tag.</p></div>
       <div>${st.example_prompts ? '<a class="btn" href="#/tag/rerunly-examples">View examples</a> <button class="btn" id="remove-examples">Remove examples</button>' : '<button class="btn" id="load-examples">Add examples</button>'}</div></div></div>
     <h2>Dashboard</h2>
