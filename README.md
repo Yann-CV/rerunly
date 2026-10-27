@@ -462,14 +462,14 @@ special service tiers, and hosted tools can differ.
 **Setup → Examples → Add examples** loads eight illustrative records, all tagged
 `rerunly-examples`. Open that tag to browse the set, or use the smaller tags:
 
-- `example:prompt-tuning`: broad Claude request versus focused Codex prompt, with a reference and an illustrative equivalent-output verdict.
+- `example:prompt-tuning`: broad versus focused prompts using the same Codex model and effort, with a reference and an illustrative equivalent-coverage verdict.
 - `example:cache`: the same task with cold and warm input caches.
 - `example:skills` and `example:subagents`: two skill snapshots and a delegated edge-case review, including persona and subagent cost.
-- `example:quality`: a cheaper rerun that misses a test case and receives an illustrative worse verdict.
+- `example:quality`: a cheaper review that omits division-by-zero verification and receives an illustrative worse verdict.
 - `example:blocked`: an unattended rerun needing a release-version decision.
 
 All tokens, timings, outputs and ratings in this set are illustrative; no agents
-or LLM judges are run. They appear in totals while visible. Hide the set with
+or LLM judges are run. The savings demonstrate dashboard comparisons, not measured improvements. Claude Code records appear in the cache examples; Codex records cover prompt and skill comparisons. They appear in totals while visible. Hide the set with
 **Setup → Excluded from the history → Examples**, or delete it with **Remove
 examples**. Adding the set again does not duplicate it. The CLI equivalents are
 `uv run rerunly examples` and `uv run rerunly examples --remove`.
