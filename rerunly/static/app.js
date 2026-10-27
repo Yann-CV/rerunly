@@ -238,7 +238,7 @@ function tagChips(tags, { removable = false } = {}) {
     CATEGORY_ORDER[tagCategory(a)] - CATEGORY_ORDER[tagCategory(b)] || a.tag.localeCompare(b.tag));
   return sorted.map((t) => {
     const cat = tagCategory(t);
-    const remove = removable && t.kind === "human" && !t.from_rule
+    const remove = removable && t.kind === "human"
       ? `<button title="Remove tag" data-remove-tag="${esc(t.tag)}">×</button>` : "";
     const title = t.from_rule ? "Your tag, added by one of your auto-tag rules" : `${tagNoun(cat)}: ${CATEGORY_INFO[cat].help}`;
     return `<span class="chip cat-${cat}" title="${esc(title)}"><a href="#/tag/${encodeURIComponent(t.tag)}">${esc(t.tag)}</a>${remove}</span>`;
@@ -588,6 +588,7 @@ function promptRow(p, maxCost, { compact = false } = {}) {
       <span class="pcost-line">${starHtml}<span class="pcost">${fmtCost(p.total_cost_usd)}</span></span>
       <span class="cost-bar" title="Cost relative to the most expensive prompt shown"><i style="width:${pct}%"></i></span>
       <span class="pmeta">${meta}</span>
+      ${listState.lockTag && !compact && listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button class="link-btn" type="button" data-untag="${esc(p.id)}">Remove from tag</button>` : ""}
       ${ref && !isRef ? refDelta(p.total_cost_usd, ref.total_cost_usd) : isRef ? '<span class="pdelta ref-badge">◆ Reference</span>' : ""}
     </div>
   </article>`;
@@ -845,6 +846,7 @@ function selectBarHtml() {
     ${listState.lockTag && listState.reference ? `<button type="button" class="btn" data-queue-selected="reference" ${n ? "" : "disabled"}
       title="Rerun them with the reference run's model, effort and Claude Code release">↻ … with the reference's settings</button>` : ""}
     <button type="button" class="btn primary" data-new-tag ${n ? "" : "disabled"}>Tag ${n || ""} selected…</button>
+    ${listState.lockTag && listState.tags.some((t) => t.tag === listState.lockTag && t.kind === "human") ? `<button type="button" class="btn" data-untag-selected ${n ? "" : "disabled"}>Remove selected from tag</button>` : ""}
     <button type="button" class="btn" data-toggle-select>Done</button>
   </div>`;
 }
@@ -890,7 +892,7 @@ function bindPromptResults() {
   renderSelectBar();
   // while selecting, a click on a row (its checkbox included) selects it instead of opening it
   results.onclick = (e) => {
-    if (e.target.closest("[data-ref]")) return; // the reference star: handled by the page
+    if (e.target.closest("[data-ref], [data-untag]")) return; // the reference star and Remove from tag: handled by the page
     if (!listState.selecting || e.target.closest("[data-filter-tag]")) return;
     const row = e.target.closest(".prow[data-id]");
     if (!row || !row.querySelector(".psel")) return;
@@ -2051,6 +2053,7 @@ async function viewTag(tag, query = new URLSearchParams()) {
     <div class="prompts-page tag-page">
       <a class="crumb" href="#/tags">← All tags</a>
       ${tagHeadHtml(info, rules)}
+      <div id="tag-curation"></div>
       <div id="prompt-summary"></div>
       <div id="prompt-highlights"></div>
       <div id="tag-reference"></div>
@@ -2076,6 +2079,51 @@ async function viewTag(tag, query = new URLSearchParams()) {
   rerenderToolbar();
   await renderPrompts();
   if (tagCategory(info) !== "human") return;
+  // duplicates and priorities come after the page is usable: the check can take a while on a large tag
+  let duplicates = [];
+  const removePrompts = async (ids) => {
+    await api(`/api/tags/${enc}/prompts`, { method: "DELETE", body: { prompt_ids: ids } });
+    route();
+  };
+  app.querySelector(".tag-page").addEventListener("click", async (e) => {
+    const button = e.target.closest("[data-untag], [data-untag-selected], #remove-duplicates");
+    if (!button) return;
+    e.preventDefault();
+    const ids = button.id === "remove-duplicates" ? duplicates.map((p) => p.id)
+      : button.hasAttribute("data-untag-selected") ? [...listState.selected] : [button.dataset.untag];
+    await removePrompts(ids);
+  });
+  const loadCuration = async () => {
+    const box = document.getElementById("tag-curation");
+    let curation;
+    try { curation = await api(`/api/tags/${enc}/curation`); }
+    catch (error) { if (box) box.innerHTML = `<p class="muted">Could not check this tag for duplicates: ${esc(error.message)}</p>`; return; }
+    if (!box?.isConnected) return; // the page changed meanwhile
+    duplicates = curation.duplicates;
+    box.innerHTML = `
+      <section class="card" aria-label="Tag curation">
+        ${duplicates.length ? `<div role="status"><strong>⚠ ${duplicates.length} potentially duplicate prompt${duplicates.length === 1 ? "" : "s"}</strong>
+          <p>These prompts have at least ${Math.round(curation.threshold * 100)}% word overlap with a retained prompt. Review the differences before removing them. The reference is retained when available; otherwise the earliest prompt is retained. Removing only changes this tag and persists after rescans.</p>
+          <button class="btn" type="button" id="remove-duplicates">Remove all ${duplicates.length} flagged prompts from tag</button>
+          ${duplicates.map((p) => `<div class="setup-row"><div><a href="#/prompt/${encodeURIComponent(p.id)}">${esc(p.text)}</a>
+            <p class="muted">${Math.round(p.similarity * 100)}% overlap with retained prompt: <a href="#/prompt/${encodeURIComponent(p.similar_to.id)}">${esc(p.similar_to.text)}</a></p></div>
+            <button class="btn" type="button" data-untag="${esc(p.id)}">Remove from tag</button></div>`).join("")}</div>`
+          : '<p>No potentially duplicate prompts found. Existing and newly added prompts are checked whenever you open this page.</p>'}
+        <form id="tag-priorities"><strong>Tags that take priority over this tag</strong>
+          <p>If a prompt has any selected tag, it will be excluded from this tag. Applies to existing and future prompts. Clearing a priority restores eligible prompts.</p>
+          <select id="preferred-tags" multiple aria-label="Tags taking priority">${tags.filter((t) => t.tag !== tag).map((t) => `<option value="${esc(t.tag)}" ${curation.preferred_tags.includes(t.tag) ? "selected" : ""}>${esc(t.tag)}</option>`).join("")}</select>
+          <button class="btn" type="submit">Save priorities</button><span id="priority-error" role="alert"></span>
+        </form>
+      </section>`;
+    document.getElementById("tag-priorities").onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        await api(`/api/tags/${enc}/priorities`, { method: "PUT", body: { preferred_tags: [...document.getElementById("preferred-tags").selectedOptions].map((o) => o.value) } });
+        route();
+      } catch (error) { document.getElementById("priority-error").textContent = error.message; }
+    };
+  };
+  loadCuration();
   document.getElementById("delete-tag").onclick = async () => {
     const n = info.prompts || 0;
     const rulesText = rules.length === 1 ? " and its rule" : rules.length ? ` and its ${rules.length} rules` : "";

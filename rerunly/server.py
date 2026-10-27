@@ -14,9 +14,9 @@ from fastapi.staticfiles import StaticFiles
 
 from . import background as bg, db, judge, otel, replay, runner
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
-from .ingest import apply_rules, ingest, session_texts
+from .ingest import apply_curation, apply_rules, ingest, session_texts
 from .pricing import DEFAULT_PRICES
-from .tagging import rule_matches, rule_scope, similarity, split_any
+from .tagging import jaccard, rule_matches, rule_scope, similarity, split_any, words
 
 STATIC = Path(__file__).parent / "static"
 CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
@@ -631,11 +631,13 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         c = conn()
         _record_creation(c, tag)
         with c:
+            c.execute("DELETE FROM tag_exclusions WHERE prompt_id=? AND tag=?", (prompt_id, tag))
             c.execute(
                 "INSERT INTO tags(prompt_id, tag, auto) VALUES (?,?,0) ON CONFLICT DO UPDATE SET auto=0",
                 (prompt_id, tag),
             )
         add_rule(c, tag, keywords, match, scope)
+        apply_curation(c)
         return tags_for(c, [prompt_id])[prompt_id]
 
     @app.get("/api/rules/preview")
@@ -739,10 +741,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         row = c.execute("SELECT auto FROM tags WHERE prompt_id=? AND tag=?", (prompt_id, tag)).fetchone()
         if row and row["auto"] == 1:
             raise HTTPException(400, "AI tags are derived from the transcript and cannot be removed")
-        if row and row["auto"] == 2:
-            raise HTTPException(400, "this tag comes from keywords or a rule: change them on the tag page")
         with c:
+            c.execute("INSERT OR IGNORE INTO tag_exclusions VALUES (?,?)", (prompt_id, tag))
+            c.execute("DELETE FROM tag_suppressed WHERE prompt_id=? AND tag=?", (prompt_id, tag))
             c.execute("DELETE FROM tags WHERE prompt_id=? AND tag=?", (prompt_id, tag))
+        apply_curation(c)
         return tags_for(c, [prompt_id])[prompt_id]
 
     # ---- tags & projects ------------------------------------------------------
@@ -813,11 +816,75 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         known = {r[0] for r in c.execute(f"SELECT id FROM prompts WHERE id IN ({','.join('?' * len(prompt_ids))})", prompt_ids)} if prompt_ids else set()
         _record_creation(c, tag)
         with c:
+            c.executemany("DELETE FROM tag_exclusions WHERE prompt_id=? AND tag=?", [(i, tag) for i in known])
             c.executemany(
                 "INSERT INTO tags(prompt_id, tag, auto) VALUES (?,?,0) ON CONFLICT DO UPDATE SET auto=0",
                 [(i, tag) for i in prompt_ids if i in known],
             )
-        return {"tag": tag, "tagged": len(known)}
+        apply_curation(c)
+        return {"tag": tag, "tagged": c.execute(
+            f"SELECT COUNT(*) FROM tags WHERE tag=? AND prompt_id IN ({','.join('?' * len(known))})", (tag, *known)).fetchone()[0] if known else 0}
+
+    def require_human_tag(c, tag):
+        if c.execute("SELECT 1 FROM tags WHERE tag=? AND auto=1", (tag,)).fetchone():
+            raise HTTPException(400, "AI tags are derived from transcripts and cannot be curated")
+        if not c.execute("SELECT 1 FROM tag_meta WHERE tag=? UNION SELECT 1 FROM tags WHERE tag=? AND auto!=1", (tag, tag)).fetchone():
+            raise HTTPException(404, "unknown human tag")
+
+    @app.delete("/api/tags/{tag:path}/prompts")
+    def untag_prompts(tag: str, prompt_ids: list[str] = Body(..., embed=True)):
+        c = conn()
+        require_human_tag(c, tag)
+        known = {r[0] for r in c.execute(f"SELECT id FROM prompts WHERE id IN ({','.join('?' * len(prompt_ids))})", prompt_ids)} if prompt_ids else set()
+        with c:
+            for pid in known:
+                c.execute("INSERT OR IGNORE INTO tag_exclusions VALUES (?,?)", (pid, tag))
+                c.execute("DELETE FROM tag_suppressed WHERE prompt_id=? AND tag=?", (pid, tag))
+                c.execute("DELETE FROM tags WHERE prompt_id=? AND tag=? AND auto!=1", (pid, tag))
+        apply_curation(c)
+        return {"tag": tag, "removed": len(known)}
+
+    @app.get("/api/tags/{tag:path}/curation")
+    def tag_curation(tag: str):
+        c = conn()
+        rows = [dict(r) for r in c.execute("SELECT p.id, p.text, p.started_at FROM pv p JOIN tags t ON t.prompt_id=p.id WHERE t.tag=? ORDER BY p.started_at, p.id", (tag,))]
+        reference = c.execute("SELECT prompt_id FROM tag_reference WHERE tag=?", (tag,)).fetchone()
+        if reference:
+            rows.sort(key=lambda r: r["id"] != reference[0])
+        threshold = max(0.8, db.get_settings(c)["similarity_threshold"])
+        # each text is split into words once: every prompt is compared with every retained one
+        kept, duplicates = [], []
+        for row in rows:
+            row_words = words(row["text"])
+            score, other = max(((jaccard(row_words, w), o) for w, o in kept), key=lambda pair: pair[0], default=(0, None))
+            if other and (score >= threshold or row["text"].strip().casefold() == other["text"].strip().casefold()):
+                duplicates.append({**row, "similar_to": other, "similarity": round(score, 3)})
+            else:
+                kept.append((row_words, row))
+        return {"duplicates": duplicates, "threshold": threshold,
+                "preferred_tags": [r[0] for r in c.execute("SELECT preferred_tag FROM tag_priorities WHERE tag=? ORDER BY preferred_tag", (tag,))]}
+
+    @app.put("/api/tags/{tag:path}/priorities")
+    def set_tag_priorities(tag: str, preferred_tags: list[str] = Body(..., embed=True)):
+        c = conn()
+        require_human_tag(c, tag)
+        preferred_tags = sorted(set(t.strip() for t in preferred_tags if t.strip()))
+        known = {r[0] for r in c.execute("SELECT tag FROM tags UNION SELECT tag FROM tag_meta")}
+        if any(t not in known for t in preferred_tags):
+            raise HTTPException(400, "choose existing tags")
+        edges = {}
+        for lower, higher in c.execute("SELECT tag, preferred_tag FROM tag_priorities WHERE tag!=?", (tag,)):
+            edges.setdefault(lower, set()).add(higher)
+        edges[tag] = set(preferred_tags)
+        def cyclic(node, path):
+            return node in path or any(cyclic(n, path | {node}) for n in edges.get(node, ()))
+        if cyclic(tag, set()):
+            raise HTTPException(400, "tag priorities cannot contain a cycle or prioritize themselves")
+        with c:
+            c.execute("DELETE FROM tag_priorities WHERE tag=?", (tag,))
+            c.executemany("INSERT INTO tag_priorities VALUES (?,?)", [(tag, t) for t in preferred_tags])
+        apply_curation(c)
+        return tag_curation(tag)
 
     @app.get("/api/tags/{tag:path}/prompts")
     def tag_prompts(tag: str):
@@ -984,8 +1051,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             prompts = c.execute("DELETE FROM tags WHERE tag = ? AND auto != 1", (tag,)).rowcount
             c.execute("DELETE FROM tag_meta WHERE tag = ?", (tag,))
             c.execute("DELETE FROM tag_reference WHERE tag = ?", (tag,))
+            c.execute("DELETE FROM tag_exclusions WHERE tag=?", (tag,))
+            c.execute("DELETE FROM tag_suppressed WHERE tag=?", (tag,))
+            c.execute("DELETE FROM tag_priorities WHERE tag=? OR preferred_tag=?", (tag, tag))
         if kept != rules:
             db.save_settings(c, {"tag_rules": kept})
+            apply_rules(c, kept)
+        else:
+            apply_curation(c)
         return {"tag": tag, "prompts": prompts, "rules": len(rules) - len(kept)}
 
     async def dashboard_json(request: Request) -> dict:

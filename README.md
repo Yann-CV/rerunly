@@ -457,6 +457,28 @@ existing estimates and reports the missing lookup rather than inventing a price.
 These are API token estimates, not subscription charges; pricing for long contexts,
 special service tiers, and hosted tools can differ.
 
+### Curate prompts within a tag
+
+On a human tag's page, use **Remove from tag** on a run, or select runs and
+choose **Remove selected from tag**. The prompts remain in your history. These
+exclusions persist after rescans and rule changes; adding a prompt to the tag
+again clears its exclusion.
+
+A warning identifies potentially duplicate prompts using at least 80% word
+overlap (or your similarity threshold if higher). It links each flagged prompt
+to the retained prompt so you can review differences and remove flagged prompts
+individually or together. The reference run is retained when available;
+otherwise the earliest prompt is retained. Existing and newly ingested prompts
+are checked whenever the tag page opens. Similarity is a review aid and does not
+prove that two tasks have the same intent.
+
+Under **Tags that take priority over this tag**, select tags that should prevent
+membership in the current tag. This applies to existing and future prompts,
+including manually tagged ones. Clearing a priority restores eligible membership;
+explicit prompt exclusions still apply. Priority chains resolve the preferred
+tags first, and circular priorities are rejected. Transcript-derived AI tags
+can take priority but cannot themselves be curated.
+
 ### Explore with examples
 
 **Setup → Examples → Add examples** loads eight illustrative records, all tagged

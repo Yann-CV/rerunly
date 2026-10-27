@@ -114,7 +114,7 @@ def remove_examples(conn):
     ids = [row[0] for row in conn.execute("SELECT id FROM prompts WHERE source=?", (SOURCE,))]
     with conn:
         for pid in ids:
-            for table in ("tags", "prompt_skill_runs", "agents", "replay_queue"):
+            for table in ("tags", "tag_exclusions", "tag_suppressed", "prompt_skill_runs", "agents", "replay_queue"):
                 conn.execute(f"DELETE FROM {table} WHERE prompt_id=?", (pid,))
             conn.execute("DELETE FROM replays WHERE prompt_id=?", (pid,))
             conn.execute("DELETE FROM run_ratings WHERE base_id=? OR other_id=?", (pid, pid))
@@ -124,4 +124,5 @@ def remove_examples(conn):
         conn.execute("DELETE FROM skill_versions WHERE skill='example-review' AND hash NOT IN (SELECT hash FROM prompt_skill_runs)")
         for tag in TAGS:
             conn.execute("DELETE FROM tag_meta WHERE tag=? AND NOT EXISTS(SELECT 1 FROM tags WHERE tag=?)", (tag, tag))
+            conn.execute("DELETE FROM tag_priorities WHERE (tag=? OR preferred_tag=?) AND NOT EXISTS(SELECT 1 FROM tags WHERE tag=?)", (tag, tag, tag))
     return {"removed": len(ids), "prompts": 0}

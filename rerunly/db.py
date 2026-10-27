@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
 
+CREATE TABLE IF NOT EXISTS tag_exclusions (
+    prompt_id TEXT NOT NULL, tag TEXT NOT NULL,
+    PRIMARY KEY (prompt_id, tag)
+);
+CREATE TABLE IF NOT EXISTS tag_priorities (
+    tag TEXT NOT NULL, preferred_tag TEXT NOT NULL,
+    PRIMARY KEY (tag, preferred_tag)
+);
+CREATE TABLE IF NOT EXISTS tag_suppressed (
+    prompt_id TEXT NOT NULL, tag TEXT NOT NULL, auto INTEGER NOT NULL,
+    PRIMARY KEY (prompt_id, tag)
+);
+
 -- When the user created a human tag (by hand or with keywords), and what it is for. AI tags have
 -- no row: their creation date is their first prompt's.
 CREATE TABLE IF NOT EXISTS tag_meta (

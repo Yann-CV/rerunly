@@ -207,7 +207,7 @@ def test_keyword_tags(client):
     assert tagged == {"prompt-1", "prompt-3"}  # prompt-3 got it from the keywords
     [tag] = [t for t in client.get("/api/prompts/prompt-3").json()["tags"] if t["tag"] == "task:flaky"]
     assert tag["kind"] == "human" and tag["from_rule"]
-    assert client.delete("/api/prompts/prompt-3/tags/task:flaky").status_code == 400  # managed by the rule
+    assert client.delete("/api/prompts/prompt-3/tags/task:flaky").status_code == 200
 
     created = {t["tag"]: t["created_at"] for t in client.get("/api/tags").json()}
     assert created["task:flaky"] > "2026-10-03"  # human tag: when it was created, not its first prompt
@@ -218,6 +218,64 @@ def test_keyword_tags(client):
     client.delete(f"/api/tags/task:flaky/rules/{rule['index']}")
     # the hand-added tag stays, the keyword-assigned one goes
     assert {p["id"] for p in client.get("/api/tags/task:flaky/prompts").json()} == {"prompt-1"}
+
+
+def test_tag_curation_exclusions_and_new_prompts(client, tmp_path):
+    from rerunly.ingest import apply_rules, store_session
+    from rerunly.sources.base import PromptRecord, SessionRecord
+
+    client.post("/api/tags", json={"tag": "tests", "keywords": ["flaky"]})
+    c = db.connect(tmp_path / "d.db")
+    settings = db.get_settings(c)
+    text = c.execute("SELECT text FROM prompts WHERE id='prompt-1'").fetchone()[0]
+    new = PromptRecord(id="new-copy", session_id="new-session", text=text,
+                       started_at="2026-10-04T10:00:00Z")
+    session = SessionRecord("new-session", "test", "repo", "test://new", "v1", prompts=[new])
+    with c:
+        store_session(c, session, settings)
+    apply_rules(c, settings["tag_rules"])
+    flagged = client.get("/api/tags/tests/curation").json()["duplicates"]
+    assert any(p["id"] == "new-copy" and p["similar_to"]["id"] == "prompt-1" for p in flagged)
+    client.put("/api/tags/tests/reference", json={"prompt_id": "new-copy"})
+    flagged = client.get("/api/tags/tests/curation").json()["duplicates"]
+    assert any(p["id"] == "prompt-1" and p["similar_to"]["id"] == "new-copy" for p in flagged)
+    assert client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": [p["id"] for p in flagged]}).status_code == 200
+    # unknown ids are neither counted nor remembered as exclusions
+    assert client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["no-such-prompt"]}).json()["removed"] == 0
+    assert c.execute("SELECT COUNT(*) FROM tag_exclusions WHERE prompt_id='no-such-prompt'").fetchone()[0] == 0
+    ingest(c, force=True)
+    apply_rules(c, settings["tag_rules"])
+    assert {p["id"] for p in client.get("/api/tags/tests/prompts").json()} == {"new-copy"}
+    client.post("/api/tags/tests/prompts", json={"prompt_ids": ["prompt-1"]})
+    assert "prompt-1" in {p["id"] for p in client.get("/api/tags/tests/prompts").json()}
+    assert client.request("DELETE", "/api/tags/project:repo/prompts", json={"prompt_ids": ["prompt-1"]}).status_code == 400
+
+
+def test_tag_priorities_restore_and_reject_cycles(client, tmp_path):
+    from rerunly.ingest import apply_rules
+
+    for tag in ("low", "middle", "high"):
+        client.post("/api/tags", json={"tag": tag, "keywords": ["flaky"]})
+    # Preserve a manual membership while a preferred tag suppresses it.
+    client.post("/api/tags/low/prompts", json={"prompt_ids": ["prompt-1"]})
+    assert client.put("/api/tags/low/priorities", json={"preferred_tags": ["middle"]}).status_code == 200
+    assert client.get("/api/tags/low/prompts").json() == []
+    client.put("/api/tags/middle/priorities", json={"preferred_tags": ["high"]})
+    assert client.get("/api/tags/middle/prompts").json() == []
+    assert len(client.get("/api/tags/low/prompts").json()) == 2  # middle no longer present
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["low"]}).status_code == 400
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["high"]}).status_code == 400
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["unknown"]}).status_code == 400
+    c = db.connect(tmp_path / "d.db")
+    ingest(c, force=True)
+    assert client.get("/api/tags/middle/prompts").json() == []
+    client.put("/api/tags/low/priorities", json={"preferred_tags": ["high"]})
+    client.delete("/api/prompts/prompt-1/tags/low")
+    client.put("/api/tags/low/priorities", json={"preferred_tags": []})
+    apply_rules(c, db.get_settings(c)["tag_rules"])
+    assert {p["id"] for p in client.get("/api/tags/low/prompts").json()} == {"prompt-3"}
+    client.delete("/api/tags/high")
+    assert len(client.get("/api/tags/middle/prompts").json()) == 2
 
 
 def test_create_tag(client):

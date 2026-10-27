@@ -17,9 +17,13 @@ def test_examples_are_tagged_idempotent_and_removable(tmp_path):
     assert c.execute("SELECT COUNT(*) FROM run_ratings").fetchone()[0] == 3
     assert c.execute("SELECT COUNT(*) FROM replays WHERE status='needs_you'").fetchone()[0] == 1
     c.execute("INSERT INTO tag_meta VALUES('keep-me','2026-10-26','User data')")
+    c.execute("INSERT INTO tag_exclusions VALUES('rerunly-example:cache-warm','example:cache')")
+    c.execute("INSERT INTO tag_suppressed VALUES('rerunly-example:cache-cold','example:cache',0)")
+    c.execute("INSERT INTO tag_priorities VALUES('example:quality','example:skills')")
     c.commit()
     assert remove_examples(c) == {"removed": 8, "prompts": 0}
-    for table in ("prompts", "sessions", "tags", "agents", "skill_versions", "prompt_skill_runs", "tag_reference", "run_ratings", "replays"):
+    for table in ("prompts", "sessions", "tags", "agents", "skill_versions", "prompt_skill_runs", "tag_reference", "run_ratings", "replays",
+                  "tag_exclusions", "tag_suppressed", "tag_priorities"):
         assert c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     assert c.execute("SELECT tag FROM tag_meta").fetchone()[0] == "keep-me"
 

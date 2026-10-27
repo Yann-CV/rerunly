@@ -132,6 +132,7 @@ def _link_replay(conn: sqlite3.Connection, session_id: str) -> None:
 def apply_rules(conn: sqlite3.Connection, rules: list[dict]) -> None:
     """Recompute the tags given by auto-tag rules on every prompt."""
     with conn:
+        _restore_suppressed(conn)
         conn.execute("DELETE FROM tags WHERE auto = 2")
         # INSERT OR IGNORE keeps a tag already added by hand (auto = 0) as such.
         insert = "INSERT OR IGNORE INTO tags(prompt_id, tag, auto) VALUES (?,?,2)"
@@ -151,13 +152,55 @@ def apply_rules(conn: sqlite3.Connection, rules: list[dict]) -> None:
                 f"INSERT OR IGNORE INTO tags(prompt_id, tag, auto) SELECT ids.id, ?, 2 FROM ({used}) ids",
                 (r["tag"], f"skill:{r['skill']}"),
             )
-        if not any(rule_scope(r) == "session" for r in rules):
+        if any(rule_scope(r) == "session" for r in rules):
+            for session_id, text in session_texts(conn):
+                tags = rule_tags(text, rules, "session")
+                if tags:
+                    ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (session_id,))]
+                    conn.executemany(insert, [(i, tag) for i in ids for tag in tags])
+        _curate(conn)
+
+
+def apply_curation(conn: sqlite3.Connection) -> None:
+    """Reapply tag exclusions and priorities without recomputing the rules: enough after a tag is
+    added to or removed from some prompts, or a tag's priorities change."""
+    with conn:
+        _restore_suppressed(conn)
+        _curate(conn)
+
+
+def _restore_suppressed(conn: sqlite3.Connection) -> None:
+    """Put back the tags held back by a priority, so priorities are resolved again from scratch."""
+    conn.execute("INSERT OR IGNORE INTO tags SELECT prompt_id, tag, auto FROM tag_suppressed WHERE prompt_id IN (SELECT id FROM prompts)")
+    conn.execute("DELETE FROM tag_suppressed")
+
+
+def _curate(conn: sqlite3.Connection) -> None:
+    """Drop the prompts removed from a tag, then hold back a tag on prompts carrying a tag preferred to it."""
+    conn.execute("DELETE FROM tags WHERE auto != 1 AND EXISTS (SELECT 1 FROM tag_exclusions e WHERE e.prompt_id=tags.prompt_id AND e.tag=tags.tag)")
+    priorities = {}
+    for tag, preferred in conn.execute("SELECT tag, preferred_tag FROM tag_priorities"):
+        priorities.setdefault(tag, set()).add(preferred)
+    # Resolve preferred tags first so chains have deterministic behavior.
+    ordered, visiting, visited = [], set(), set()
+
+    def visit(tag):
+        if tag in visited or tag in visiting:
             return
-        for session_id, text in session_texts(conn):
-            tags = rule_tags(text, rules, "session")
-            if tags:
-                ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (session_id,))]
-                conn.executemany(insert, [(i, tag) for i in ids for tag in tags])
+        visiting.add(tag)
+        for preferred in sorted(priorities.get(tag, ())):
+            visit(preferred)
+        visiting.remove(tag)
+        visited.add(tag)
+        ordered.append(tag)
+
+    for tag in sorted(priorities):
+        visit(tag)
+    held = "FROM tags WHERE tag=? AND auto != 1 AND prompt_id IN (SELECT prompt_id FROM tags WHERE tag=?)"
+    for tag in ordered:
+        for preferred in priorities.get(tag, ()):
+            conn.execute(f"INSERT OR IGNORE INTO tag_suppressed SELECT prompt_id, tag, auto {held}", (tag, preferred))
+            conn.execute(f"DELETE {held}", (tag, preferred))
 
 
 def session_texts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
