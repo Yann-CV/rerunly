@@ -19,7 +19,7 @@ CWD = "/work/repo"
 
 def user(uuid, ts, content, prompt_id, human=True, **extra):
     d = {"type": "user", "uuid": uuid, "timestamp": ts, "sessionId": SESSION, "cwd": CWD, "gitBranch": "main",
-         "promptId": prompt_id, "message": {"role": "user", "content": content}, **extra}
+        "promptId": prompt_id, "permissionMode": "default", "message": {"role": "user", "content": content}, **extra}
     if human:
         d["origin"] = {"kind": "human"}
     return d
@@ -207,7 +207,7 @@ def test_keyword_tags(client):
     assert tagged == {"prompt-1", "prompt-3"}  # prompt-3 got it from the keywords
     [tag] = [t for t in client.get("/api/prompts/prompt-3").json()["tags"] if t["tag"] == "task:flaky"]
     assert tag["kind"] == "human" and tag["from_rule"]
-    assert client.delete("/api/prompts/prompt-3/tags/task:flaky").status_code == 400  # managed by the rule
+    assert client.delete("/api/prompts/prompt-3/tags/task:flaky").status_code == 200
 
     created = {t["tag"]: t["created_at"] for t in client.get("/api/tags").json()}
     assert created["task:flaky"] > "2026-10-03"  # human tag: when it was created, not its first prompt
@@ -218,6 +218,275 @@ def test_keyword_tags(client):
     client.delete(f"/api/tags/task:flaky/rules/{rule['index']}")
     # the hand-added tag stays, the keyword-assigned one goes
     assert {p["id"] for p in client.get("/api/tags/task:flaky/prompts").json()} == {"prompt-1"}
+
+
+def test_tag_curation_exclusions_and_new_prompts(client, tmp_path):
+    from rerunly.ingest import apply_rules, store_session
+    from rerunly.sources.base import PromptRecord, SessionRecord
+
+    client.post("/api/tags", json={"tag": "tests", "keywords": ["flaky"]})
+    c = db.connect(tmp_path / "d.db")
+    settings = db.get_settings(c)
+    text = c.execute("SELECT text FROM prompts WHERE id='prompt-1'").fetchone()[0]
+    new = PromptRecord(id="new-copy", session_id="new-session", text=text,
+                       started_at="2026-10-04T10:00:00Z")
+    session = SessionRecord("new-session", "test", "repo", "test://new", "v1", prompts=[new])
+    with c:
+        store_session(c, session, settings)
+    apply_rules(c, settings["tag_rules"])
+    assert client.get("/api/tags/tests/curation").json()["flagged"] == []
+    client.delete("/api/prompts/prompt-1/tags/tests")
+    flagged = client.get("/api/tags/tests/curation").json()["flagged"]
+    assert any(p["id"] == "new-copy" and p["similar_to"]["id"] == "prompt-1" for p in flagged)
+    client.put("/api/tags/tests/reference", json={"prompt_id": "new-copy"})
+    assert client.delete("/api/prompts/new-copy/tags/tests").status_code == 400
+    # in a selection, the reference is skipped rather than failing the whole request
+    assert client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["new-copy"]}).json() == {
+        "tag": "tests", "removed": 0, "skipped_reference": "new-copy"}
+    flagged = client.get("/api/tags/tests/curation").json()["flagged"]
+    assert all(p["id"] != "new-copy" for p in flagged)
+    assert client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": [p["id"] for p in flagged]}).status_code == 200
+    # unknown ids are neither counted nor remembered as exclusions
+    assert client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["no-such-prompt"]}).json()["removed"] == 0
+    assert c.execute("SELECT COUNT(*) FROM tag_exclusions WHERE prompt_id='no-such-prompt'").fetchone()[0] == 0
+    ingest(c, force=True)
+    apply_rules(c, settings["tag_rules"])
+    assert {p["id"] for p in client.get("/api/tags/tests/prompts").json()} == {"new-copy"}
+    client.post("/api/tags/tests/prompts", json={"prompt_ids": ["prompt-1"]})
+    assert "prompt-1" in {p["id"] for p in client.get("/api/tags/tests/prompts").json()}
+    assert client.request("DELETE", "/api/tags/project:repo/prompts", json={"prompt_ids": ["prompt-1"]}).status_code == 400
+
+
+def test_redundant_negative_examples_stay_excluded(client, tmp_path):
+    client.post("/api/tags", json={"tag": "tests", "keywords": ["flaky"]})
+    # Make the examples identical so this also checks exact-text matching.
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET text=(SELECT text FROM prompts WHERE id='prompt-1') WHERE id='prompt-3'")
+    client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["prompt-1", "prompt-3"]})
+    data = client.get("/api/tags/tests/curation").json()
+    assert {p["id"] for p in data["excluded"]} == {"prompt-1", "prompt-3"}
+    assert [p["id"] for p in data["redundant_exclusions"]] == ["prompt-3"]
+    # no longer an example, still out of the tag
+    assert client.put("/api/tags/tests/exclusions", json={"prompt_ids": ["prompt-3"], "example": False}).json()["updated"] == 1
+    data = client.get("/api/tags/tests/curation").json()
+    assert {p["id"]: p["example"] for p in data["excluded"]} == {"prompt-1": 1, "prompt-3": 0}
+    assert data["redundant_exclusions"] == []
+    assert client.get("/api/tags/tests/prompts").json() == []
+    # Bulk ignore keeps every selected prompt excluded and stops using them as examples.
+    assert client.put("/api/tags/tests/exclusions", json={"prompt_ids": ["prompt-1", "prompt-3"], "example": False}).json()["updated"] == 2
+    data = client.get("/api/tags/tests/curation").json()
+    assert {p["id"]: p["example"] for p in data["excluded"]} == {"prompt-1": 0, "prompt-3": 0}
+    assert client.get("/api/tags/tests/prompts").json() == []
+
+
+def test_restore_puts_the_tag_back_the_way_it_was(client, tmp_path):
+    client.post("/api/tags", json={"tag": "tests", "keywords": ["flaky"]})
+    client.post("/api/tags/tests/prompts", json={"prompt_ids": ["prompt-4"]})  # by hand; prompt-1 and prompt-3 come from the rule
+    client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["prompt-1", "prompt-4"]})
+    assert {p["id"] for p in client.get("/api/tags/tests/prompts").json()} == {"prompt-3"}
+    # prompt-2 is not a prompt, and prompt-3 is not excluded
+    assert client.post("/api/tags/tests/exclusions/restore", json={"prompt_ids": ["prompt-1", "prompt-2", "prompt-3", "prompt-4"]}).json()["restored"] == 2
+    c = db.connect(tmp_path / "d.db")
+    assert dict(c.execute("SELECT prompt_id, auto FROM tags WHERE tag='tests'").fetchall()) == {"prompt-1": 2, "prompt-3": 2, "prompt-4": 0}
+    # a rule-tagged prompt the rule no longer matches does not come back
+    client.request("DELETE", "/api/tags/tests/prompts", json={"prompt_ids": ["prompt-1"]})
+    with c:
+        c.execute("UPDATE prompts SET text='unrelated' WHERE id='prompt-1'")
+    client.post("/api/tags/tests/exclusions/restore", json={"prompt_ids": ["prompt-1"]})
+    assert {p["id"] for p in client.get("/api/tags/tests/prompts").json()} == {"prompt-3", "prompt-4"}
+
+
+def test_legacy_exclusions_restore_manually_after_migration(client, tmp_path):
+    from rerunly.ingest import apply_rules
+
+    client.post("/api/tags", json={"tag": "legacy"})
+    c = db.connect(tmp_path / "d.db")
+    # The old schema stored no assignment type. Both rows must survive migration.
+    with c:
+        c.execute("DROP TABLE tag_exclusions")
+        c.execute("CREATE TABLE tag_exclusions (prompt_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(prompt_id, tag))")
+        c.executemany("INSERT INTO tag_exclusions VALUES (?,?)", [("prompt-1", "legacy"), ("prompt-4", "legacy")])
+    c.close()
+    c = db.connect(tmp_path / "d.db")
+    assert dict(c.execute("SELECT prompt_id, auto FROM tag_exclusions")) == {"prompt-1": -1, "prompt-4": -1}
+    assert client.post("/api/tags/legacy/exclusions/restore", json={"prompt_ids": ["prompt-1"]}).json()["restored"] == 1
+    apply_rules(c, db.get_settings(c)["tag_rules"])
+    assert dict(c.execute("SELECT prompt_id, auto FROM tags WHERE tag='legacy'")) == {"prompt-1": 0}
+    # Restoring a legacy assignment still respects priority and can be undone.
+    client.put("/api/tags/legacy/priorities", json={"preferred_tags": ["project:repo"]})
+    client.post("/api/tags/legacy/exclusions/restore", json={"prompt_ids": ["prompt-4"]})
+    assert client.get("/api/tags/legacy/prompts").json() == []
+    client.put("/api/tags/legacy/priorities", json={"preferred_tags": []})
+    assert {p["id"] for p in client.get("/api/tags/legacy/prompts").json()} == {"prompt-1", "prompt-4"}
+    client.request("DELETE", "/api/tags/legacy/prompts", json={"prompt_ids": ["prompt-1"]})
+    assert c.execute("SELECT auto FROM tag_exclusions WHERE prompt_id='prompt-1' AND tag='legacy'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("prefix", ["model:", "skill:", "project:", "agent:", "persona:", "cmd:"])
+def test_include_rules_support_all_main_tag_types(client, tmp_path, prefix):
+    chosen = next(t["tag"] for t in client.get("/api/tags").json() if t["kind"] == "ai" and t["tag"].startswith(prefix))
+    expected = {p["id"] for p in client.get(f"/api/tags/{chosen}/prompts").json()}
+    response = client.post("/api/tags", json={"tag": "included", "rules": [{"include_tag": chosen}]})
+    assert response.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/included/prompts").json()} == expected
+    ingest(db.connect(tmp_path / "d.db"), force=True)
+    assert {p["id"] for p in client.get("/api/tags/included/prompts").json()} == expected
+    rule = client.get("/api/tags/included/rules").json()[0]
+    # Switch Include to Exclude using the same selected tag, then switch back.
+    response = client.put(f"/api/tags/included/rules/{rule['index']}", json={"preferred_tag": chosen})
+    assert response.status_code == 200
+    assert client.get("/api/tags/included/prompts").json() == []
+    rule = next(r for r in response.json() if r.get("preferred_tag"))
+    response = client.put(f"/api/tags/included/rules/{rule['index']}", json={"include_tag": chosen})
+    assert response.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/included/prompts").json()} == expected
+
+
+def test_include_rules_follow_final_membership_and_reject_cycles(client):
+    client.post("/api/tags/source/prompts", json={"prompt_ids": ["prompt-1"]})
+    client.post("/api/tags", json={"tag": "derived", "rules": [{"include_tag": "source"}]})
+    client.post("/api/tags", json={"tag": "chain", "rules": [{"include_tag": "derived"}]})
+    assert {p["id"] for p in client.get("/api/tags/chain/prompts").json()} == {"prompt-1"}
+    assert client.post("/api/tags/source/rules", json={"include_tag": "chain"}).status_code == 400
+    assert client.post("/api/tags/source/rules", json={"preferred_tag": "chain"}).status_code == 400
+    assert client.post("/api/tags/source/rules", json={"include_tag": "source"}).status_code == 400
+    client.post("/api/tags/blocker/prompts", json={"prompt_ids": ["prompt-1"]})
+    response = client.post("/api/tags/source/rules", json={"preferred_tag": "blocker"})
+    assert response.status_code == 200
+    assert client.get("/api/tags/derived/prompts").json() == []
+    assert client.get("/api/tags/chain/prompts").json() == []
+    rule = next(r for r in response.json() if r.get("preferred_tag"))
+    client.delete(f"/api/tags/source/rules/{rule['index']}")
+    client.post("/api/tags/source/prompts", json={"prompt_ids": ["prompt-4"]})
+    assert {p["id"] for p in client.get("/api/tags/chain/prompts").json()} == {"prompt-1", "prompt-4"}
+    client.delete("/api/prompts/prompt-1/tags/source")
+    assert {p["id"] for p in client.get("/api/tags/chain/prompts").json()} == {"prompt-4"}
+
+
+def test_keyword_exclusion_overrides_assignment_and_restores(client, tmp_path):
+    client.post("/api/tags", json={"tag": "filtered", "rules": [{"include_tag": "project:repo"}]})
+    client.post("/api/tags/filtered/prompts", json={"prompt_ids": ["prompt-1"]})
+    client.post("/api/tags", json={"tag": "dependent", "rules": [{"include_tag": "filtered"}]})
+    response = client.post("/api/tags/filtered/rules", json={"keywords": ["FLAKY", "TEST"], "exclude": True, "match": "all"})
+    assert response.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/filtered/prompts").json()} == {"prompt-4"}
+    assert {p["id"] for p in client.get("/api/tags/dependent/prompts").json()} == {"prompt-4"}
+    c = db.connect(tmp_path / "d.db")
+    ingest(c, force=True)
+    assert {p["id"] for p in client.get("/api/tags/filtered/prompts").json()} == {"prompt-4"}
+    rule = next(r for r in response.json() if r.get("exclude"))
+    updated = client.put(f"/api/tags/filtered/rules/{rule['index']}", json={"keywords": ["release"], "exclude": True})
+    assert updated.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/filtered/prompts").json()} == {"prompt-1", "prompt-3"}
+    assert c.execute("SELECT auto FROM tags WHERE tag='filtered' AND prompt_id='prompt-1'").fetchone()[0] == 0
+    client.delete("/api/prompts/prompt-3/tags/filtered")
+    client.delete(f"/api/tags/filtered/rules/{rule['index']}")
+    assert {p["id"] for p in client.get("/api/tags/filtered/prompts").json()} == {"prompt-1", "prompt-4"}
+
+
+def test_keyword_exclusion_any_session_and_creation(client):
+    response = client.post("/api/tags", json={"tag": "negative-only", "rules": [{"keywords": ["release", "flaky"], "match": "any", "exclude": True}]})
+    assert response.status_code == 200
+    assert client.get("/api/tags/negative-only/prompts").json() == []  # exclusions never assign a tag
+    rules = client.get("/api/tags/negative-only/rules").json()
+    assert len(rules) == 2 and all(r["exclude"] for r in rules)
+    client.post("/api/tags/negative-only/prompts", json={"prompt_ids": ["prompt-1", "prompt-4"]})
+    assert client.get("/api/tags/negative-only/prompts").json() == []
+    client.post("/api/tags", json={"tag": "session-filter", "rules": [
+        {"include_tag": "project:repo"}, {"keywords": ["release notes"], "exclude": True, "scope": "session"}]})
+    assert client.get("/api/tags/session-filter/prompts").json() == []
+    assert client.post("/api/tags/session-filter/rules", json={"exclude": True, "keywords": []}).status_code == 400
+    assert client.post("/api/tags/session-filter/rules", json={"exclude": True, "keywords": ["release"], "scope": "invalid"}).status_code == 400
+
+
+def test_include_tag_session_scope(client):
+    client.post("/api/tags/source/prompts", json={"prompt_ids": ["prompt-1"]})
+    client.post("/api/tags", json={"tag": "session-inclusion", "rules": [{"include_tag": "source", "scope": "session"}]})
+    assert {p["id"] for p in client.get("/api/tags/session-inclusion/prompts").json()} == {"prompt-1", "prompt-3", "prompt-4"}
+
+
+@pytest.mark.parametrize("prefix", ["model:", "skill:", "project:", "agent:", "persona:", "cmd:"])
+def test_priority_rule_supports_all_main_tag_types(client, prefix):
+    chosen = next(t["tag"] for t in client.get("/api/tags").json() if t["kind"] == "ai" and t["tag"].startswith(prefix))
+    ids = {"prompt-1", "prompt-3", "prompt-4"}
+    blocked = {p["id"] for p in client.get(f"/api/tags/{chosen}/prompts").json()}
+    client.post("/api/tags/main-types/prompts", json={"prompt_ids": sorted(ids)})
+    response = client.post("/api/tags/main-types/rules", json={"preferred_tag": chosen})
+    assert response.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/main-types/prompts").json()} == ids - blocked
+    rule = next(r for r in response.json() if r.get("preferred_tag") == chosen)
+    client.delete(f"/api/tags/main-types/rules/{rule['index']}")
+    assert {p["id"] for p in client.get("/api/tags/main-types/prompts").json()} == ids
+
+
+def test_skill_exclusion_rule_survives_ingestion_and_can_be_removed(client, tmp_path):
+    response = client.post("/api/tags", json={"tag": "without-review", "rules": [
+        {"keywords": ["flaky"]}, {"preferred_tag": "skill:review-skill"}]})
+    assert response.status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1"}
+    c = db.connect(tmp_path / "d.db")
+    ingest(c, force=True)
+    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1"}
+    rule = next(r for r in client.get("/api/tags/without-review/rules").json() if r.get("preferred_tag"))
+    assert client.delete(f"/api/tags/without-review/rules/{rule['index']}").status_code == 200
+    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1", "prompt-3"}
+
+
+def test_priority_rules_create_edit_remove_and_validate(client):
+    client.post("/api/tags", json={"tag": "preferred", "keywords": ["flaky"]})
+    response = client.post("/api/tags", json={"tag": "lower", "rules": [
+        {"keywords": ["flaky"]}, {"preferred_tag": "preferred"}]})
+    assert response.status_code == 200
+    assert client.get("/api/tags/lower/prompts").json() == []
+    rules = client.get("/api/tags/lower/rules").json()
+    priority = next(r for r in rules if r.get("preferred_tag"))
+    assert priority["preferred_tag"] == "preferred"
+    assert client.post("/api/tags/preferred/rules", json={"preferred_tag": "lower"}).status_code == 400
+    assert client.post("/api/tags/lower/rules", json={"preferred_tag": "lower"}).status_code == 400
+    assert client.post("/api/tags/lower/rules", json={"preferred_tag": "missing"}).status_code == 400
+    client.post("/api/tags", json={"tag": "other"})
+    updated = client.put(f"/api/tags/lower/rules/{priority['index']}", json={"preferred_tag": "other"})
+    assert updated.status_code == 200
+    assert len(client.get("/api/tags/lower/prompts").json()) == 2
+    priority = next(r for r in updated.json() if r.get("preferred_tag"))
+    # A priority can be converted to an assignment rule, and back again.
+    updated = client.put(f"/api/tags/lower/rules/{priority['index']}", json={"keywords": ["release"]})
+    assert updated.status_code == 200
+    normal = next(r for r in updated.json() if r.get("keywords") == ["release"])
+    updated = client.put(f"/api/tags/lower/rules/{normal['index']}", json={"preferred_tag": "preferred"})
+    assert updated.status_code == 200
+    assert client.get("/api/tags/lower/prompts").json() == []
+    priority = next(r for r in updated.json() if r.get("preferred_tag"))
+    assert client.delete(f"/api/tags/lower/rules/{priority['index']}").status_code == 200
+    assert len(client.get("/api/tags/lower/prompts").json()) == 2
+
+
+def test_tag_priorities_restore_and_reject_cycles(client, tmp_path):
+    from rerunly.ingest import apply_rules
+
+    for tag in ("low", "middle", "high"):
+        client.post("/api/tags", json={"tag": tag, "keywords": ["flaky"]})
+    # Preserve a manual membership while a preferred tag suppresses it.
+    client.post("/api/tags/low/prompts", json={"prompt_ids": ["prompt-1"]})
+    assert client.put("/api/tags/low/priorities", json={"preferred_tags": ["middle"]}).status_code == 200
+    assert client.get("/api/tags/low/prompts").json() == []
+    client.put("/api/tags/middle/priorities", json={"preferred_tags": ["high"]})
+    assert client.get("/api/tags/middle/prompts").json() == []
+    assert len(client.get("/api/tags/low/prompts").json()) == 2  # middle no longer present
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["low"]}).status_code == 400
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["high"]}).status_code == 400
+    assert client.put("/api/tags/high/priorities", json={"preferred_tags": ["unknown"]}).status_code == 400
+    c = db.connect(tmp_path / "d.db")
+    ingest(c, force=True)
+    assert client.get("/api/tags/middle/prompts").json() == []
+    client.put("/api/tags/low/priorities", json={"preferred_tags": ["high"]})
+    client.delete("/api/prompts/prompt-1/tags/low")
+    client.put("/api/tags/low/priorities", json={"preferred_tags": []})
+    apply_rules(c, db.get_settings(c)["tag_rules"])
+    assert {p["id"] for p in client.get("/api/tags/low/prompts").json()} == {"prompt-3"}
+    client.delete("/api/tags/high")
+    assert len(client.get("/api/tags/middle/prompts").json()) == 2
 
 
 def test_create_tag(client):
@@ -510,7 +779,9 @@ def test_tag_reference(client):
     assert client.get("/api/prompts/prompt-3").json()["compare"]["reference"] is None
     # AI tags can have one too
     assert client.put("/api/tags/project:repo/reference", json={"prompt_id": "prompt-4"}).json()["reference"]["id"] == "prompt-4"
-    # a reference that loses the tag, or leaves the history, is no reference
+    # Clear a reference before excluding it as irrelevant.
+    assert client.delete("/api/prompts/prompt-1/tags/task:ref").status_code == 400
+    client.put("/api/tags/task:ref/reference", json={"prompt_id": None})
     client.delete("/api/prompts/prompt-1/tags/task:ref")
     assert client.get("/api/tags/task:ref/reference").json()["reference"] is None
     client.put("/api/settings", json={"excluded_sessions": [SESSION]})
@@ -569,7 +840,7 @@ def test_replay(client, monkeypatch):
     [(cwd, argv)] = launched
     assert cwd == CWD and out["terminal"] == "gnome-terminal"
     assert argv == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
-                    "--model", "claude-haiku-5-5", "--effort", "high", "write the release notes"]
+                    "--model", "claude-haiku-5-5", "--effort", "high", "--permission-mode", "default", "write the release notes"]
     # the installed Claude Code unless asked otherwise, and the prompt's own settings by default
     client.post("/api/prompts/prompt-4/replay", json={"mode": "terminal"})
     assert launched[1][1][:3] == ["claude", "--session-id", launched[1][1][2]] and launched[1][1][-1] == "write the release notes"
@@ -614,6 +885,84 @@ def test_replay_is_linked(projects, tmp_path):
 
 
 
+def test_prompt_rerun_impact_uses_selected_agent_limits_and_model(client, monkeypatch):
+    from rerunly import statusline
+    from rerunly.sources.codex import CodexSource
+
+    monkeypatch.setattr(statusline, "rate_limits", lambda: {
+        "observed_at": "2026-10-01T10:00:00Z", "plan": "Claude plan",
+        "windows": [{"window_minutes": 300, "used_percent": 42, "resets_at": 4_000_000_000}]})
+    monkeypatch.setattr(CodexSource, "rate_limits", lambda self: {
+        "observed_at": "2026-10-01T10:00:00Z", "plan": "Codex plan",
+        "windows": [{"window_minutes": 300, "used_percent": 90, "resets_at": 1}]})
+    original = client.get("/api/prompts/prompt-1/rerun-estimate").json()
+    assert original["agent"] == "Claude Code"
+    assert original["limits"]["windows"][0]["used_percent"] == 42
+    assert original["limits"]["windows"][0]["reset"] is False
+    assert original["estimate"]["model"] == "claude-opus-5-5"
+    cheaper = client.get("/api/prompts/prompt-1/rerun-estimate", params={"model": "claude-haiku-5-5"}).json()
+    assert cheaper["estimate"]["total_tokens"] == original["estimate"]["total_tokens"]
+    assert cheaper["estimate"]["cost_usd"] < original["estimate"]["cost_usd"]
+    for model in ("codex:gpt-6-luna", "gpt-6-luna"):
+        selected = client.get("/api/prompts/prompt-1/rerun-estimate", params={"model": model}).json()
+        assert selected["agent"] == "Codex" and selected["limits"]["plan"] == "Codex plan"
+        assert selected["limits"]["windows"][0]["used_percent"] == 0
+        assert selected["limits"]["windows"][0]["reset"] is True
+        assert selected["estimate"]["model"] == "gpt-6-luna"
+    assert client.get("/api/prompts/prompt-1/rerun-estimate", params={"model": "invalid;command"}).status_code == 400
+    assert client.get("/api/prompts/missing/rerun-estimate").status_code == 404
+    client.put("/api/settings", json={"codex_enabled": False})
+    assert client.get("/api/prompts/prompt-1/rerun-estimate", params={"model": "codex:gpt-6-luna"}).json()["limits"] is None
+
+
+def test_rerun_defaults_to_original_directory_and_permissions(client, monkeypatch, tmp_path):
+    from rerunly import replay
+
+    original_dir = str(tmp_path / "repo" / "worktree" / "nested")
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET cwd=?, permissions=? WHERE id='prompt-1'", (original_dir, json.dumps({"permission_mode": "acceptEdits"})))
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append((cwd, argv)) or "terminal")
+    response = client.post("/api/prompts/prompt-1/replay", json={})
+    assert response.status_code == 200, response.text
+    assert response.json()["mode"] == "terminal"
+    assert launched[0][0] == original_dir
+    assert launched[0][1][launched[0][1].index("--permission-mode") + 1] == "acceptEdits"
+    assert client.post("/api/prompts/prompt-1/replay", json={"mode": "background"}).status_code == 400
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"]})
+    queue = client.get("/api/reruns").json()["queue"]
+    assert queue[0]["permission"] == "same" and queue[0]["prompt"]["cwd"] == original_dir
+    assert client.post("/api/reruns/launch", json={"ids": [queue[0]["id"]]}).status_code == 200
+    assert launched[1][0] == original_dir and "acceptEdits" in launched[1][1]
+    assert client.get("/api/prompts/prompt-1").json()["rerun"]["permission_args"] == ["--permission-mode", "acceptEdits"]
+
+
+def test_missing_original_directory_or_permissions_never_falls_back(client, monkeypatch, tmp_path):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda *args: launched.append(args))
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET permissions='{}' WHERE id='prompt-1'")
+    response = client.post("/api/prompts/prompt-1/replay", json={})
+    assert response.status_code == 400 and "not recorded" in response.json()["detail"]
+    with c:
+        c.execute("UPDATE prompts SET cwd='' WHERE id='prompt-1'")
+    response = client.post("/api/prompts/prompt-1/replay", json={"permission": "ask", "mode": "terminal"})
+    assert response.status_code == 400 and "directory" in response.json()["detail"]
+    assert not launched
+
+
+def test_legacy_permissions_are_reimported_without_transcript_changes(client, tmp_path):
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET permissions=NULL")
+    assert ingest(c)["updated"] == 1
+    assert json.loads(c.execute("SELECT permissions FROM prompts WHERE id='prompt-1'").fetchone()[0]) == {"permission_mode": "default"}
+
+
 def test_rerun_queue(client, monkeypatch):
     from rerunly import replay
 
@@ -630,14 +979,36 @@ def test_rerun_queue(client, monkeypatch):
     assert [(x["prompt_id"], x["model"], x["effort"]) for x in queue] == [
         ("prompt-1", "claude-haiku-5-5", ""), ("prompt-4", "claude-haiku-5-5", ""), ("prompt-1", "", "high")]
     assert queue[0]["prompt"]["text"].startswith("fix the flaky test")
+    assert queue[0]["estimate"]["model"] == "claude-haiku-5-5"
+    assert queue[0]["estimate"]["total_tokens"] == queue[0]["prompt"]["total_tokens"]
+    assert queue[0]["estimate"]["cost_usd"] > 0
     client.delete(f"/api/reruns/queue/{queue[2]['id']}")
     # launch two together: two terminals, out of the queue, listed as launched
-    out = client.post("/api/reruns/launch", json={"ids": [queue[0]["id"], queue[1]["id"]]}).json()["results"]
+    out = client.post("/api/reruns/launch", json={"ids": [queue[0]["id"], queue[1]["id"], queue[0]["id"]]}).json()["results"]
     assert len(out) == 2 and len(launched) == 2 and all("--model" in a for a in launched)
     data = client.get("/api/reruns").json()
     assert data["queue"] == [] and len(data["launched"]) == 2 and data["launched"][0]["replay"] is None
     assert {x["original"]["id"] for x in data["launched"]} == {"prompt-1", "prompt-4"}
     assert client.post("/api/reruns/launch", json={"ids": [1]}, headers={"content-type": "text/plain"}).status_code == 415
+
+
+def test_batch_launch_keeps_failures_queued_and_starts_others(client, monkeypatch):
+    from rerunly import runner
+
+    calls = []
+    def start(cwd, argv, log, on_exit, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            raise OSError("test launch failure")
+        return 12345
+    monkeypatch.setattr(runner, "start", start)
+    monkeypatch.setattr(runner, "alive", lambda pid: True)
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1", "prompt-4"], "mode": "background", "permission": "ask"})
+    queue = client.get("/api/reruns").json()["queue"]
+    results = client.post("/api/reruns/launch", json={"ids": [q["id"] for q in queue]}).json()["results"]
+    assert len(calls) == 2 and len(results) == 2
+    assert "error" in results[0] and results[1]["mode"] == "background"
+    assert [q["id"] for q in client.get("/api/reruns").json()["queue"]] == [queue[0]["id"]]
 
 
 def test_rerun_with_reference_settings(client, monkeypatch):
@@ -737,7 +1108,7 @@ def test_background_rerun(client, monkeypatch):
     [x] = client.get("/api/reruns").json()["launched"]
     assert (x["status"], x["result"], x["cost_usd"]) == ("done", "Release notes drafted.", 0.21)
     # a rerun that ended while nobody watched is caught up on the next listing
-    out = client.post("/api/prompts/prompt-4/replay", json={}).json()
+    out = client.post("/api/prompts/prompt-4/replay", json={"mode": "background", "permission": "ask"}).json()
     monkeypatch.setattr(runner, "alive", lambda pid: False)
     assert next(x for x in client.get("/api/reruns").json()["launched"] if x["session_id"] == out["session_id"])["status"] == "done"
     assert client.post("/api/prompts/prompt-3/replay", json={"permission": "everything"}).status_code == 400
@@ -758,7 +1129,7 @@ def test_llm_judge(client, monkeypatch):
     assert "REFERENCE" in prompt and "Files it edited: x.md" in prompt and "B" in prompt
 
     calls = []
-    def fake_rate(request, reference, rerun, model, workdir, budget=0.5):
+    def fake_rate(request, reference, rerun, model, workdir, budget=0.5, effort=""):
         calls.append(model)
         return {"score": 72, "verdict": "minor", "quality": "same", "look": False, "summary": "Close enough.", "differences": ["shorter"], "cost_usd": 0.01}
     monkeypatch.setattr(judge, "rate", fake_rate)
@@ -780,3 +1151,78 @@ def test_llm_judge(client, monkeypatch):
     # the compare view: both runs with their answers, and the runs to pick from
     data = client.get("/api/compare", params={"a": "prompt-1", "b": "prompt-4"}).json()
     assert data["a"]["answer"] == "done" and data["candidates"][0] == {**data["candidates"][0], "id": "prompt-1", "kind": "original"}
+
+
+def test_usage_limits_reset_once_their_window_has_passed(client, monkeypatch):
+    from rerunly.sources.codex import CodexSource
+
+    monkeypatch.setattr(CodexSource, "rate_limits", lambda self: {"observed_at": "2026-10-27T10:00:00Z", "plan": "plus", "windows": [
+        {"used_percent": 40.0, "window_minutes": 300, "resets_at": 1_000_000_000},  # 2001: long reset
+        {"used_percent": 10.0, "window_minutes": 10080, "resets_at": 4_000_000_000}]})
+    claude, codex = client.get("/api/limits").json()
+    # every connected agent is listed, Claude Code with nothing yet: its statusline capture is not set up
+    assert (claude["agent"], claude["capture"], claude["windows"]) == ("Claude Code", False, [])
+    assert codex["agent"] == "Codex"
+    assert [(w["used_percent"], w["reset"]) for w in codex["windows"]] == [(0, True), (10.0, False)]
+    assert codex["windows"][1]["resets_at"].startswith("2096-")
+    client.post("/api/setup/agents/codex", json={"enabled": False})
+    client.post("/api/setup/agents/claude-code", json={"enabled": False})
+    assert client.get("/api/limits").json() == []
+
+
+def test_claude_statusline_capture_keeps_the_users_statusline(client, tmp_path):
+    import json, subprocess
+    from rerunly import server, statusline
+
+    own = {"type": "command", "command": "input=$(cat); echo \"mine: $(printf '%s' \"$input\" | wc -c)\"", "padding": 1}
+    server.CLAUDE_SETTINGS.write_text(json.dumps({"statusLine": own, "model": "opus"}))
+    assert client.post("/api/setup/statusline?install=true").json()["statusline_installed"]
+    client.post("/api/setup/statusline?install=true")  # twice: the user's command is not lost
+    installed = json.loads(server.CLAUDE_SETTINGS.read_text())
+    assert installed["model"] == "opus" and installed["statusLine"]["padding"] == 1
+    # what Claude Code runs: the user's line is printed, and the input saved for Rerunly
+    payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 42.4, "resets_at": 4_000_000_000},
+                                          "seven_day": {"used_percentage": 7, "resets_at": 4_100_000_000}}})
+    out = subprocess.run(["sh", "-c", installed["statusLine"]["command"]], input=payload, capture_output=True, text=True)
+    assert out.stdout.strip() == f"mine: {len(payload)}"
+    [claude, _] = client.get("/api/limits").json()
+    assert claude["capture"] and [(w["window_minutes"], w["used_percent"]) for w in claude["windows"]] == [(300, 42.4), (10080, 7)]
+    assert not client.post("/api/setup/statusline?install=false").json()["statusline_installed"]
+    assert json.loads(server.CLAUDE_SETTINGS.read_text())["statusLine"] == own
+    assert not (statusline.DIR / "claude-statusline.sh").exists()
+
+
+def test_claude_statusline_capture_without_a_statusline_of_ones_own(client):
+    import json
+    from rerunly import server
+
+    server.CLAUDE_SETTINGS.write_text("{}")
+    client.post("/api/setup/statusline?install=true")
+    assert "rerunly-statusline" in json.loads(server.CLAUDE_SETTINGS.read_text())["statusLine"]["command"]
+    client.post("/api/setup/statusline?install=false")
+    assert "statusLine" not in json.loads(server.CLAUDE_SETTINGS.read_text())
+
+
+def test_default_judge_runs_at_its_effort(client, tmp_path, monkeypatch):
+    import time
+    from rerunly import judge
+    seen = []
+    monkeypatch.setattr(judge, "rate", lambda *a, **k: seen.append((a[3], k.get("effort"))) or
+                        {"score": 90, "verdict": "equivalent", "quality": "same", "look": False, "summary": "", "differences": [], "cost_usd": None})
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET answer='Done' WHERE id IN ('prompt-1', 'prompt-3')")
+    client.put("/api/settings", json={"judge_model": "codex:gpt-6-luna", "judge_effort": "high"})
+    # the default judge at its effort; a model picked for one rating at that model's default
+    client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-3", "force": True})
+    for _ in range(100):
+        if c.execute("SELECT status FROM run_ratings").fetchone()[0] != "rating":
+            break
+        time.sleep(0.02)
+    assert c.execute("SELECT model FROM run_ratings").fetchone()[0] == "codex:gpt-6-luna · high effort"
+    client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-3", "model": "claude-haiku-5-5", "force": True})
+    for _ in range(100):
+        if len(seen) == 2:
+            break
+        time.sleep(0.02)
+    assert seen == [("codex:gpt-6-luna", "high"), ("claude-haiku-5-5", "")]

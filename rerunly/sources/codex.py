@@ -34,6 +34,37 @@ class CodexSource:
     def _files(self):
         return sorted(self.root.rglob("rollout-*.jsonl")) if self.root.is_dir() else []
 
+    def rate_limits(self, newest: int = 5, tail: int = 256 * 1024):
+        """The usage limits Codex reported last (each `token_count` event carries them), read from the end of the
+        newest rollouts only: {"observed_at", "plan", "windows": [{"used_percent", "window_minutes", "resets_at"}]}."""
+        def stamp(path):
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0
+        for path in sorted(self._files(), key=stamp, reverse=True)[:newest]:
+            try:
+                with path.open("rb") as f:
+                    f.seek(max(0, f.seek(0, 2) - tail))
+                    lines = f.read().decode("utf-8", "replace").splitlines()
+            except OSError:
+                continue
+            for raw in reversed(lines):
+                if '"rate_limits"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue  # the first line of the tail can be cut
+                limits = (d.get("payload") or {}).get("rate_limits") if d.get("type") == "event_msg" else None
+                windows = [w for w in ((limits or {}).get(k) for k in ("primary", "secondary"))
+                           if isinstance(w, dict) and w.get("used_percent") is not None]
+                if windows:
+                    return {"observed_at": d.get("timestamp"), "plan": limits.get("plan_type"),
+                            "windows": [{"used_percent": w["used_percent"], "window_minutes": w.get("window_minutes"),
+                                         "resets_at": w.get("resets_at")} for w in windows]}
+        return None
+
     @staticmethod
     def _meta(path):
         # Metadata is the first rollout record; avoid reading whole child transcripts for discovery.
@@ -101,7 +132,8 @@ class CodexSource:
                 session_id=session.id, text=text, started_at=ts, ended_at=ts, cwd=cwd,
                 project=project_name(cwd), git_branch=(meta.get("git") or {}).get("branch", ""),
                 harness="Codex", harness_version=meta.get("cli_version", ""),
-                requested_model=context.get("model", ""), effort=context.get("effort") or context.get("reasoning_effort") or "")
+                requested_model=context.get("model", ""), effort=context.get("effort") or context.get("reasoning_effort") or "",
+                permissions={k: context[k] for k in ("approval_policy", "sandbox_policy") if k in context})
             session.prompts.append(current)
             session.project = session.project or current.project
 
@@ -114,6 +146,10 @@ class CodexSource:
                 if current and (not q.get("turn_id") or q.get("turn_id") == current_turn):
                     current.requested_model = q.get("model") or current.requested_model
                     current.effort = q.get("effort") or q.get("reasoning_effort") or current.effort
+                    current.permissions.update({k: q[k] for k in ("approval_policy", "sandbox_policy") if k in q})
+                    if q.get("cwd"):
+                        current.cwd = q["cwd"]
+                        current.project = project_name(current.cwd)
                 continue
             if kind == "event_msg" and t in ("task_started", "turn_started"):
                 turn_id = q.get("turn_id") or turn_id

@@ -65,7 +65,7 @@ def split_any(rule: dict) -> list[dict]:
 
 def rule_tags(text: str, rules: list[dict], scope: str = "prompt") -> set[str]:
     """Human tags given by the user's auto-tag rules of `scope` to a prompt's (or a session's) text."""
-    return {r["tag"] for r in rules if r.get("tag") and rule_scope(r) == scope and rule_matches(r, text)}
+    return {r["tag"] for r in rules if r.get("tag") and not r.get("exclude") and rule_scope(r) == scope and rule_matches(r, text)}
 
 
 def words(text: str) -> set[str]:

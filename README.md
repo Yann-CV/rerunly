@@ -188,8 +188,8 @@ a timeline by creation date. Click one to open its charts in place.</p>
   original's in substance (0–100, wording aside), whether it is better, the same or worse, and
   whether you should read it: **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it**,
   with a one-line summary and the main differences. The badge shows wherever reruns are listed.
-  Pick the judge model per rerun or per comparison; the default (haiku) is set on the Setup
-  page. The judge runs in an empty scratch folder, saves no session and has a budget cap.
+  Pick the judge model per rerun or per comparison. The default judge (haiku) is set on the
+  Setup page: any model of your linked agents, at any effort that model accepts. The judge runs in an empty scratch folder, saves no session and has a budget cap.
 - **Compare**: any two runs of a prompt (the original, its reruns, its tags' reference runs)
   side by side, with the judge's call and a button to judge them with the model of your choice.
 - **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
@@ -201,6 +201,19 @@ a timeline by creation date. Click one to open its charts in place.</p>
   settings* does it for many prompts at once.
 - **Add to queue** keeps a rerun for later, with the settings picked. Queue many at once from
   the Prompts page or a tag's page: *Select prompts*, then *Queue reruns*.
+- Reruns use the exact recorded working directory, including a nested directory or worktree;
+  a missing directory is never replaced with your home folder. **Same as original** is the
+  default permission setting: Claude Code's recorded permission mode, or Codex's recorded
+  approval policy, sandbox, writable roots and network settings. The default is a terminal
+  so approval prompts remain possible. Background mode requires recorded permissions that
+  do not ask for approval, or an explicit permission override. Missing or unsupported
+  permission metadata requires an explicit choice instead of a guessed permission level.
+  Previously imported histories are reparsed once to capture permission metadata where available.
+- The prompt-page rerun controls show the selected agent's latest usage and reset limits,
+  alongside estimated additional tokens, API cost, and the original duration baseline.
+  The panel follows model/reference selection, offers **Refresh usage**, and refreshes
+  every minute. It cannot predict the added subscription percentage from limit reports;
+  the displayed percentages are current reported usage, not a post-rerun forecast.
 </details>
 
 <details>
@@ -228,10 +241,17 @@ a timeline by creation date. Click one to open its charts in place.</p>
 <details>
 <summary><b>Reruns</b>: a queue, launched together</summary>
 
-- The queued reruns, with their prompt, its original cost and the settings to rerun it with
-  (model, effort, Claude Code release). Pick some, or all, and **Run selected**: each opens its
-  own Claude Code window, all at the same time, after a confirmation saying how many and what
-  their originals cost.
+- Each queued rerun shows estimated cost, input/output tokens, and a duration baseline.
+  Cost reuses original usage at the selected model's configured prices, assuming a cold
+  cache and unchanged subagent models. Actual consumption may differ; judge calls are extra.
+- Launch **Run this rerun**, select several and **Run selected**, or **Run all**. Runs start
+  together using their saved background/terminal settings. The page and launch confirmation
+  show combined consumption for the selection and the full queue. Concurrent duration uses
+  the longest original run; combined run time sums the originals. Unknown prices or missing
+  originals remain visibly unknown, rather than counting as free.
+- Usage limits and reset status appear above the queue. API-price estimates are not
+  subscription charges; the available limit reports cannot predict a subscription percentage.
+  Failed launches stay queued for retry while the other runs can start.
 - **Launched**: every rerun started from the dashboard, and once imported, its cost and time
   against the original.
 </details>
@@ -457,10 +477,57 @@ existing estimates and reports the missing lookup rather than inventing a price.
 These are API token estimates, not subscription charges; pricing for long contexts,
 special service tiers, and hosted tools can differ.
 
+### Curate prompts within a tag
+
+On a human tag's page, use **Exclude from tag** on a run, or select runs and
+choose **Exclude selected from tag**. The prompts remain in your history. These
+exclusions persist after rescans and rule changes; adding a prompt to the tag
+again clears its exclusion. The reference run is skipped in a selection.
+
+A warning identifies possibly irrelevant prompts that resemble examples you
+excluded, using at least 80% word overlap (or your similarity threshold if
+higher). Each warning links to the excluded example. Review and exclude flagged
+prompts individually or together; similarity never excludes them automatically.
+The reference prompt is never flagged and cannot be excluded until you clear
+its reference status. Existing and newly ingested prompts are checked whenever
+the tag page opens.
+
+The **Excluded as irrelevant** list lets you restore a prompt to the tag the way
+it had it: a prompt you tagged by hand is tagged by hand again, and one tagged
+by a rule comes back only if a rule still matches it. Older exclusions whose
+original assignment was not recorded fall back to manual membership on restore.
+Tag priorities still
+apply to restored prompts. An excluded prompt can also stop serving as an
+example while staying excluded: excluded examples that resemble another one
+are identified so you can stop using them individually or together.
+
+Choose **Add a rule → Include tag** or **Add a rule → Exclude tag**.
+Use category buttons to browse your tags, models, skills, projects, agents,
+personas, or commands, and search within the category. Include assigns the
+current tag to prompts carrying the selected tag (or every prompt in their
+session). Exclude keeps those prompts out, including manually assigned ones.
+Exclusions take priority over inclusion. Add one rule per selected tag.
+
+These rules work for existing and future prompts and when creating tags,
+including from a prompt selection. Existing skill and priority rules remain
+editable through the same picker. Removing a rule recomputes eligible membership;
+explicit prompt exclusions still apply. Rules follow the final memberships of
+the tags they depend on, and circular dependencies are rejected.
+To hide skill usage across the dashboard, use **Setup → Excluded from the history**.
+
+Use **Add a rule → Exclude keywords** to keep prompts matching text out of the
+tag, even if an inclusion rule or manual assignment would add them. Match all
+keywords together or any of them, case-insensitively; session scope excludes
+every prompt of a session whose title or prompts match. Removing or editing the
+rule restores eligible membership. Explicit prompt exclusions still apply.
+
 ### Explore with examples
 
-**Setup → Examples → Add examples** loads eight illustrative records, all tagged
-`rerunly-examples`. Open that tag to browse the set, or use the smaller tags:
+**Setup → Examples → Open the example app** opens a separate example app, at
+`/examples/`, holding only eight illustrative records. Your own history never
+shows them, and the example app never shows your history: it cannot import
+transcripts or change your agents' settings. Its records are tagged
+`rerunly-examples`, with smaller tags for each scenario:
 
 - `example:prompt-tuning`: broad versus focused prompts using the same Codex model and effort, with a reference and an illustrative equivalent-coverage verdict.
 - `example:cache`: the same task with cold and warm input caches.
@@ -469,7 +536,9 @@ special service tiers, and hosted tools can differ.
 - `example:blocked`: an unattended rerun needing a release-version decision.
 
 All tokens, timings, outputs and ratings in this set are illustrative; no agents
-or LLM judges are run. The savings demonstrate dashboard comparisons, not measured improvements. Claude Code records appear in the cache examples; Codex records cover prompt and skill comparisons. They appear in totals while visible. Hide the set with
-**Setup → Excluded from the history → Examples**, or delete it with **Remove
-examples**. Adding the set again does not duplicate it. The CLI equivalents are
-`uv run rerunly examples` and `uv run rerunly examples --remove`.
+or LLM judges are run. The savings demonstrate dashboard comparisons, not
+measured improvements. Claude Code records appear in the cache and blocked
+examples; Codex records cover prompt and skill comparisons. The example app is
+rebuilt each time Rerunly starts, so the dates stay recent and any change you
+make there is discarded. Examples added to the history by an earlier version
+are removed from it.

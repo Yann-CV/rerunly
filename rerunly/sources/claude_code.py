@@ -234,6 +234,7 @@ class ClaudeCodeSource:
                     git_branch=d.get("gitBranch", ""),
                     harness="Claude Code",
                     harness_version=d.get("version", ""),
+                    permissions={"permission_mode": d["permissionMode"]} if d.get("permissionMode") else {},
                 )
                 prompts.append(current)
                 session.project = session.project or current.project

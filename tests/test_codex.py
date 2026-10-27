@@ -21,7 +21,8 @@ def rollout(root, sid="s1", records=(), parent=None):
 
 
 def context(turn="t1", model="gpt-6.1-sol"):
-    return ("turn_context", {"turn_id": turn, "model": model, "effort": "high"})
+    return ("turn_context", {"turn_id": turn, "model": model, "effort": "high",
+                             "approval_policy": "never", "sandbox_policy": {"type": "workspace-write"}})
 
 
 def user(text):
@@ -112,7 +113,7 @@ def test_dashboard_codex_flow(tmp_path, monkeypatch):
         response = client.post(f"/api/prompts/{pid}/replay", json={"mode": "terminal", "same_version": True})
         assert response.status_code == 200, response.text
         assert "@openai/codex@0.164.0" in response.json()["command"]
-        response = client.post(f"/api/prompts/{pid}/replay", json={"budget_usd": 1})
+        response = client.post(f"/api/prompts/{pid}/replay", json={"budget_usd": 1, "mode": "background"})
         assert response.status_code == 400 and "budget" in response.json()["detail"]
         response = client.post("/api/reruns/queue", json={"prompt_ids": [pid], "model": "codex:gpt-6-luna"})
         assert response.status_code == 200, response.text
@@ -138,7 +139,7 @@ def test_background_rerun_import_link_and_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "alive", lambda pid: True)
     with TestClient(create_app(path, background=False)) as client:
         pid = client.get("/api/prompts").json()["items"][0]["id"]
-        response = client.post(f"/api/prompts/{pid}/replay", json={"model": "codex:gpt-6-luna", "rate": False})
+        response = client.post(f"/api/prompts/{pid}/replay", json={"model": "codex:gpt-6-luna", "rate": False, "mode": "background"})
         assert response.status_code == 200, response.text
         sid = response.json()["session_id"]
         assert calls[0][1] == {"timeout": 3600}
@@ -207,3 +208,67 @@ def test_setup_links_agents_independently(tmp_path, monkeypatch):
         assert client.post("/api/setup/agents/codex", json={"enabled": "false"}).status_code == 400
         assert client.post("/api/setup/agents/codex", json={"directory": " "}).status_code == 400
         assert client.post("/api/setup/agents/unknown", json={"enabled": True}).status_code == 404
+
+
+def test_rate_limits_come_from_the_newest_rollout(tmp_path):
+    import json, os
+    from rerunly.sources.codex import CodexSource
+
+    def rollout(name, used, mtime):
+        path = tmp_path / name
+        event = {"timestamp": "2026-10-27T10:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+            "plan_type": "plus", "primary": {"used_percent": used, "window_minutes": 300, "resets_at": 1793144251},
+            "secondary": {"used_percent": 10.0, "window_minutes": 10080, "resets_at": 1793652602}}}}
+        path.write_text("\n".join(json.dumps(e) for e in ({"type": "session_meta", "payload": {}}, event,
+                                                        {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": None}})) + "\n")
+        os.utime(path, (mtime, mtime))
+
+    assert CodexSource(tmp_path).rate_limits() is None
+    rollout("rollout-old.jsonl", 90.0, 1_000)
+    rollout("rollout-new.jsonl", 14.0, 2_000)
+    limits = CodexSource(tmp_path).rate_limits()
+    assert limits["plan"] == "plus" and limits["observed_at"] == "2026-10-27T10:00:00Z"
+    assert limits["windows"] == [{"used_percent": 14.0, "window_minutes": 300, "resets_at": 1793144251},
+                                 {"used_percent": 10.0, "window_minutes": 10080, "resets_at": 1793652602}]
+
+
+def test_judge_runs_at_the_chosen_effort(tmp_path, monkeypatch):
+    calls = []
+    rating = {"score": 90, "verdict": "equivalent", "quality": "same", "summary": "Same", "differences": []}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "codex":
+            events = [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(rating)}}, {"type": "turn.completed"}]
+            return type("Result", (), {"returncode": 0, "stdout": "\n".join(json.dumps(e) for e in events), "stderr": ""})()
+        return type("Result", (), {"returncode": 0, "stdout": json.dumps({"result": json.dumps(rating), "total_cost_usd": 0.01}), "stderr": ""})()
+
+    monkeypatch.setattr(judge.subprocess, "run", run)
+    judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "codex:gpt-6-luna", tmp_path, effort="high")
+    judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "claude-haiku-5-5", tmp_path, effort="max")
+    judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "claude-haiku-5-5", tmp_path, effort="bogus; rm -rf /")
+    assert 'model_reasoning_effort="high"' in calls[0]
+    assert calls[1][calls[1].index("--effort") + 1] == "max"
+    assert "--effort" not in calls[2]  # an unknown level is dropped, not passed on
+
+
+def test_models_list_the_efforts_each_accepts(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "models_cache.json").write_text(json.dumps({"models": [
+        {"slug": "gpt-6-luna", "visibility": "list", "default_reasoning_level": "medium",
+         "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]}]}))
+    monkeypatch.setattr(replay, "model_aliases", lambda: ("opus",))
+    monkeypatch.setattr(replay, "claude_efforts", lambda: ("low", "medium", "high", "xhigh", "max"))
+    models = {m["id"]: m for m in replay.agent_models(["claude-haiku-5-5"], [])}
+    assert models["opus"]["agent"] == "claude" and models["claude-haiku-5-5"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    luna = models["codex:gpt-6-luna"]
+    assert (luna["agent"], luna["efforts"], luna["default_effort"]) == ("codex", ["low", "medium", "high"], "medium")
+    assert models["codex:gpt-6-astra"]["efforts"] == list(replay.CODEX_EFFORTS)  # not in the cache: a safe default
+
+
+def test_claude_efforts_come_from_its_help(monkeypatch):
+    replay.claude_efforts.cache_clear()
+    help_text = "  --effort <level>    Effort level for the current session\n                      (low, medium, high, xhigh, max)\n"
+    monkeypatch.setattr(replay.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": help_text})())
+    assert replay.claude_efforts() == ("low", "medium", "high", "xhigh", "max")
+    replay.claude_efforts.cache_clear()

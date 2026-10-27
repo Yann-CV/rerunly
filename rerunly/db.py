@@ -78,6 +78,23 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
 
+-- Prompts taken off a tag: `auto` is how they had it (-1 = unknown legacy assignment,
+-- restored by hand), `example` whether they
+-- serve as examples of what does not belong to the tag.
+CREATE TABLE IF NOT EXISTS tag_exclusions (
+    prompt_id TEXT NOT NULL, tag TEXT NOT NULL,
+    auto INTEGER NOT NULL DEFAULT -1, example INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (prompt_id, tag)
+);
+CREATE TABLE IF NOT EXISTS tag_priorities (
+    tag TEXT NOT NULL, preferred_tag TEXT NOT NULL,
+    PRIMARY KEY (tag, preferred_tag)
+);
+CREATE TABLE IF NOT EXISTS tag_suppressed (
+    prompt_id TEXT NOT NULL, tag TEXT NOT NULL, auto INTEGER NOT NULL,
+    PRIMARY KEY (prompt_id, tag)
+);
+
 -- When the user created a human tag (by hand or with keywords), and what it is for. AI tags have
 -- no row: their creation date is their first prompt's.
 CREATE TABLE IF NOT EXISTS tag_meta (
@@ -180,6 +197,7 @@ def connect(path: Path) -> sqlite3.Connection:
 # table, so inserts listing values in table order keep working.
 ADDED_COLUMNS = [
     ("agents", "persona", "TEXT"), ("agents", "skill", "TEXT"), ("tag_meta", "description", "TEXT"),
+    ("tag_exclusions", "auto", "INTEGER NOT NULL DEFAULT -1"), ("tag_exclusions", "example", "INTEGER NOT NULL DEFAULT 1"),
     # what ran a prompt, to run it again (inserted in this order, after the original columns)
     ("prompts", "harness", "TEXT"), ("prompts", "harness_version", "TEXT"), ("prompts", "effort", "TEXT"),
     ("prompts", "requested_model", "TEXT"),
@@ -187,6 +205,7 @@ ADDED_COLUMNS = [
     ("replay_queue", "release", "TEXT"),
     # what a prompt produced: its final answer, and the files it edited (JSON list)
     ("prompts", "answer", "TEXT"), ("prompts", "files", "TEXT"),
+    ("prompts", "permissions", "TEXT"),
     # how a rerun ran: "terminal" (interactive) or "background" (unattended), and how it ended
     ("replays", "mode", "TEXT"), ("replays", "status", "TEXT"), ("replays", "result", "TEXT"),
     ("replays", "denials", "TEXT"), ("replays", "cost_usd", "REAL"), ("replays", "ended_at", "TEXT"),

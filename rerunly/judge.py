@@ -11,6 +11,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from .replay import EFFORTS
+
 MAX_ANSWER = 30_000
 VERDICTS = ("equivalent", "minor", "major")
 QUALITIES = ("better", "same", "worse", "unclear")
@@ -64,8 +66,10 @@ def judge_agent(model: str) -> tuple[str, str]:
     return "claude", model
 
 
-def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, budget: float = 0.5) -> dict:
-    """Ask an LLM for the rating: the parsed rating, plus its cost when reported by the harness."""
+def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, budget: float = 0.5, effort: str = "") -> dict:
+    """Ask an LLM for the rating, at `effort` ("" = the model's default): the parsed rating, plus its cost when
+    reported by the harness."""
+    effort = effort if effort in EFFORTS else ""
     workdir.mkdir(parents=True, exist_ok=True)
     prompt = rating_prompt(request, reference, rerun)
     agent, model = judge_agent(model)
@@ -74,6 +78,8 @@ def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, 
                 "-c", 'approval_policy="never"']
         if model:
             argv += ["--model", model]
+        if effort:
+            argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
         out = subprocess.run([*argv, prompt], cwd=workdir, capture_output=True, text=True, timeout=600)
         answer = ""
         completed = False
@@ -93,6 +99,8 @@ def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, 
             "--disable-slash-commands", "--max-budget-usd", f"{budget:.2f}"]
     if model:
         argv += ["--model", model]
+    if effort:
+        argv += ["--effort", effort]
     out = subprocess.run(argv, input=prompt, cwd=workdir, capture_output=True,
                          text=True, timeout=600)
     try:

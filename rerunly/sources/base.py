@@ -70,6 +70,7 @@ class PromptRecord:
     # what it produced, to compare runs: the main agent's last message, and the files it edited
     answer: str = ""
     files: set[str] = field(default_factory=set)
+    permissions: dict = field(default_factory=dict)
 
 
 @dataclass
