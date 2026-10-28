@@ -767,6 +767,30 @@ def test_exclude_skills_and_agents(client):
     assert client.get("/api/overview").json()["totals"]["prompts"] == total
 
 
+def test_exclude_other_tag_categories(client):
+    scope = client.get("/api/setup/history").json()
+    [models] = [cat["tags"] for cat in scope["tag_categories"] if cat["key"] == "model"]
+    assert models and not any(cat["key"] == "your" for cat in scope["tag_categories"])
+    total = client.get("/api/overview").json()["totals"]["prompts"]
+    # an AI category: every prompt answered by the model goes
+    model = models[0]
+    client.put("/api/settings", json={"excluded_tags": [model["tag"]]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - model["prompts"]
+    client.put("/api/settings", json={"excluded_tags": []})
+    # your tags: excluded apart from an AI tag of the same name
+    client.post("/api/prompts/prompt-1/tags", json={"tag": model["tag"]})
+    client.post("/api/prompts/prompt-1/tags", json={"tag": "chore"})
+    [your] = [cat["tags"] for cat in client.get("/api/setup/history").json()["tag_categories"] if cat["key"] == "your"]
+    assert {t["tag"] for t in your} == {model["tag"], "chore"}
+    client.put("/api/settings", json={"excluded_your_tags": ["chore"]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - 1
+    assert client.get("/api/prompts/prompt-1").status_code == 404
+    client.put("/api/settings", json={"excluded_your_tags": [model["tag"]]})
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - 1
+    assert next(t for cat in client.get("/api/setup/history").json()["tag_categories"] if cat["key"] == "your"
+                for t in cat["tags"] if t["tag"] == model["tag"])["excluded"]
+
+
 def test_tag_reference(client):
     client.post("/api/tags/task:ref/prompts", json={"prompt_ids": ["prompt-1", "prompt-3"]})
     assert client.get("/api/tags/task:ref/reference").json()["reference"] is None

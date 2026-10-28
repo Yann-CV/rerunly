@@ -256,8 +256,11 @@ def create_prompt_view(conn: sqlite3.Connection, prefer_official: bool, settings
     if settings and settings.get("excluded_sessions"):
         where.append(f"p.session_id NOT IN ({_sql_list(settings['excluded_sessions'])})")
     if settings and settings.get("excluded_tags"):
-        # prompts where the agent used an excluded skill or subagent type (their AI tags)
+        # prompts carrying an excluded AI tag: a skill or subagent type the agent used, a model, ...
         where.append(f"p.id NOT IN (SELECT prompt_id FROM tags WHERE auto = 1 AND tag IN ({_sql_list(settings['excluded_tags'])}))")
+    if settings and settings.get("excluded_your_tags"):
+        # prompts carrying one of your excluded tags, added by hand or by a rule
+        where.append(f"p.id NOT IN (SELECT prompt_id FROM tags WHERE auto IN (0, 2) AND tag IN ({_sql_list(settings['excluded_your_tags'])}))")
     conn.execute("DROP VIEW IF EXISTS temp.pv")
     conn.execute(
         f"CREATE TEMP VIEW pv AS SELECT {', '.join(select)} "

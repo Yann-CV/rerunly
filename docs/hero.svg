@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 440" width="1200" height="440" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 500" width="1200" height="500" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Tune, rerun, compare and judge</title>
+  <desc>Track Claude Code and OpenAI Codex prompts, skills and subagents. Queue reruns and compare cost, time, tokens and output quality. Savings are illustrative.</desc>
   <defs>
     <linearGradient id="h-bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#121a3d"/>
@@ -14,12 +16,12 @@
     <marker id="h-arrow" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="15" markerHeight="15" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#fff" opacity=".55"/>
     </marker>
-    <clipPath id="h-clip"><rect width="1200" height="440" rx="28"/></clipPath>
+    <clipPath id="h-clip"><rect width="1200" height="500" rx="28"/></clipPath>
   </defs>
 
   <g clip-path="url(#h-clip)">
-    <rect width="1200" height="440" fill="url(#h-bg)"/>
-    <rect width="1200" height="440" fill="url(#h-dots)"/>
+    <rect width="1200" height="500" fill="url(#h-bg)"/>
+    <rect width="1200" height="500" fill="url(#h-dots)"/>
     <circle cx="230" cy="90" r="150" fill="#3987e5" opacity=".28" filter="url(#h-blur)"/>
     <circle cx="640" cy="380" r="170" fill="#6250d6" opacity=".35" filter="url(#h-blur)"/>
     <circle cx="1010" cy="120" r="140" fill="#1baf7a" opacity=".2" filter="url(#h-blur)"/>
@@ -63,12 +65,12 @@
     <text y="16" font-size="15" fill="#c9cbe0" text-anchor="middle">rerun</text>
 
     <circle cx="-102.2" cy="59" r="36" fill="#fff" opacity=".5"/>
-    <text x="-102.2" y="64.6" font-size="16" font-weight="700" fill="#1b1b1f" text-anchor="middle">$1.20</text>
+    <text x="-102.2" y="64.6" font-size="16" font-weight="700" fill="#1b1b1f" text-anchor="middle">$0.017</text>
     <circle cx="-67.7" cy="-96.7" r="28" fill="#fff" opacity=".85"/>
-    <text x="-67.7" y="-91.7" font-size="14" font-weight="700" fill="#1b1b1f" text-anchor="middle">$0.74</text>
+    <text x="-67.7" y="-91.7" font-size="14" font-weight="700" fill="#1b1b1f" text-anchor="middle">$0.010</text>
     <circle cx="90.4" cy="-75.8" r="30" fill="#7ef0c4" opacity=".55" filter="url(#h-glow)"/>
     <circle cx="90.4" cy="-75.8" r="22" fill="#7ef0c4"/>
-    <text x="90.4" y="-71.1" font-size="13" font-weight="700" fill="#0d3b2c" text-anchor="middle">$0.41</text>
+    <text x="90.4" y="-71.1" font-size="13" font-weight="700" fill="#0d3b2c" text-anchor="middle">$0.002</text>
   </g>
   <text x="600" y="384" font-size="17" font-weight="600" fill="#fff" text-anchor="middle">You rerun the task</text>
 
@@ -83,9 +85,11 @@
     <polyline points="47,56 107,98 167,128" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity=".8"/>
     <circle cx="167" cy="128" r="5" fill="#fff"/>
     <rect x="30" y="18" width="154" height="30" rx="15" fill="#7ef0c4"/>
-    <text x="107" y="38.5" font-size="15" font-weight="800" fill="#0d3b2c" text-anchor="middle">▼ 66% cheaper</text>
+    <text x="107" y="38.5" font-size="15" font-weight="800" fill="#0d3b2c" text-anchor="middle">▼ 86% cheaper</text>
     <rect x="14" y="190" width="186" height="26" rx="13" fill="#fff" fill-opacity=".12"/>
-    <text x="107" y="208" font-size="13.5" font-weight="600" fill="#e8e9f5" text-anchor="middle">▼ 41% faster · −58% tokens</text>
+    <text x="107" y="208" font-size="13.5" font-weight="600" fill="#e8e9f5" text-anchor="middle">▼ 89% faster · −89% tokens</text>
   </g>
   <text x="993" y="384" font-size="17" font-weight="600" fill="#fff" text-anchor="middle">You see if it paid off</text>
+  <text x="600" y="435" font-size="17" font-weight="600" fill="#e8e9f5" text-anchor="middle">Claude Code + OpenAI Codex · Skills &amp; subagents · Rerun queue · Output comparison &amp; LLM judge</text>
+  <text x="600" y="468" font-size="14" fill="#c9cbe0" text-anchor="middle">Example app: review skill comparison · Judge: worse — omitted division-by-zero verification</text>
 </svg>

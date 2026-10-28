@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/hero.svg" alt="You change a prompt, you rerun the task, Rerunly shows whether it paid off: 66% cheaper" width="900">
+  <img src="docs/hero.svg" alt="Tune prompts or skills, rerun with Claude Code or OpenAI Codex, then compare cost, time, tokens and output quality; savings shown are illustrative" width="900">
 </p>
 
 <p align="center">
@@ -38,33 +38,54 @@ paid off.
 <tr>
 <td width="50%" valign="top">
 
-### 💸 Know the real cost
-Dollars, tokens and time for every prompt, including linked subagents where recorded.
-Compare runs using API price estimates or agent-reported costs where supported.
+### 💸 Know what each task costs
+Bring **Claude Code and Codex** into one history. See dollars, tokens and time for every
+prompt, including linked subagents where recorded, using API price estimates or supported
+agent-reported costs. Check reported account usage and reset times alongside your history.
 
 </td>
 <td width="50%" valign="top">
 
-### 📈 See the trend, not just the bill
-Every task gets a sparkline and a verdict: **▼ 46% cheaper** or **▲ 200% pricier** than its
-previous runs. Similar prompts are lined up automatically, so you compare like with like.
+### 🔁 Rerun it. Change the settings. Measure the difference.
+Launch a recorded task with a different **agent, model, effort or CLI release**, restoring
+captured skills where available. Run it in a terminal or in the background, or queue a whole
+selection. Review estimated cost, tokens and time before launching.
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
-### 🏷️ Tags that write themselves
-Project, model, skill, slash command, subagent type and persona tags are **created
-automatically** where the transcript provides them. Add your own (`task:review-branch`) once, give it keywords, and every
-future prompt that matches is tagged for you.
+### ⚖️ Check that cheaper still does the job
+Compare the original and rerun's **cost, edited files and final answers** side by side.
+An LLM judge highlights substantive differences and flags **Good enough**, **Minor differences**
+or **Look at it**, so you know where to focus your review.
+
+</td>
+<td valign="top">
+
+### 📈 See whether your changes pay off
+Follow cost, time and tokens across repeated tasks with charts and trend badges. Similar
+prompts line up automatically; pick a **reference run** for a tag to compare against your
+baseline and reuse its settings for the next batch.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🏷️ Keep useful comparisons together
+Project, model, skill, command, subagent and persona tags appear automatically where recorded.
+Add your own task tags, automate them with **include/exclude rules**, and curate out irrelevant
+runs without deleting history. Your comparison groups stay under your control.
 
 </td>
 <td valign="top">
 
 ### 🔍 Find the expensive habits
-Order your tags by **most used**, **priciest per run** or **most time in total**. Spot the
-persona that burns tokens, the skill that drags, the project that quietly costs the most.
+Rank tags by **most used**, **priciest per run** or **most time in total**. Trace a costly task
+through its session, agents, cache usage and recorded skill versions to see where the spend
+comes from—and what to try changing next.
 
 </td>
 </tr>
@@ -72,15 +93,17 @@ persona that burns tokens, the skill that drags, the project that quietly costs 
 <td valign="top">
 
 ### ⚡ Always on, never in the way
-Runs in the background with an **icon in your status bar** showing today's spend. Starts at
-login on its own. Imports new history automatically while the dashboard runs.
+Runs in the background with an **icon in your status bar** showing today's spend. Enable
+start at login and let new history import automatically. Missing model prices can be looked
+up automatically from official provider pages, with your overrides taking precedence.
 
 </td>
 <td valign="top">
 
-### 🔒 Yours, and only yours
-No account, no cloud, no upload. A local SQLite file and a local web page. Your prompts
-never leave your machine.
+### 🔒 Your history stays local
+**No Rerunly account or cloud upload.** Imported history lives in a local SQLite file and a
+local dashboard. Reruns and LLM judging use your installed, authenticated agents; automatic
+price lookups send no prompts and can be disabled.
 
 </td>
 </tr>
@@ -110,162 +133,206 @@ That's it. Go do some work, then come back and see what it cost.
 <table>
 <tr>
 <td width="50%" valign="top">
-<img src="docs/screenshots/by-tag.png" alt="Prompts grouped by tag family">
-<p><b>Prompts, by tag</b>: one card per task, with its median cost, trend and latest run, in
-sections per tag family. Order them by most used or priciest per run, or switch to a plain list
-by day. Filter by project, tag or period, and share any view by URL.</p>
+<a href="docs/screenshots/home.png"><img src="docs/screenshots/home.png" alt="Home dashboard with cost totals, expensive runs and tag highlights"></a>
+<p><b>Home at a glance</b>: Total spend, tokens and agent time, plus the most expensive and most repeated prompts. Category highlights help you find where the work goes.</p>
 </td>
 <td width="50%" valign="top">
-<img src="docs/screenshots/prompt.png" alt="A prompt's page with its evolution charts">
-<p><b>A prompt, dissected</b>: the main agent and every subagent side by side (models, cache
-reads and writes, cost, tools), and charts of how this task's cost, time and tokens evolved
-across all its runs.</p>
+<a href="docs/screenshots/prompts.png"><img src="docs/screenshots/prompts.png" alt="Prompt history with search, filters and daily cost totals"></a>
+<p><b>Every prompt in one history</b>: Search and filter by project, tag or period; sort by cost, tokens or time. Select prompts to tag them or queue reruns, and bookmark filtered views.</p>
 </td>
 </tr>
 <tr>
-<td valign="top">
-<img src="docs/screenshots/tag.png" alt="A tag's page in light mode">
-<p><b>A tag's story</b>: runs, total and median cost with its trend, the keyword rules that
-assign it, and its full history.</p>
+<td width="50%" valign="top">
+<a href="docs/screenshots/by-tag.png"><img src="docs/screenshots/by-tag.png" alt="Prompt history grouped into tag cards with costs and trends"></a>
+<p><b>Tasks and trends</b>: Group prompts by tag family to compare median cost, sparklines and recent runs. Order cards by usage, cost or time to spot expensive habits.</p>
 </td>
-<td valign="top">
-<img src="docs/screenshots/tags.png" alt="Tags gallery">
-<p><b>The Tags gallery</b>: every tag as a card, clustered by type and family, or laid out on
-a timeline by creation date. Click one to open its charts in place.</p>
+<td width="50%" valign="top">
+<a href="docs/screenshots/sessions.png"><img src="docs/screenshots/sessions.png" alt="Sessions page listing conversations and their costs"></a>
+<p><b>Whole conversations</b>: Browse sessions across Claude Code and OpenAI Codex, with search, filters and totals. Open a conversation to follow its prompts in order.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/screenshots/prompt.png"><img src="docs/screenshots/prompt.png" alt="Prompt agent breakdown including a reviewer persona and cost, time and token charts"></a>
+<p><b>Every agent and token</b>: See main-agent and subagent models, personas, skill attribution, cache usage, tools and costs. Compare the task’s cost, duration and tokens across runs.</p>
+</td>
+<td width="50%" valign="top">
+<a href="docs/screenshots/session.png"><img src="docs/screenshots/session.png" alt="Session detail with per-agent costs and a prompt timeline"></a>
+<p><b>Inside a session</b>: Inspect the conversation’s totals, agent breakdown and prompt timeline, then open an individual prompt for its skills, reruns and comparisons.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/screenshots/tag.png"><img src="docs/screenshots/tag.png" alt="Tag detail with a reference run, cost trends and prompt curation"></a>
+<p><b>A tag’s story</b>: Set a reference run, track costs and curate the prompts belonging to a task. Keyword, skill and tag rules assign membership; exclusions keep irrelevant runs out.</p>
+</td>
+<td width="50%" valign="top">
+<a href="docs/screenshots/tags.png"><img src="docs/screenshots/tags.png" alt="Tags gallery with category filters, costs and trend cards"></a>
+<p><b>The Tags gallery</b>: Browse automatic project, model, skill and agent tags alongside your own. Switch between cards and a creation timeline, and open a tag’s charts in place.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/screenshots/reruns.png"><img src="docs/screenshots/reruns.png" alt="Reruns page showing completed runs, judge verdicts and a run needing a decision"></a>
+<p><b>Reruns and their status</b>: Queue runs with model, effort, release and permission choices, then launch them together. Review consumption estimates, available usage limits, completed results and runs that need you.</p>
+</td>
+<td width="50%" valign="top">
+<a href="docs/screenshots/compare.png"><img src="docs/screenshots/compare.png" alt="Comparison with cost savings, a worse judge verdict and both final answers"></a>
+<p><b>Savings and output quality</b>: Compare cost, tokens, time, tool calls, edited files and final answers. The LLM judge flags substantive differences: this illustrative cheaper rerun misses a required check.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="docs/screenshots/tag-dark.png"><img src="docs/screenshots/tag-dark.png" alt="The same tag detail page in dark mode"></a>
+<p><b>Light and dark</b>: The dashboard follows your system theme. Tag prefixes and chip shapes distinguish categories alongside their colors in both modes.</p>
 </td>
 </tr>
 </table>
 
+Screenshots use the isolated example app: costs, timings, outputs and judge verdicts are
+illustrative, not measured improvements. Always use the example app for documentation
+illustrations. Click any image for the full-size view.
+
+To refresh these images from the current UI, see [the screenshot capture script](docs/capture_screenshots.py).
+
 ## 🧭 What's inside
 
-<details>
-<summary><b>Prompts page</b>: list or by tag, with filters you can share</summary>
+One local dashboard for **Claude Code and OpenAI Codex**: explore recorded work, group runs
+by task, rerun them with different settings, and compare the cost and the output.
+The detail available depends on what each agent records; see [Supported agents](#-supported-agents).
 
-- A summary band that follows your filters: prompts, total cost, cost per prompt, agent time.
-- A toolbar that stays visible while you scroll: search, **Project** and **Tag** pill menus
-  (searchable, grouped by category), period (today, 7 days, 30 days, all time) and sort
-  (newest, most expensive, longest, most tokens). Click a tag on any prompt to filter by it.
-  Active filters show as removable chips and live in the URL, so any view can be bookmarked.
-- **List** layout: prompts grouped by day with each day's total; each row shows its cost with a
-  bar relative to the most expensive prompt shown, plus tokens, time and subagents.
-- **By tag** layout: one foldable section per tag family (the prefix before `:`, such as
-  `task:`, `project:`, `model:`, `skill:`, `cmd:`, `agent:`), with jump links at the top. Each
-  tag is a card with its median cost per run, trend, sparkline, totals and latest run. A section
-  shows one row of cards (as many as fit), "Show N more tags" reveals the rest, and "Show N
-  more runs" lists a tag's earlier runs. An **Order** menu sorts the cards in two sections:
-  *Tags* (most used, recently used, newest tags, A to Z) and *Timing, cost & usage* (priciest
-  per run, most expensive in total, longest per run, most time in total, most tokens per run).
-  Prompts without any of your tags get their own "Not tagged by you" card.
+<details>
+<summary><b>Home</b>: spending, repeated work and account usage at a glance</summary>
+
+- Choose today, 7 days, 30 days or all time to see prompt and session counts, cost, tokens
+  and agent time.
+- Find the most expensive single run, the most expensive prompt across repeated runs, and
+  the prompt you use most. Open the underlying runs to investigate.
+- See the most used and most expensive tags across your tasks, projects, models and skills.
+- View connected agents' reported usage windows, observation times and reset times where
+  available. These account limits are separate from API-price cost estimates.
 </details>
 
 <details>
-<summary><b>Prompt page</b>: every agent, every token, and how it evolves</summary>
+<summary><b>Prompts</b>: searchable history, by day or by tag</summary>
 
-- Total cost, tokens, active time and wall time; cost, tokens and active time are compared
-  with the comparison group's median (for example "-23% vs group median").
-- A per-agent table splitting the main agent from each subagent: models, input, output, cache
-  read and cache write tokens, cost, duration, tool calls. Each subagent shows its **persona**
-  and the skill that spawned it; runs of one agent type with different personas are reported
-  apart.
-- Cost, duration and token charts over the prompt's history: its similar prompts (default), all
-  prompts sharing one of your tags, or similar prompts sharing it, split by model, skill,
-  project or your tags if you like (see [How prompts are linked](#-how-prompts-are-linked)).
-- *+ Add a tag*: one of your tags, or a new one with a description and rules.
-- **Run it again**: what ran the prompt (the agent and its version, the model and effort, and
-  each skill's exact version) and a command repeating it: same folder, skills checked out at the
-  commit they ran from, same agent release and model. View or download each skill exactly as it
-  ran, even when no commit has it.
-- **Rerun a prompt**: choose an agent, model, effort and CLI release, using the original
-  folder and recorded skill snapshots where available. Run in a terminal to approve actions,
-  or in the background with compatible permissions. Permission controls, skill restoration
-  and budget support depend on the [selected agent](#-supported-agents).
-- Each rerun gets a **status**: running, done, needs you (with the actions it was denied and
-  what it said it needed), or failed.
-- **Compared with the original**: a rerun's page sets its figures (cost, tokens, time, calls)
-  next to the original's, lists the files each edited, and shows both final answers side by
-  side or as differences.
-- **LLM judge**: once a rerun is imported, an LLM rates how close its output is to the
-  original's in substance (0–100, wording aside), whether it is better, the same or worse, and
-  whether you should read it: **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it**,
-  with a one-line summary and the main differences. The badge shows wherever reruns are listed.
-  Pick the judge model per rerun or per comparison. The default judge (haiku) is set on the
-  Setup page: any model of your linked agents, at any effort that model accepts. The judge runs in an empty scratch folder and saves no session; budget caps and timeouts depend on the selected agent.
-- **Compare**: any two runs of a prompt (the original, its reruns, its tags' reference runs)
-  side by side, with the judge's call and a button to judge them with the model of your choice.
-- **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
-  it, or leave reruns out of the history on the Setup page) and none of the original's tags. A
-  rerun's page says what it reruns, its cost against it, and the configuration chosen to launch
-  it (model, effort, agent release).
-- When one of the prompt's tags has a reference run, *Settings from* reuses the reference's
-  model, effort and agent release; on a tag's page, *Queue … with the reference's
-  settings* does it for many prompts at once.
-- **Add to queue** keeps a rerun for later, with the settings picked. Queue many at once from
-  the Prompts page or a tag's page: *Select prompts*, then *Queue reruns*.
-- Reruns use the exact recorded working directory, including a nested directory or worktree;
-  a missing directory is never replaced with your home folder. **Same as original** is the
-  default permission setting: Claude Code's recorded permission mode, or Codex's recorded
-  approval policy, sandbox, writable roots and network settings. The default is a terminal
-  so approval prompts remain possible. Background mode requires recorded permissions that
-  do not ask for approval, or an explicit permission override. Missing or unsupported
-  permission metadata requires an explicit choice instead of a guessed permission level.
-  Previously imported histories are reparsed once to capture permission metadata where available.
-- The prompt-page rerun controls show the selected agent's latest usage and reset limits,
-  alongside estimated additional tokens, API cost, and the original duration baseline.
-  The panel follows model/reference selection, offers **Refresh usage**, and refreshes
-  every minute. It cannot predict the added subscription percentage from limit reports;
-  the displayed percentages are current reported usage, not a post-rerun forecast.
+- Search and filter by project, tag and period; sort by newest, cost, duration or tokens.
+  Totals follow the filters, and filters live in the URL for bookmarking.
+- **List** groups prompts by day, with daily totals and each run's cost, tokens, time and
+  subagent count. Click a tag on a prompt to filter by it.
+- **By tag** groups cards by tag family, with median cost, trend, sparkline, totals and the
+  latest run. Expand a card for earlier runs; order tags by usage, recency, cost, time or tokens.
+- Select prompts to tag them together or queue reruns in bulk.
 </details>
 
 <details>
-<summary><b>Tags</b>: five color-coded categories, automatic and your own</summary>
+<summary><b>A prompt's page</b>: usage, agents and the history of a task</summary>
 
-- **Your tags** (blue, filled chip): added by hand, to a selection of prompts, or by rules.
-  Use them to group prompts aiming at the same task, such as `task:review-branch`.
-- **AI tags** (dashed outline), derived from what the agent did and refreshed on every import:
-  **Project** (orange) `project:`, **Model** (aqua) `model:`, **Skill** (violet) `skill:`,
-  and **Other AI** (grey) `cmd:` for slash commands, `agent:` for subagent types, `persona:`.
-- Color is never the only cue: chips carry their prefix and your tags' chips have their own shape.
-  The palette passes a color-blindness check in light and dark mode.
-- **New tag**: a name, a description and rules (keywords or a skill, in a prompt or in a
-  session), each rule in its own color with a live count of matches.
-- **Tags gallery**: cards with cost per prompt, sparkline and trend badge; a summary band with
-  the priciest and most used tags; search, category filters, five sorts; **Grouped** (by
-  category, then family) or **Timeline** (by month of creation) layouts. Click a card to open
-  its charts in place; Escape closes them.
-- **A page per tag**: a header in the tag's color, its rules as colored chips you can change or
-  remove, a summary band (runs, total cost, median cost with trend, median time), charts with
-  one line per model (or skill, project, tag of yours), and its runs with the Prompts page's
-  toolbar.
+- Inspect cost, tokens, active time and wall time, with comparisons against the selected
+  group's median or a tag's reference run.
+- Break usage down by main agent and linked subagents: models, input/output and cache
+  tokens, cost, duration and tool calls. Recorded personas and skills help explain delegation.
+- Chart cost, duration and tokens across similar prompts, prompts sharing a tag, or both;
+  split the charts by model, skill, project or your tags.
+- Add a tag, choose a reference run, and inspect the recorded agent release, model, effort
+  and skill versions. View or download captured skill instructions.
+- For reruns, see the original and chosen configuration, usage differences, edited files,
+  and final answers side by side or as a diff.
 </details>
 
 <details>
-<summary><b>Reruns</b>: a queue, launched together</summary>
+<summary><b>Tags</b>: task groups, reference runs and rules you can curate</summary>
 
-- Each queued rerun shows estimated cost, input/output tokens, and a duration baseline.
-  Cost reuses original usage at the selected model's configured prices, assuming a cold
-  cache and unchanged subagent models. Actual consumption may differ; judge calls are extra.
-- Launch **Run this rerun**, select several and **Run selected**, or **Run all**. Runs start
-  together using their saved background/terminal settings. The page and launch confirmation
-  show combined consumption for the selection and the full queue. Concurrent duration uses
-  the longest original run; combined run time sums the originals. Unknown prices or missing
-  originals remain visibly unknown, rather than counting as free.
-- Usage limits and reset status appear above the queue. API-price estimates are not
-  subscription charges; the available limit reports cannot predict a subscription percentage.
-  Failed launches stay queued for retry while the other runs can start.
-- **Launched**: every rerun started from the dashboard, and once imported, its cost and time
-  against the original.
+- Automatic tags identify projects, models, skills, commands, subagent types and personas
+  where recorded. Your own tags group work by purpose, such as `task:review-branch`.
+- Browse the **Tags gallery** by category and family or on a creation timeline, with search,
+  sorting, cost trends and charts that open in place.
+- Each tag has its own history, summary and comparison charts. Set a **reference run** to
+  measure other runs against it and reuse its model, effort and agent release for reruns.
+- Build rules with **Include keywords**, **Exclude keywords**, **Include tag** and
+  **Exclude tag**, scoped to a prompt or session. Rules apply to existing and future history;
+  exclusions take priority over inclusions.
+- Curate your tags by excluding individual or selected prompts without deleting history.
+  Review relevance warnings based on excluded examples, restore membership, or stop using an
+  excluded prompt as an example. Similarity never excludes prompts automatically.
+- See [Curate prompts within a tag](#curate-prompts-within-a-tag) for rule and restoration details.
 </details>
 
 <details>
-<summary><b>Sessions, Setup and the status bar icon</b></summary>
+<summary><b>Reruns</b>: choose a configuration, estimate usage and launch a queue</summary>
 
-- **Sessions**: every session with its totals, prompts over time, token usage, timing,
-  tool calls and available per-agent detail. Reported costs appear where supported.
-- **Setup**: choose agents and transcript directories, configure integration-specific options,
-  start at login, leave projects, skills, subagent types or sessions out of the history,
-  and edit the price table and similarity threshold. Tags and their rules live on the Tags pages.
-- **Status bar icon**: today's cost and prompt count, *Open dashboard* (also a left click),
-  *Import now*, *Start at login* and *Quit*.
+- From a prompt, select an agent, model, reasoning effort and CLI release, or copy a tag's
+  reference settings. Launch immediately or **Add to queue**; queue selections from the
+  Prompts page or a tag's page too.
+- Reruns start fresh in the recorded working directory and restore captured skills where
+  available. They do not restore the original conversation or repository state.
+- **Same as original** reuses recorded permissions. Terminal mode lets you answer approval
+  prompts; background mode needs compatible permissions or an explicit override. Missing
+  directories or permission metadata require attention rather than guessed defaults.
+- Check the selected agent's reported usage and reset limits alongside estimated additional
+  tokens, API cost and the original duration baseline. The prompt panel supports manual
+  refresh and refreshes usage every minute.
+- The **Reruns** page shows saved settings and estimates for each queued run. Launch one,
+  selected runs, or all together; review combined cost/tokens, summed run time and the
+  longest-run duration baseline before launching. Failed launches stay queued for retry.
+- Estimates reuse original usage at the selected model's prices, assuming a cold cache and
+  unchanged subagent models. Unknown costs stay unknown; actual usage and judge calls can differ.
+  API estimates do not predict subscription charges or future account-limit percentages.
+- Follow launched runs as **running**, **done**, **needs you** or **failed**, then compare
+  imported results with the original. Imported rerun prompts get the `rerun` tag and are
+  studied separately from the original's tags.
+- Permission modes, skill restoration, budget caps and timeouts vary by
+  [agent](#-supported-agents).
+</details>
+
+<details>
+<summary><b>Comparisons and LLM judging</b>: check whether savings kept the useful output</summary>
+
+- Compare two runs side by side, including the original, reruns and tag reference runs.
+  Inspect cost, tokens, time, tool calls, edited files and answer differences.
+- After a rerun is imported, an LLM judge compares its output with the original's substance:
+  similarity from 0–100, better/same/worse, a short explanation and key differences.
+- Verdicts flag **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it** and appear
+  wherever rated reruns are listed. They help direct review; they are not a test of correctness.
+- Choose the judge model and supported effort per rerun or comparison, or set the default
+  in Setup. Judging runs through an installed, authenticated agent in an empty scratch folder;
+  it adds usage, with caps and timeouts depending on the agent.
+</details>
+
+<details>
+<summary><b>Sessions</b>: the conversation behind the prompts</summary>
+
+- Search session titles and prompts, filter history, and open a session's full breakdown.
+- Inspect session totals, prompts over time, token usage, timing, tool calls and available
+  per-agent detail. Agent-reported costs appear where supported.
+- Exclude a session from dashboard history and restore it later from Setup.
+</details>
+
+<details>
+<summary><b>Setup</b>: agent connections, imports, prices and examples</summary>
+
+- Add or remove agent connections, inspect imported history and connection status, and set
+  transcript directories. Removing a connection keeps its imported history.
+- Import now, re-import all history, configure periodic imports and start at login.
+  Claude Code also offers a Stop hook, cost telemetry, usage capture and retention settings.
+- Leave projects, skills, subagent types, sessions or reruns out of history; manage exclusions
+  and adjust the similarity threshold used to link prompts.
+- Edit model prices or let **Automatic model pricing** look up missing prices on official
+  provider pages. Inspect lookup status, missing prices and source links; manual overrides
+  take precedence. Price lookups send no prompts and can be disabled.
+- Switch the top bar between **Official** (reported cost where fully covered, estimates
+  otherwise) and **Price table** estimates. Neither measures subscription charges.
+- Open a separate **example app** covering prompt tuning, caches, skills, subagents, quality
+  tradeoffs and blocked reruns. Its illustrative records stay separate from your history,
+  run no agents or judges, and reset when Rerunly starts.
+</details>
+
+<details>
+<summary><b>Status bar icon</b>: keep the dashboard close</summary>
+
+- See today's cost and prompt count; click to open the dashboard.
+- Import history, toggle **Start at login**, or quit from the icon's menu.
+- The background dashboard continues to work on desktops without a tray icon.
 </details>
 
 ## ⚙️ Running it your way

@@ -425,6 +425,23 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             )
         ]
         reruns = c.execute("SELECT COUNT(*) FROM tags WHERE tag = 'rerun' AND auto = 1").fetchone()[0]
+        # the other tag categories: your tags, then the AI tags not listed above (projects have their own list)
+        your = [
+            {"tag": r[0], "prompts": r[1], "excluded": r[0] in s["excluded_your_tags"]}
+            for r in c.execute("SELECT tag, COUNT(DISTINCT prompt_id) FROM tags WHERE auto IN (0, 2) GROUP BY tag ORDER BY tag")
+        ]
+        other = [
+            {"tag": r[0], "prompts": r[1], "excluded": r[0] in s["excluded_tags"]}
+            for r in c.execute(
+                "SELECT tag, COUNT(*) FROM tags WHERE auto = 1 AND tag != 'rerun' AND tag NOT LIKE 'skill:%' "
+                "AND tag NOT LIKE 'agent:%' AND tag NOT LIKE 'project:%' GROUP BY tag ORDER BY tag"
+            )
+        ]
+        prefix = lambda u: u["tag"].split(":")[0] if ":" in u["tag"] else ""
+        categories = [{"key": "your", "tags": your}] + [
+            {"key": key, "tags": [u for u in other if (prefix(u) if prefix(u) in ("model", "persona", "cmd") else "ai") == key]}
+            for key in ("model", "persona", "cmd", "ai")
+        ]
         return {
             "reruns": [{"tag": "rerun", "prompts": reruns, "excluded": "rerun" in s["excluded_tags"]}] if reruns else [],
             # prompts left out by any exclusion, each counted once
@@ -432,6 +449,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "projects": projects, "sessions": sessions,
             "skills": [u for u in used if u["tag"].startswith("skill:")],
             "agents": [u for u in used if u["tag"].startswith("agent:")],
+            "tag_categories": [cat for cat in categories if cat["tags"]],
         }
 
     @app.post("/api/setup/autostart")

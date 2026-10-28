@@ -2698,16 +2698,25 @@ async function viewSession(id) {
   };
 }
 
+/** The other tag categories of the exclusion card: title and help, by the key `/api/setup/history` gives them. */
+const EXCLUDE_CATEGORIES = {
+  your: ["Your tags", "Leave out every prompt carrying one of your tags, added by hand or by an auto-tag rule."],
+  model: ["Models", "Leave out every prompt answered by a model, even in part."],
+  persona: ["Subagent personas", "Leave out every prompt that ran a subagent with this persona."],
+  cmd: ["Commands", "Leave out every prompt started with a slash command."],
+  ai: ["Other AI tags", "Leave out every prompt carrying one of these tags."],
+};
+
 /** Projects to click in or out of the history, and the sessions left out with a way back. */
 function excludedCardHtml(scope) {
   const sessionLabel = (x) => `${fmtDate(x.started_at)} · ${x.title || (x.first_prompt || "").slice(0, 60) || x.id.slice(0, 8)}${x.project ? ` · ${x.project}` : ""}`;
   const out = scope.sessions.filter((x) => x.excluded);
   const pickable = scope.sessions.filter((x) => !x.excluded && !scope.projects.some((pr) => pr.excluded && pr.project === x.project));
   const { hidden } = scope;
-  const tagChips = (list, prefix) => list.map((x) => `<button type="button" class="exclude-chip" data-exclude-tag="${esc(x.tag)}" aria-pressed="${x.excluded}"
+  const tagChips = (list, prefix, attr = "data-exclude-tag") => list.map((x) => `<button type="button" class="exclude-chip" ${attr}="${esc(x.tag)}" aria-pressed="${x.excluded}"
     title="${x.excluded ? "Left out: click to bring it back" : "Click to leave out every prompt where the agent used it"}">${esc(x.tag.slice(prefix.length))} <span class="mi-count">${x.prompts}</span></button>`).join("");
   return `<div class="card exclusions">
-    <p class="muted">Leave a project, a skill, a kind of subagent or a session out of every page: totals, lists, tags, charts and comparisons. Its prompts stay imported,
+    <p class="muted">Leave a project, a skill, a kind of subagent, any other tag or a session out of every page: totals, lists, tags, charts and comparisons. Its prompts stay imported,
       so bringing it back is instant.${hidden ? ` <strong>${plural(hidden, "prompt")} left out now.</strong>` : ""}</p>
     <div class="setup-row"><div><strong>Projects</strong><br><span class="muted">Click a project to leave it out; click it again to bring it back.</span>
       <div class="exclude-chips">${scope.projects.map((x) => `<button type="button" class="exclude-chip" data-exclude-project="${esc(x.project)}" aria-pressed="${x.excluded}"
@@ -2718,6 +2727,8 @@ function excludedCardHtml(scope) {
       <div class="exclude-chips">${tagChips(scope.reruns, "")}</div></div></div>` : ""}
     <div class="setup-row"><div><strong>Subagent types</strong><br><span class="muted">Leave out every prompt that ran a kind of subagent.</span>
       <div class="exclude-chips">${tagChips(scope.agents, "agent:") || '<span class="muted">No subagent run yet.</span>'}</div></div></div>
+    ${scope.tag_categories.map((cat) => `<div class="setup-row"><div><strong>${EXCLUDE_CATEGORIES[cat.key][0]}</strong><br><span class="muted">${EXCLUDE_CATEGORIES[cat.key][1]}</span>
+      <div class="exclude-chips">${cat.key === "your" ? tagChips(cat.tags, "", "data-exclude-your-tag") : tagChips(cat.tags, cat.key === "ai" ? "" : `${cat.key}:`)}</div></div></div>`).join("")}
     <div class="setup-row"><div><strong>Sessions</strong><br><span class="muted">Leave out one conversation, such as a test or an experiment.</span>
       ${out.length ? `<ul class="excluded-sessions">${out.map((x) => `<li><span>${esc(sessionLabel(x))} <span class="mi-count">${plural(x.prompts, "prompt")}</span></span>
         <button type="button" class="link-btn" data-include-session="${esc(x.id)}">Bring back</button></li>`).join("")}</ul>` : ""}
@@ -2929,11 +2940,13 @@ async function viewSetup() {
     const name = b.dataset.excludeProject;
     exclude("excluded_projects", excludedProjects.includes(name) ? excludedProjects.filter((x) => x !== name) : [...excludedProjects, name]);
   });
-  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns].filter((x) => x.excluded).map((x) => x.tag);
-  app.querySelectorAll("[data-exclude-tag]").forEach((b) => b.onclick = () => {
-    const tag = b.dataset.excludeTag;
-    exclude("excluded_tags", excludedTags.includes(tag) ? excludedTags.filter((x) => x !== tag) : [...excludedTags, tag]);
-  });
+  const yourCategory = scope.tag_categories.filter((cat) => cat.key === "your");
+  const aiCategories = scope.tag_categories.filter((cat) => cat.key !== "your");
+  const excludedTags = [...scope.skills, ...scope.agents, ...scope.reruns, ...aiCategories.flatMap((cat) => cat.tags)].filter((x) => x.excluded).map((x) => x.tag);
+  const excludedYourTags = yourCategory.flatMap((cat) => cat.tags).filter((x) => x.excluded).map((x) => x.tag);
+  const toggle = (list, tag) => list.includes(tag) ? list.filter((x) => x !== tag) : [...list, tag];
+  app.querySelectorAll("[data-exclude-tag]").forEach((b) => b.onclick = () => exclude("excluded_tags", toggle(excludedTags, b.dataset.excludeTag)));
+  app.querySelectorAll("[data-exclude-your-tag]").forEach((b) => b.onclick = () => exclude("excluded_your_tags", toggle(excludedYourTags, b.dataset.excludeYourTag)));
   app.querySelectorAll("[data-include-session]").forEach((b) => b.onclick = () =>
     exclude("excluded_sessions", excludedSessions.filter((x) => x !== b.dataset.includeSession)));
   document.getElementById("exclude-session-form").onsubmit = (e) => {
