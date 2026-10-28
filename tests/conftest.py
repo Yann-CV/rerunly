@@ -9,3 +9,6 @@ def isolate_codex_history(monkeypatch, tmp_path):
     monkeypatch.setitem(DEFAULT_SETTINGS, "auto_price_lookup", False)
     from rerunly import statusline
     monkeypatch.setattr(statusline, "DIR", tmp_path / "rerunly-data")
+    from rerunly import live_limits
+    monkeypatch.setattr(live_limits, "claude_code", lambda: None)
+    monkeypatch.setattr(live_limits, "codex", lambda: None)

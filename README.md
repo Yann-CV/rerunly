@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
-  <b>Cost, tokens and time for every prompt you give Claude Code,<br>so each rerun tells you if your last change made it cheaper, faster, or neither.</b>
+  <b>Cost, tokens and time for every prompt you give your coding agents,<br>so each rerun tells you if your last change made it cheaper, faster, or neither.</b>
 </p>
 
 <p align="center">
+  <img alt="OpenAI Codex" src="https://img.shields.io/badge/works%20with-OpenAI%20Codex-222222">
   <img alt="Claude Code" src="https://img.shields.io/badge/works%20with-Claude%20Code-6250d6">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-2a78d6">
   <img alt="Local first" src="https://img.shields.io/badge/data-stays%20on%20your%20machine-1baf7a">
@@ -23,10 +24,10 @@
 
 ---
 
-You tweak a skill, rewrite a `CLAUDE.md`, add a subagent… and then? Did the task get
+You tweak a skill, rewrite your agent instructions, add a subagent… and then? Did the task get
 **cheaper**? **Faster**? Or did that clever persona just double your token bill?
 
-**Rerunly** reads the transcripts Claude Code already writes on your machine and turns them
+**Rerunly** reads the transcripts your supported agents already write on your machine and turns them
 into a living cost history: **per prompt, per subagent, per persona, per task**. Every rerun of
 a task lands next to the previous ones, so after each change you see, at a glance, whether it
 paid off.
@@ -38,9 +39,8 @@ paid off.
 <td width="50%" valign="top">
 
 ### 💸 Know the real cost
-Dollars, tokens and time for every prompt, **including every subagent** it spawned. Use
-Claude Code's **own official cost** (via OpenTelemetry) or your price table, with a switch to
-compare them.
+Dollars, tokens and time for every prompt, including linked subagents where recorded.
+Compare runs using API price estimates or agent-reported costs where supported.
 
 </td>
 <td width="50%" valign="top">
@@ -56,7 +56,7 @@ previous runs. Similar prompts are lined up automatically, so you compare like w
 
 ### 🏷️ Tags that write themselves
 Project, model, skill, slash command, subagent type and persona tags are **created
-automatically**. Add your own (`task:review-branch`) once, give it keywords, and every
+automatically** where the transcript provides them. Add your own (`task:review-branch`) once, give it keywords, and every
 future prompt that matches is tagged for you.
 
 </td>
@@ -73,7 +73,7 @@ persona that burns tokens, the skill that drags, the project that quietly costs 
 
 ### ⚡ Always on, never in the way
 Runs in the background with an **icon in your status bar** showing today's spend. Starts at
-login on its own. Updates live after every Claude answer through a hook.
+login on its own. Imports new history automatically while the dashboard runs.
 
 </td>
 <td valign="top">
@@ -96,10 +96,12 @@ uv run rerunly start   # runs in the background, with a status bar icon
 
 Open <http://127.0.0.1:8765>, go to **Setup**, and press:
 
-1. **Import now**: your whole Claude Code history appears.
-2. **Install hook**: new prompts show up the moment Claude answers.
-3. **Enable telemetry** *(optional)*: switch to Claude Code's own cost figures.
-4. **Start at login** *(optional)*: never think about it again.
+1. Check the enabled agents and history directories.
+2. **Import now**: load your available history from supported agents.
+3. **Start at login** *(optional)*: keep the dashboard running automatically.
+
+New history is imported automatically. For integration-specific setup, including hooks
+and reported costs, see [Supported agents](#-supported-agents).
 
 That's it. Go do some work, then come back and see what it cost.
 
@@ -122,9 +124,9 @@ across all its runs.</p>
 </tr>
 <tr>
 <td valign="top">
-<img src="docs/screenshots/tag-dark.png" alt="A tag's page in dark mode">
+<img src="docs/screenshots/tag.png" alt="A tag's page in light mode">
 <p><b>A tag's story</b>: runs, total and median cost with its trend, the keyword rules that
-assign it, and its full history. Dark mode included, of course.</p>
+assign it, and its full history.</p>
 </td>
 <td valign="top">
 <img src="docs/screenshots/tags.png" alt="Tags gallery">
@@ -173,12 +175,10 @@ a timeline by creation date. Click one to open its charts in place.</p>
   each skill's exact version) and a command repeating it: same folder, skills checked out at the
   commit they ran from, same agent release and model. View or download each skill exactly as it
   ran, even when no commit has it.
-- **Rerun with Claude**: the same folder and prompt, with **the skills as they ran** (rebuilt
-  from their commit, or their snapshot, into a plugin for that run only: your copies stay
-  untouched), the same model and effort or others, the installed Claude Code or a given release.
-  **Unattended** (the default), it runs in the background: anything that would need you (a
-  command, an edit, a question) is denied, the agent stops and says what it needed, and a budget
-  cap stops runaways. **In a terminal**, you watch it and approve its actions.
+- **Rerun a prompt**: choose an agent, model, effort and CLI release, using the original
+  folder and recorded skill snapshots where available. Run in a terminal to approve actions,
+  or in the background with compatible permissions. Permission controls, skill restoration
+  and budget support depend on the [selected agent](#-supported-agents).
 - Each rerun gets a **status**: running, done, needs you (with the actions it was denied and
   what it said it needed), or failed.
 - **Compared with the original**: a rerun's page sets its figures (cost, tokens, time, calls)
@@ -189,15 +189,15 @@ a timeline by creation date. Click one to open its charts in place.</p>
   whether you should read it: **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it**,
   with a one-line summary and the main differences. The badge shows wherever reruns are listed.
   Pick the judge model per rerun or per comparison. The default judge (haiku) is set on the
-  Setup page: any model of your linked agents, at any effort that model accepts. The judge runs in an empty scratch folder, saves no session and has a budget cap.
+  Setup page: any model of your linked agents, at any effort that model accepts. The judge runs in an empty scratch folder and saves no session; budget caps and timeouts depend on the selected agent.
 - **Compare**: any two runs of a prompt (the original, its reruns, its tags' reference runs)
   side by side, with the judge's call and a button to judge them with the model of your choice.
 - **Reruns are studied on their own**: every prompt of a rerun gets the `rerun` tag (filter on
   it, or leave reruns out of the history on the Setup page) and none of the original's tags. A
   rerun's page says what it reruns, its cost against it, and the configuration chosen to launch
-  it (model, effort, Claude Code release).
+  it (model, effort, agent release).
 - When one of the prompt's tags has a reference run, *Settings from* reuses the reference's
-  model, effort and Claude Code release; on a tag's page, *Queue … with the reference's
+  model, effort and agent release; on a tag's page, *Queue … with the reference's
   settings* does it for many prompts at once.
 - **Add to queue** keeps a rerun for later, with the settings picked. Queue many at once from
   the Prompts page or a tag's page: *Select prompts*, then *Queue reruns*.
@@ -259,14 +259,11 @@ a timeline by creation date. Click one to open its charts in place.</p>
 <details>
 <summary><b>Sessions, Setup and the status bar icon</b></summary>
 
-- **Sessions**: every session with its totals, and a page each with the price-table cost next
-  to the total Claude Code stores, tokens, active time, API and tool calls, cost per agent type
-  and persona, Claude Code's own per-caller cost when telemetry is on, and its prompts over
-  time.
-- **Setup**: check that transcripts are found, install the live-update hook, enable telemetry,
-  extend transcript retention, start at login, leave projects, skills, subagent types or
-  sessions out of the history, and edit the price table and similarity threshold. Tags and
-  their rules live on the Tags pages.
+- **Sessions**: every session with its totals, prompts over time, token usage, timing,
+  tool calls and available per-agent detail. Reported costs appear where supported.
+- **Setup**: choose agents and transcript directories, configure integration-specific options,
+  start at login, leave projects, skills, subagent types or sessions out of the history,
+  and edit the price table and similarity threshold. Tags and their rules live on the Tags pages.
 - **Status bar icon**: today's cost and prompt count, *Open dashboard* (also a left click),
   *Import now*, *Start at login* and *Quit*.
 </details>
@@ -303,7 +300,7 @@ the most automatic to the most deliberate.
 
 **1. Sessions: where it was typed.** Every prompt belongs to the session (the conversation) it
 was typed in. Everything the agent did until your next prompt belongs to it, subagents included:
-they are tied to their prompt through the transcript's `promptId`. When a session is resumed or
+they are linked using the parent/child identifiers recorded by each agent. When a session is resumed or
 forked and replays earlier prompts, each prompt stays in its first session, so nothing counts
 twice.
 
@@ -353,7 +350,43 @@ only sees words.
 
 ## 🧮 How the numbers are computed
 
-Trust, but verify: every figure comes from data Claude Code writes itself.
+Rerunly groups recorded usage by prompt and its linked subagents, then applies the configured
+model prices. Unknown models are flagged as unpriced. Reported costs, timing precision,
+cache detail and subagent attribution vary by integration; see [Supported agents](#-supported-agents).
+API price estimates measure token usage, not subscription charges or credit consumption.
+
+Wall time runs from a prompt to its last recorded event. Similar prompts use word overlap
+(Jaccard) at the configured threshold, as described in [How prompts are linked](#-how-prompts-are-linked).
+Skill snapshots, agent versions, model and effort are captured where the transcript supplies them.
+
+## 🤖 Supported agents
+
+Rerunly currently supports **Claude Code** and **OpenAI Codex**. Both feed the same
+local dashboard: prompt history, filters, tags, comparisons, reference runs, exclusions,
+exports, rerun queue and output judging. Available detail depends on what each agent records.
+
+| Integration | History location | Updates | Cost source |
+|---|---|---|---|
+| Claude Code | `~/.claude/projects` | Polling; optional Stop hook for immediate updates | API price estimates; reported cost through optional OpenTelemetry |
+| OpenAI Codex CLI and IDE | `$CODEX_HOME/sessions`, or `~/.codex/sessions` | Polling | API price estimates |
+
+Both integrations are enabled by default. Change their directories or disable an integration
+on **Setup**. Importing existing history needs no API key; launching reruns or judges requires
+the selected agent to be installed and authenticated. Automatic imports run every 60 seconds
+by default while the dashboard is running.
+
+### Claude Code
+
+Use **Setup → Install hook** for updates after each answer, **Enable telemetry** for
+reported API costs, and the retention setting to keep transcripts longer. These settings
+apply to Claude Code only.
+
+Claude reruns restore recorded skills into a temporary plugin. You can use the installed
+CLI or select a release, model and effort. Unattended runs deny actions that would ask for
+approval and can enforce a dollar budget cap; terminal runs let you approve actions.
+Recorded permission modes can be reused through **Same as original**.
+
+The transcript and telemetry details below explain Claude-specific attribution and pricing.
 
 <details>
 <summary>Show the details</summary>
@@ -384,22 +417,6 @@ made while the dashboard is not running are lost; a prompt missing some of its c
 to the estimate.
 </details>
 
-## 🛣️ Beyond Claude Code
-
-Claude Code is supported today. Parsing sits behind a small `Source` interface
-(`rerunly/sources/base.py`), so other agents and harnesses can plug in next.
-
-## 🛠️ Development
-
-```bash
-uv sync
-uv run rerunly --reload   # edit, refresh the page, repeat
-uv run pytest
-```
-
-<p align="center"><sub>Built for people who tune their agents like they tune their code.</sub></p>
-
-
 ### OpenAI Codex
 
 Codex CLI and IDE rollout history is imported automatically from
@@ -426,7 +443,7 @@ a small replay marker in their prompt so their imported history links to the ori
 Restored skills are placed in an isolated folder and referenced by exact path in the
 rerun's instructions. They are removed after a background run finishes.
 
-Codex does have these parity limits:
+Codex-specific behavior and limitations:
 
 - **No dollar budget cap:** Codex background reruns reject a USD budget rather than
   pretending to enforce one. They have a one-hour process timeout. Codex judging has
@@ -450,12 +467,13 @@ Codex does have these parity limits:
   Claude's harness-reported active duration. A replay does not restore conversation
   context, repository state, authentication, MCP servers or the full harness configuration.
 
-Model and CLI behavior were checked against the
-[official Codex model documentation](https://learn.chatgpt.com/docs/models),
-[CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli), and
-[OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
-### Automatic model prices
+### Adding another agent
+
+Parsing uses a shared `Source` interface in `rerunly/sources/base.py`. Additional agents
+and harnesses can provide adapters that produce the same session, prompt and usage records.
+
+## Automatic model prices
 
 During import, Rerunly checks newly recorded models (including subagents), locally
 listed Codex models, and the configured judge for missing exact prices. It fetches
@@ -477,7 +495,7 @@ existing estimates and reports the missing lookup rather than inventing a price.
 These are API token estimates, not subscription charges; pricing for long contexts,
 special service tiers, and hosted tools can differ.
 
-### Curate prompts within a tag
+## Curate prompts within a tag
 
 On a human tag's page, use **Exclude from tag** on a run, or select runs and
 choose **Exclude selected from tag**. The prompts remain in your history. These
@@ -521,7 +539,7 @@ keywords together or any of them, case-insensitively; session scope excludes
 every prompt of a session whose title or prompts match. Removing or editing the
 rule restores eligible membership. Explicit prompt exclusions still apply.
 
-### Explore with examples
+## Explore with examples
 
 **Setup → Examples → Open the example app** opens a separate example app, at
 `/examples/`, holding only eight illustrative records. Your own history never
@@ -542,3 +560,13 @@ examples; Codex records cover prompt and skill comparisons. The example app is
 rebuilt each time Rerunly starts, so the dates stay recent and any change you
 make there is discarded. Examples added to the history by an earlier version
 are removed from it.
+
+## 🛠️ Development
+
+```bash
+uv sync
+uv run rerunly --reload   # edit, refresh the page, repeat
+uv run pytest
+```
+
+<p align="center"><sub>Built for people who tune their agents like they tune their code.</sub></p>

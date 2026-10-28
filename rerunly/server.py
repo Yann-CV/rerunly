@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, judge, otel, replay, runner, statusline
+from . import background as bg, db, judge, live_limits, otel, replay, runner, statusline
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .estimates import estimate_rerun
 from .ingest import apply_curation, apply_rules, ingest, session_texts
@@ -1167,19 +1167,29 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     @app.get("/api/limits")
     def usage_limits():
         """Subscription usage of every connected agent, as last seen: Claude Code through its statusline (`capture`:
-        whether that is set up), Codex in its rollouts. No `windows` when nothing was reported yet; a window whose
-        reset time has passed since is back to 0%."""
+        whether that is set up), Codex in its rollouts; asked from the provider with the agent's login (`live`) when
+        nothing usable was seen locally. No `windows` when neither has any; a window whose reset time has passed
+        since is back to 0%."""
         if examples:
             return []  # the illustrative records have no subscription
         settings = db.get_settings(conn())
         empty = {"observed_at": None, "plan": None, "windows": []}
+        now = datetime.now(timezone.utc).timestamp()
+
+        def seen(local, live):
+            """The local reading, or the provider's answer (`live`) when there is none or all its windows reset since."""
+            if local and any(not w["resets_at"] or w["resets_at"] > now for w in local["windows"]):
+                return {**local, "live": False}
+            fetched = live()
+            return {**fetched, "live": True} if fetched else {**(local or empty), "live": False}
+
         found = []
         if settings.get("claude_enabled", True):
             found.append({"agent": "Claude Code", "capture": statusline.installed(read_claude_settings()),
-                          **(statusline.rate_limits() or empty)})
+                          **seen(statusline.rate_limits(), live_limits.claude_code)})
         if settings.get("codex_enabled", True):
-            found.append({"agent": "Codex", "capture": True, **(CodexSource(settings["codex_sessions_dir"]).rate_limits() or empty)})
-        now = datetime.now(timezone.utc).timestamp()
+            found.append({"agent": "Codex", "capture": True,
+                          **seen(CodexSource(settings["codex_sessions_dir"]).rate_limits(), live_limits.codex)})
         for limits in found:
             for w in limits["windows"]:
                 w["reset"] = bool(w["resets_at"] and w["resets_at"] <= now)

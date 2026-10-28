@@ -3090,7 +3090,7 @@ function homeLimits(limits) {
       </div>`;
     }).join("");
     const empty = !a.capture ? `<a href="#/setup">Capture its usage in Setup</a>` : "No usage reported yet";
-    return `<div class="limit-agent" ${a.observed_at ? `title="${esc(`As of the last ${a.agent} activity, ${fmtAgo(a.observed_at)}`)}"` : ""}>
+    return `<div class="limit-agent" ${a.observed_at ? `title="${esc(a.live ? `Asked from ${a.agent}'s account ${fmtAgo(a.observed_at)}` : `As of the last ${a.agent} activity, ${fmtAgo(a.observed_at)}`)}"` : ""}>
       <span class="limit-head"><strong>${esc(a.agent)}</strong>${a.plan ? ` <span class="muted">${esc(a.plan)}</span>` : ""}${a.observed_at ? `<span class="muted">${esc(fmtAgo(a.observed_at))}</span>` : ""}</span>
       ${rows || `<span class="limit-reset">${empty}</span>`}
     </div>`;

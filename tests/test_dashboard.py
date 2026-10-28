@@ -1170,6 +1170,26 @@ def test_usage_limits_reset_once_their_window_has_passed(client, monkeypatch):
     assert client.get("/api/limits").json() == []
 
 
+def test_usage_limits_asked_from_the_provider_when_nothing_usable_was_seen(client, monkeypatch):
+    from rerunly import live_limits
+    from rerunly.sources.codex import CodexSource
+
+    monkeypatch.setattr(live_limits, "claude_code", lambda: {"observed_at": "2026-10-28T10:00:00Z", "plan": "pro", "windows": [
+        {"used_percent": 12.0, "window_minutes": 300, "resets_at": 4_000_000_000}]})
+    # Codex's last reading has reset since: the provider is asked too
+    monkeypatch.setattr(CodexSource, "rate_limits", lambda self: {"observed_at": "2001-01-01T00:00:00Z", "plan": "plus", "windows": [
+        {"used_percent": 40.0, "window_minutes": 300, "resets_at": 1_000_000_000}]})
+    monkeypatch.setattr(live_limits, "codex", lambda: {"observed_at": "2026-10-28T10:00:00Z", "plan": "plus", "windows": [
+        {"used_percent": 3, "window_minutes": 300, "resets_at": 4_000_000_000}]})
+    claude, codex = client.get("/api/limits").json()
+    assert claude["live"] and claude["plan"] == "pro" and claude["windows"][0]["used_percent"] == 12.0
+    assert codex["live"] and codex["windows"][0]["used_percent"] == 3
+    # not logged in: the stale local reading stays, shown as reset
+    monkeypatch.setattr(live_limits, "codex", lambda: None)
+    codex = client.get("/api/limits").json()[1]
+    assert not codex["live"] and codex["windows"][0]["reset"] is True
+
+
 def test_claude_statusline_capture_keeps_the_users_statusline(client, tmp_path):
     import json, subprocess
     from rerunly import server, statusline
