@@ -958,7 +958,13 @@ function bindSelection(page, { tags, exclude = [] }) {
     } else if (e.target.closest("[data-queue-selected]")) {
       const ref = e.target.closest("[data-queue-selected]").dataset.queueSelected === "reference" ? listState.reference : null;
       const settings = ref ? { model: ref.requested_model || "", effort: ref.effort || "", version: ref.harness_version || "" } : {};
-      const out = await api("/api/reruns/queue", { method: "POST", body: { prompt_ids: [...listState.selected], ...settings } });
+      if (!document.getElementById("replay-permission").value) {
+      const status = document.getElementById("replay-status");
+      status.textContent = "Choose permissions for the selected agent.";
+      status.hidden = false;
+      return;
+    }
+    const out = await api("/api/reruns/queue", { method: "POST", body: { prompt_ids: [...listState.selected], ...settings } });
       document.getElementById("select-note").innerHTML = `${plural(out.added, "rerun")} queued · <a href="#/reruns">${out.queued} on the Reruns page</a>`;
     }
   });
@@ -1178,6 +1184,10 @@ function rerunCommand(p) {
   return lines.join("\n");
 }
 
+function rerunModelAgent(model, fallback = "claude") {
+  return model ? (model.startsWith("codex:") || (model.startsWith("gpt-") && !model.startsWith("gpt-oss")) ? "codex" : "claude") : fallback;
+}
+
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 /** Replay it with Claude Code from here, and the replays launched so far. */
@@ -1206,7 +1216,7 @@ function replayHtml(p, models, defaultJudge = "") {
         : '<span class="muted">not imported yet: press Refresh</span>'}</li>`;
   }).join("");
   return `<div class="replay">
-    <div class="replay-head"><strong>Rerun with ${esc(r.harness || "Claude Code")}</strong>
+    <div class="replay-head"><strong>Rerun this prompt</strong>
       <span class="muted">In <code>${esc(r.cwd || "directory not recorded")}</code>, with this prompt${restorable.length ? " and the skills as they ran" : ""}. Permissions default to those recorded for this run.
         <strong>Unattended</strong>: it runs in the background, anything that would need you is denied, and it stops to report what it needed.
         <strong>In a terminal</strong>: you watch it and approve its actions.
@@ -1215,18 +1225,19 @@ function replayHtml(p, models, defaultJudge = "") {
     ${isExample ? '<p class="muted">Illustrative rerun history. Use a real prompt to launch or queue agent work.</p>' : `<form id="replay-form" class="replay-form">
       ${p.references.length ? `<label class="replay-from">Settings from <select id="replay-from">${opt("", "This run", "")}${p.references.map((x, i) =>
         opt(String(i), `Reference of ${x.tag} · ${fmtDate(x.started_at)} (${[x.model, x.effort && `effort ${x.effort}`, x.harness_version && `Claude Code ${x.harness_version}`].filter(Boolean).join(", ")})`, "")).join("")}</select></label>` : ""}
+      <label>Agent <select id="replay-agent">${opt("claude", "Claude Code", isCodex ? "codex" : "claude")}${opt("codex", "OpenAI Codex", isCodex ? "codex" : "claude")}</select></label>
       <label>Model <select id="replay-model">${opt("", `Same (${same || "default"})`, "")}${others.map((m) => opt(m, m, "")).join("")}</select></label>
       <label>Effort <select id="replay-effort">${opt("", `Same (${r.effort || "default"})`, "")}${EFFORTS.map((e) => opt(e, e, "")).join("")}</select></label>
-      <label title="Through npx for a release other than the installed one">${esc(r.harness || "Claude Code")} <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
+      <label title="Through npx for a release other than the installed one">CLI release <select id="replay-release">${opt("", "Installed", "")}${releases.map(([v, why]) => opt(v, `${v} · ${why}`, "")).join("")}</select></label>
       <label>Run <select id="replay-mode">${opt("terminal", "In a terminal window", "terminal")}${opt("background", "Unattended, in the background", "terminal")}</select></label>
-      <label title="Restore recorded permissions, or explicitly override them">Permissions <select id="replay-permission">${opt("same", "Same as original", "same")}${opt("ask", "Read-only when unattended", "same")}${opt("edits", "Allow file edits", "same")}</select></label>
+      <label title="Restore recorded permissions, or explicitly override them">Permissions <select id="replay-permission" required><option value="" disabled>Choose permissions</option>${opt("same", "Same as original", "same")}${opt("ask", "Read-only when unattended", "same")}${opt("edits", "Allow file edits", "same")}</select></label>
       <label class="bg-only" title="It stops when it has spent this much">Stop at $ <input id="replay-budget" type="number" min="0.1" step="0.5" value="${isCodex ? "" : budget}" size="5" ${isCodex ? "disabled" : ""}></label>
       ${restorable.length ? `<label class="replay-check" title="${esc(restorable.map((k) => k.skill).join(", "))}: rebuilt for this run only, your copies stay untouched">
         <input type="checkbox" id="replay-skills" checked> Restore ${restorable.length === 1 ? "the skill" : `the ${restorable.length} skills`} as ${restorable.length === 1 ? "it" : "they"} ran</label>` : ""}
       <label class="replay-check" title="Once imported, an LLM judge rates how much its output differs from this run's">
         <input type="checkbox" id="replay-rate" checked> Judge it with <select id="replay-judge">${opt("", `default (${defaultJudge || "Claude Code's"})`, "")}${[...new Set([same, ...models])].filter(Boolean).map((m) => opt(m, m, "")).join("")}</select></label>
       <section class="replay-impact" aria-label="Selected agent usage impact">
-        <div class="replay-impact-head"><strong>Rerun consumption & reset limits</strong><button class="btn" type="button" id="refresh-replay-impact">Refresh usage</button></div>
+        <div class="replay-impact-head"><strong>Rerun planning</strong><button class="btn" type="button" id="refresh-replay-impact">Refresh usage</button></div>
         <div id="replay-impact-content" aria-live="polite"><p class="muted">Loading the selected agent's usage…</p></div>
       </section>
       <span class="replay-buttons"><button type="button" class="btn" id="queue-replay" title="Keep it for later, to launch with others from the Reruns page">+ Add to queue</button>
@@ -1267,14 +1278,27 @@ function rerunSectionHtml(p, knownModels = [], defaultJudge = "") {
 
 function bindRerun(p) {
   const form = document.getElementById("replay-form");
-  const settings = () => ({
+  const settings = () => {
+    if (!document.getElementById("replay-permission").value) throw new Error("Choose permissions for the selected agent.");
+    return ({
     model: document.getElementById("replay-model").value, effort: document.getElementById("replay-effort").value,
     version: document.getElementById("replay-release").value, mode: document.getElementById("replay-mode").value,
     permission: document.getElementById("replay-permission").value, budget_usd: document.getElementById("replay-budget").value,
     restore_skills: document.getElementById("replay-skills")?.checked ?? true,
     rate: document.getElementById("replay-rate").checked, judge_model: document.getElementById("replay-judge").value,
   });
+  };
   const modelSelect = document.getElementById("replay-model");
+  const agentSelect = document.getElementById("replay-agent");
+  const originalAgent = p.rerun.harness === "Codex" ? "codex" : "claude";
+  const modelOptions = modelSelect ? [...modelSelect.options].map((o) => ({ value: o.value, label: o.textContent })) : [];
+  const filterModels = () => {
+    const current = modelSelect.value;
+    const options = modelOptions.filter((o) => rerunModelAgent(o.value, originalAgent) === agentSelect.value);
+    modelSelect.replaceChildren(...options.map((o) => new Option(o.label, o.value)));
+    if (options.some((o) => o.value === current)) modelSelect.value = current;
+  };
+  if (agentSelect) filterModels();
   const impactBox = document.getElementById("replay-impact-content");
   let impactRequest = 0, impactTimer;
   const updateImpact = async () => {
@@ -1287,11 +1311,15 @@ function bindRerun(p) {
       if (!impactBox.isConnected || request !== impactRequest) return;
       const estimate = data.estimate;
       const reached = data.limits?.windows.some((w) => w.used_percent >= 100);
-      impactBox.innerHTML = `<div class="replay-impact-estimate"><strong>${esc(data.agent)}</strong>
-        ${estimate ? `<span>Estimated additional usage: <strong>≈ ${fmtTokens(estimate.total_tokens)} tokens</strong> · <strong>${estimate.cost_usd == null ? "Cost unavailable" : `≈ ${fmtCost(estimate.cost_usd)}`}</strong> · time baseline ${fmtMs(estimate.duration_ms)}</span>` : '<span>Consumption estimate unavailable.</span>'}</div>
+      impactBox.innerHTML = `<section class="replay-impact-current" aria-label="Current account status">
+        <h3>Current account status</h3>
         ${reached ? '<p class="status-warn">A reported usage limit is reached. Check its reset time below.</p>' : ""}
         <div class="replay-impact-limits">${data.limits ? homeLimits([data.limits]) : `<p class="muted">No usage report for ${esc(data.agent)}. Check its connection in <a href="#/setup">Setup</a>.</p>`}</div>
-        <p class="muted replay-impact-note">Usage and reset times are the latest reported values. Additional subscription percentage cannot be predicted from these reports. Token and API-cost estimates reuse original usage with a cold cache; actual usage varies. Judge calls are extra. Refreshes every minute.</p>`;
+        <p class="muted replay-impact-note">Latest reported usage and reset times. Refreshes every minute.</p></section>
+        <section class="replay-impact-forecast" aria-label="Rerun estimate"><h3>Rerun estimate</h3>
+        <div class="replay-impact-estimate">${estimate ? `<span>Estimated additional usage: <strong>≈ ${fmtTokens(estimate.total_tokens)} tokens</strong> · <strong>${estimate.cost_usd == null ? "Cost unavailable" : `≈ ${fmtCost(estimate.cost_usd)}`}</strong> · time baseline ${fmtMs(estimate.duration_ms)}</span>` : '<span>Consumption estimate unavailable.</span>'}</div>
+        ${quotaForecast(data.forecast)}
+        <p class="muted replay-impact-note">Token and API-cost estimates reuse original usage with a cold cache; actual usage varies. Judge calls are extra. Limit forecasts learn from local model history; external account activity can affect them.</p></section>`;
     } catch (error) {
       if (!(error instanceof StaleNavigation) && impactBox.isConnected && request === impactRequest) {
         impactBox.innerHTML = `<p class="muted">Could not load usage impact: ${esc(error.message)}. Use Refresh usage to retry.</p>`;
@@ -1303,14 +1331,27 @@ function bindRerun(p) {
   document.getElementById("refresh-replay-impact")?.addEventListener("click", updateImpact);
   const updateHarness = () => {
     const selected = modelSelect.value;
-    const codex = selected.startsWith("codex:") || (selected.startsWith("gpt-") && !selected.startsWith("gpt-oss")) || (!selected && p.rerun.harness === "Codex");
+    const codex = rerunModelAgent(selected, originalAgent) === "codex";
+    agentSelect.value = codex ? "codex" : "claude";
+    for (const option of document.getElementById("replay-release").options) {
+      option.disabled = Boolean(option.value) && agentSelect.value !== originalAgent;
+    }
+    const samePermission = document.getElementById("replay-permission").querySelector('option[value="same"]');
+    samePermission.disabled = agentSelect.value !== originalAgent;
+    if (samePermission.disabled && samePermission.selected) document.getElementById("replay-permission").value = "";
     const budget = document.getElementById("replay-budget");
     budget.disabled = codex;
     if (codex) budget.value = "";
     updateImpact();
   };
+  if (agentSelect) agentSelect.onchange = () => {
+    filterModels();
+    document.getElementById("replay-release").value = "";
+    document.getElementById("replay-effort").value = "";
+    updateHarness();
+  };
   if (modelSelect) modelSelect.onchange = updateHarness;
-  updateImpact();
+  if (form) updateHarness();
   // permission and budget only apply to unattended reruns
   const mode = document.getElementById("replay-mode");
   if (mode) {
@@ -1320,7 +1361,9 @@ function bindRerun(p) {
   // a reference run's settings, copied into the menus (still editable)
   const from = document.getElementById("replay-from");
   if (from) from.onchange = () => {
-    const x = p.references[Number(from.value)];
+    const x = from.value === "" ? null : p.references[Number(from.value)];
+    agentSelect.value = rerunModelAgent(x?.model, originalAgent);
+    filterModels();
     const set = (id, value, sameValue) => {
       const select = document.getElementById(id);
       const v = !x || !value || value === sameValue ? "" : value;
@@ -1350,7 +1393,7 @@ function bindRerun(p) {
       status.innerHTML = out.mode === "background"
         ? `Rerun started in the background.${skills} Follow it on the <a href="#/reruns">Reruns</a> page: it says when it is done, or what it needed.`
         : out.terminal
-          ? `Claude Code opened in a new terminal window.${skills} Once it answers, the rerun shows up here (press Refresh).`
+          ? `Agent opened in a new terminal window.${skills} Once it answers, the rerun shows up here (press Refresh).`
           : `No terminal window could be opened from here. Run this in a terminal: the rerun is linked to this prompt once imported.<pre><code>${esc(out.command)}</code></pre>`;
       status.hidden = false;
       updateImpact();
@@ -3086,6 +3129,48 @@ function windowLabel(minutes) {
   return minutes % 60 ? `${minutes} min` : `${minutes / 60} h`;
 }
 
+/** Empirical percentage-point impact, kept separate from reported account state. */
+function quotaForecast(forecast) {
+  if (!forecast?.windows?.length) return '<p class="muted">Limit impact unavailable: waiting for account usage readings.</p>';
+  const pct = (value) => Number(value).toFixed(1);
+  return `<div class="quota-forecast">${forecast.windows.map((w) => {
+    const samples = (w.models || []).map((m) => `${esc(m.model)}: ${m.samples} sample${m.samples === 1 ? "" : "s"}${m.tokens_per_percentage_point ? ` · ≈ ${fmtTokens(m.tokens_per_percentage_point)} tokens/percentage point` : ""}`).join(" · ");
+    if (w.status !== "estimated") return `<p class="muted">${windowLabel(w.window_minutes)} impact: learning (${samples || "model unknown"}). Needs at least 3 usable observations per model and 3 percentage points of observed usage.</p>`;
+    const projected = w.projected_percent == null ? "" : ` · projected ${pct(w.projected_percent_low)}–${pct(w.projected_percent_high)}% used`;
+    return `<p><strong>${windowLabel(w.window_minutes)}: +${pct(w.additional_percent_low)}–${pct(w.additional_percent_high)} percentage points</strong>${projected}<br><span class="muted">Low confidence · observed range · ${samples}</span>${w.projected_percent_high >= 100 ? '<br><span class="status-warn">May exhaust the remaining allowance.</span>' : ""}${w.may_cross_reset ? '<br><span class="status-warn">Run may cross the reported reset; projection assumes the current window.</span>' : ""}</p>`;
+  }).join("")}</div>`;
+}
+
+function queueQuotaForecast(items) {
+  const groups = new Map();
+  for (const q of items) {
+    const agent = q.agent || "Agent";
+    if (!groups.has(agent)) groups.set(agent, []);
+    groups.get(agent).push(q);
+  }
+  return [...groups].map(([agent, runs]) => {
+    const minutes = [...new Set(runs.flatMap((q) => (q.forecast?.windows || []).map((w) => w.window_minutes)))];
+    const windows = minutes.map((window_minutes) => {
+      const rows = runs.map((q) => q.forecast?.windows?.find((w) => w.window_minutes === window_minutes));
+      const models = new Map();
+      rows.filter(Boolean).forEach((w) => (w.models || []).forEach((m) => models.set(m.model, m)));
+      const result = {window_minutes, models: [...models.values()], status: "learning"};
+      if (rows.every((w) => w?.status === "estimated")) {
+        result.status = "estimated";
+        for (const key of ["additional_percent", "additional_percent_low", "additional_percent_high"]) result[key] = rows.reduce((sum, w) => sum + w[key], 0);
+        if (rows.every((w) => w.projected_percent != null)) {
+          result.projected_percent_low = rows[0].projected_percent_low - rows[0].additional_percent_low + result.additional_percent_low;
+          result.projected_percent_high = rows[0].projected_percent_high - rows[0].additional_percent_high + result.additional_percent_high;
+          result.projected_percent = rows[0].projected_percent - rows[0].additional_percent + result.additional_percent;
+        }
+        result.may_cross_reset = rows.some((w) => w.may_cross_reset);
+      }
+      return result;
+    });
+    return `<strong>${esc(agent)}</strong>${quotaForecast({windows})}`;
+  }).join("");
+}
+
 /** Subscription usage of each connected agent, beside the home title: share of each window used, and when it resets. */
 function homeLimits(limits) {
   return limits.map((a) => {
@@ -3246,7 +3331,7 @@ async function viewReruns() {
       </header>
 
       <section class="card rerun-limits" aria-labelledby="rerun-limits-title">
-        <div class="rerun-limits-head"><h2 id="rerun-limits-title">Usage limits & reset status</h2>
+        <div class="rerun-limits-head"><h2 id="rerun-limits-title">Current account status</h2>
           <button type="button" class="btn" data-refresh-limits>Refresh status</button></div>
         <p class="muted">Latest reported usage and reset times. Updates every minute while this page is open.</p>
         <div class="rerun-limits-agents" id="rerun-limits-status" aria-live="polite">${limits === null ? '<p class="muted">Could not load usage limits. Try refreshing the status.</p>' : limits.length ? homeLimits(limits) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>'}</div>
@@ -3256,7 +3341,8 @@ async function viewReruns() {
       <h2 class="page-sec">Queue <span class="muted">${data.queue.length}</span></h2>
       ${data.queue.length ? `
         <div class="rr-estimate-grid">${rerunEstimateSummary("Entire queue", fullEstimate)}${picked.length ? rerunEstimateSummary("Selected", estimate) : ""}</div>
-        <p class="muted rr-estimate-note">Estimates reuse the original token volume at the chosen model's current configured prices, assuming a cold cache and unchanged subagent models. Duration uses original run times; concurrent duration assumes all runs start together. Actual usage can vary with model, effort, tools and caching. Judge calls are extra. API estimates are not subscription charges; subscription percentage impact cannot be calculated from the reported limits.</p>
+        <section class="card" aria-label="Estimated queue limit impact"><h3>Estimated queue limit impact</h3><div id="queue-quota-forecast">${queueQuotaForecast(data.queue)}</div>${picked.length ? `<h3>Selected runs</h3><div id="selected-quota-forecast">${queueQuotaForecast(picked)}</div>` : ""}</section>
+        <p class="muted rr-estimate-note">Estimates reuse the original token volume at the chosen model's current configured prices, assuming a cold cache and unchanged subagent models. Duration uses original run times; concurrent duration assumes all runs start together. Actual usage can vary with model, effort, tools and caching. Judge calls are extra. API estimates are not subscription charges. Model-specific limit forecasts learn from local observations; external activity can affect them.</p>
         <div class="select-bar rerun-bar">
           <strong>${picked.length} selected</strong>
           <button type="button" class="btn" data-rr-all ${picked.length === data.queue.length ? "disabled" : ""}>Select all ${data.queue.length}</button>
@@ -3270,7 +3356,7 @@ async function viewReruns() {
           <input type="checkbox" class="psel" data-rr-pick="${q.id}" ${rerunState.picked.has(q.id) ? "checked" : ""} aria-label="Select this rerun">
           <div class="rr-body">${rerunPromptCell(q.prompt)}<div class="rr-settings">${rerunSettings(q)}</div>
             ${q.prompt?.cwd ? `<span class="pmeta">Directory: <code>${esc(q.prompt.cwd)}</code></span>` : '<span class="pmeta">Original directory unavailable</span>'}
-            <div class="rr-consumption">${q.estimate ? `<strong>${rerunEstimateCost(rerunEstimateTotal([q]))}</strong><span>≈ ${fmtTokens(q.estimate.total_tokens)} tokens</span><span>${fmtTokens(q.estimate.input_tokens)} input · ${fmtTokens(q.estimate.output_tokens)} output</span><span>Time baseline ${fmtMs(q.estimate.duration_ms)}</span><span>${esc(q.estimate.model || "Model unknown")}</span>` : '<span>Estimate unavailable: original prompt is outside the current history.</span>'}</div>
+            <div class="rr-consumption">${q.estimate ? `<strong>${rerunEstimateCost(rerunEstimateTotal([q]))}</strong><span>≈ ${fmtTokens(q.estimate.total_tokens)} tokens</span><span>${fmtTokens(q.estimate.input_tokens)} input · ${fmtTokens(q.estimate.output_tokens)} output</span><span>Time baseline ${fmtMs(q.estimate.duration_ms)}</span><span>${esc(q.estimate.model || "Model unknown")}</span><div data-quota-run="${q.id}">${quotaForecast(q.forecast)}</div>` : '<span>Estimate unavailable: original prompt is outside the current history.</span>'}</div>
             <button type="button" class="link-btn" data-rr-launch-one="${q.id}">Run this rerun</button>
           </div>
           <span class="muted rr-added" title="${esc(fmtDate(q.added_at))}">queued ${esc(fmtAgo(q.added_at))}</span>
@@ -3305,9 +3391,19 @@ async function viewReruns() {
     const errorBox = page.querySelector("#rerun-limits-error");
     button.disabled = true;
     try {
-      const latest = await api("/api/limits");
+      const [latest, updated] = await Promise.all([api("/api/limits"), api("/api/reruns")]);
       if (!limitStatus.isConnected) return;
       limitStatus.innerHTML = latest.length ? homeLimits(latest) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>';
+      const byId = new Map(updated.queue.map((q) => [q.id, q]));
+      data.queue.forEach((q) => { if (byId.has(q.id)) Object.assign(q, byId.get(q.id)); });
+      const fullForecast = page.querySelector("#queue-quota-forecast");
+      const selectedForecast = page.querySelector("#selected-quota-forecast");
+      if (fullForecast) fullForecast.innerHTML = queueQuotaForecast(data.queue);
+      if (selectedForecast) selectedForecast.innerHTML = queueQuotaForecast(data.queue.filter((q) => rerunState.picked.has(q.id)));
+      page.querySelectorAll("[data-quota-run]").forEach((el) => {
+        const q = byId.get(Number(el.dataset.quotaRun));
+        if (q) el.innerHTML = quotaForecast(q.forecast);
+      });
       errorBox.hidden = true;
     } catch (error) {
       if (error instanceof StaleNavigation || !limitStatus.isConnected) return;

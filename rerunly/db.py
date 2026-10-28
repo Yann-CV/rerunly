@@ -5,6 +5,26 @@ from pathlib import Path
 from .config import DEFAULT_SETTINGS
 
 SCHEMA = """
+-- Only local usage readings and token counts, never authentication data.
+CREATE TABLE IF NOT EXISTS usage_observations (
+    agent TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    windows TEXT NOT NULL,
+    records TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_samples (
+    id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model TEXT NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    percentage REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_samples_model ON usage_samples(agent, scope, model, window_minutes);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,

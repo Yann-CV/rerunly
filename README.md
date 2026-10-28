@@ -271,7 +271,8 @@ The detail available depends on what each agent records; see [Supported agents](
 <details>
 <summary><b>Reruns</b>: choose a configuration, estimate usage and launch a queue</summary>
 
-- From a prompt, select an agent, model, reasoning effort and CLI release, or copy a tag's
+- From a prompt, use **Agent** to choose Claude Code or OpenAI Codex, then select a model,
+  reasoning effort and CLI release, or copy a tag's
   reference settings. Launch immediately or **Add to queue**; queue selections from the
   Prompts page or a tag's page too.
 - Reruns start fresh in the recorded working directory and restore captured skills where
@@ -280,16 +281,17 @@ The detail available depends on what each agent records; see [Supported agents](
   prompts; background mode needs compatible permissions or an explicit override. Missing
   directories or permission metadata require attention rather than guessed defaults. Changing
   agents requires an explicit permission choice; the original agent’s permissions cannot be reused.
-- Check the selected agent's reported usage and reset limits alongside estimated additional
-  tokens, API cost and the original duration baseline. The prompt panel supports manual
-  refresh and refreshes usage every minute.
+- The rerun form separates **Current account status** (reported usage and reset times) from
+  **Rerun estimate** (additional tokens, API cost, duration baseline and learned limit impact).
+  The prompt panel supports manual refresh and refreshes usage every minute.
 - The **Reruns** page shows saved settings and estimates for each queued run. Launch one,
   selected runs, or all together; review combined cost/tokens, summed run time and the
   longest-run duration baseline before launching. Failed launches stay queued for retry.
 - Estimates reuse original usage at the selected model's prices, assuming a cold cache and
   unchanged subagent models. Unpriced models are flagged; displayed estimates can be partial.
   Actual usage can differ, and judge calls add usage.
-  API estimates do not predict subscription charges or future account-limit percentages.
+  API estimates do not predict subscription charges. Separate empirical limit forecasts show
+  an approximate percentage-point range and projected usage when calibration is available.
 - Follow launched runs as **running**, **done**, **needs you** or **failed**, then compare
   imported results with the original. Imported rerun prompts get the `rerun` tag and are
   studied separately from the original's tags.
@@ -571,14 +573,38 @@ how recent each reading is. The rerun form and Reruns page refresh usage every m
 provide manual refresh controls.
 
 If local readings are missing or all their windows have reset, Rerunly tries the provider’s
-usage endpoint using the agent’s existing local login. It reads credentials without changing
+usage endpoint using the agent’s existing local login. Automatic imports also collect usage
+readings for calibration, using the same fallback. It reads credentials without changing
 or refreshing them and caches the result for 60 seconds. Offline, expired or unavailable
 credentials can leave usage unavailable. These requests send authentication and account
 information to the provider, not prompts or transcripts; they are separate from automatic
 price lookups. The example app never makes these usage requests.
 
-Usage percentages describe the reported account state. They do not predict the percentage
-an upcoming rerun will consume, and API token estimates do not measure subscription charges.
+**Current account status** shows the reported account state. **Rerun estimate** and the
+queue's **Estimated queue limit impact** separately show empirical forecasts, including
+combined forecasts for the entire queue and selected runs, grouped by agent.
+
+While the dashboard runs, imports and usage refreshes save local token/usage observations.
+Calibration uses raw imported history, including runs hidden from dashboard history, and
+counts main agents and linked subagents separately. Each agent, reported plan, reading source
+(local or provider), model and window length has its own calibration. Only consecutive,
+fresh readings within one hour, in the same reset window, with token changes attributable to
+one model produce samples. Mixed-model intervals, late imports, decreasing counters, reached
+limits and reset boundaries are excluded; unchanged percentages are retained to account for
+rounded reports. The example app never collects calibration data.
+
+Forecasts need at least three usable samples and three observed percentage points per model
+and window. Until then they show **learning**, with sample counts. Samples expire after 30
+days. Forecasts show an observed range allowing for percentage rounding and are labeled low
+confidence; the range is not a statistical confidence interval or a provider quota formula.
+Projection requires a reading less than one hour old and an active reported reset window.
+A warning appears if the range reaches 100% or the original duration could cross the reset.
+
+Activity outside imported local history, account changes with the same reported plan, effort,
+cache behavior and provider policy can affect the relationship. Plan/source changes keep
+calibrations separate, but the readings do not identify the account itself. Models without
+calibration prevent a complete limit forecast; judge usage is extra. API token estimates do
+not measure subscription charges. Reset times remain provider-reported, not predicted.
 
 ## Automatic model prices
 

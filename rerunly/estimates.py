@@ -17,6 +17,7 @@ def estimate_rerun(prompt, agents, model, prices):
     target = (model or prompt.get("requested_model") or (next(iter(models)) if len(models) == 1 else "")).removeprefix("codex:")
     inputs, outputs, searches = 0, 0, 0
     costs = []
+    tokens_by_model = {}
     for record, selected in [(prompt, target), *[(a, None) for a in agents]]:
         input_count = sum(record.get(k) or 0 for k in ("input_tokens", "cache_read_tokens", "cache_write_tokens"))
         output_count = record.get("output_tokens") or 0
@@ -26,6 +27,8 @@ def estimate_rerun(prompt, agents, model, prices):
             selected = next(iter(observed)) if len(observed) == 1 else ""
         costs.append(cost_usd(selected, Usage(input_tokens=input_count, output_tokens=output_count,
                                               web_search_requests=search_count), prices))
+        if input_count + output_count:
+            tokens_by_model[selected] = tokens_by_model.get(selected, 0) + input_count + output_count
         inputs += input_count
         outputs += output_count
         searches += search_count
@@ -33,4 +36,4 @@ def estimate_rerun(prompt, agents, model, prices):
             "total_tokens": inputs + outputs, "web_search_requests": searches,
             "cost_usd": sum(costs) if all(c is not None for c in costs) else None,
             "duration_ms": prompt.get("active_ms") or prompt.get("wall_ms"),
-            "basis": "original_usage_cold_cache"}
+            "tokens_by_model": tokens_by_model, "basis": "original_usage_cold_cache"}

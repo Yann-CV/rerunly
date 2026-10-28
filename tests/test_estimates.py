@@ -19,6 +19,7 @@ def test_estimate_reprices_cold_cache_and_includes_agents():
     assert result["model"] == "cheaper"
     assert result["input_tokens"] == 450 and result["output_tokens"] == 30
     assert result["total_tokens"] == 480
+    assert result["tokens_by_model"] == {"cheaper": 370, "original": 110}
     assert result["duration_ms"] == 3000
     assert result["cost_usd"] == pytest.approx((350 + 20 * 2 + 100 * 10 + 10 * 20) / 1_000_000 + 0.01)
 

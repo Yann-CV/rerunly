@@ -1091,3 +1091,7 @@ a.hero-fact:hover { text-decoration: none; background: color-mix(in srgb, var(--
 .rerun-setup table th[scope="row"] { width: 120px; color: var(--text-secondary); font-weight: 500; }
 .rerun-setup td .rr-chip { margin: 0 4px 2px 0; }
 @media (max-width: 640px) { .rerun-setup table th[scope="row"] { width: 76px; } }
+
+.replay-impact-current, .replay-impact-forecast { padding: 12px; border: 1px solid var(--border); border-radius: 8px; margin-top: 10px; }
+.replay-impact h3 { margin: 0 0 10px; font-size: 14px; }
+.quota-forecast { font-size: 12px; line-height: 1.5; }

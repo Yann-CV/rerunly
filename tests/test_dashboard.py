@@ -1270,3 +1270,20 @@ def test_default_judge_runs_at_its_effort(client, tmp_path, monkeypatch):
             break
         time.sleep(0.02)
     assert seen == [("codex:gpt-6-luna", "high"), ("claude-haiku-5-5", "")]
+
+
+def test_usage_presentation_preserves_cached_readings(client, monkeypatch):
+    from datetime import datetime, timezone
+    from rerunly.sources.codex import CodexSource
+
+    report = {"observed_at": datetime.now(timezone.utc).isoformat(), "plan": "plus", "windows": [
+        {"window_minutes": 300, "used_percent": 10, "resets_at": 4_000_000_000}]}
+    monkeypatch.setattr(CodexSource, "rate_limits", lambda self: report)
+    for _ in range(2):
+        response = client.get("/api/limits")
+        assert response.status_code == 200
+    assert report["windows"][0]["resets_at"] == 4_000_000_000
+    result = client.get("/api/prompts/prompt-1/rerun-estimate", params={"model": "codex:gpt-6-luna"}).json()
+    assert result["limits"]["windows"][0]["used_percent"] == 10
+    assert result["forecast"]["status"] == "learning"
+    assert result["forecast"]["windows"][0]["models"][0]["samples"] == 0

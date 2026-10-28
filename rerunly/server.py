@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, judge, live_limits, otel, replay, runner, statusline
+from . import background as bg, db, judge, live_limits, otel, replay, runner, statusline, usage_forecast
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .estimates import estimate_rerun
 from .ingest import apply_curation, apply_rules, ingest, session_texts
@@ -80,6 +80,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             path.unlink(missing_ok=True)  # rebuilt at each start: the illustrative dates stay recent
         add_examples(db.connect(db_path))
     ingest_lock = threading.Lock()
+    usage_lock = threading.Lock()
     stop = threading.Event()
 
     def conn():
@@ -106,6 +107,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             c = conn()
             try:
                 out = ingest(c, force=force)
+                usage_limits()  # pair newly imported tokens with local account readings
                 rate_pending(c)  # reruns just imported get their rating
                 return out
             finally:
@@ -1208,6 +1210,16 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if settings.get("codex_enabled", True):
             found.append({"agent": "Codex", "capture": True,
                           **seen(CodexSource(settings["codex_sessions_dir"]).rate_limits(), live_limits.codex)})
+        # Presentation must not mutate cached provider readings or source-owned dictionaries.
+        found = [{**entry, "windows": [dict(w) for w in entry["windows"]]} for entry in found]
+        # Persist raw readings before presentation replaces expired windows with zero.
+        with usage_lock:
+            calibration = conn()
+            try:
+                for limits in found:
+                    usage_forecast.observe(calibration, limits)
+            finally:
+                calibration.close()
         for limits in found:
             for w in limits["windows"]:
                 w["reset"] = bool(w["resets_at"] and w["resets_at"] <= now)
@@ -1349,8 +1361,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         agents = [dict(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=?", (prompt_id,))]
         agent = "Codex" if replay.uses_codex(model, original["harness"]) else "Claude Code"
         limits = next((entry for entry in usage_limits() if entry["agent"] == agent), None)
-        return {"agent": agent, "limits": limits,
-                "estimate": estimate_rerun(row, agents, model, db.get_settings(c)["prices"])}
+        estimate = estimate_rerun(row, agents, model, db.get_settings(c)["prices"])
+        return {"agent": agent, "limits": limits, "estimate": estimate,
+                "forecast": usage_forecast.forecast(c, limits, estimate)}
 
     def finish_rerun(session_id: str) -> None:
         """Record how a background rerun ended, from its log, and drop its restored skills."""
@@ -1505,12 +1518,15 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             r = c.execute(f"SELECT {prompt_cols} FROM pv WHERE id = ?", (pid,)).fetchone()
             return dict(r) if r else None
         prices = db.get_settings(c)["prices"]
+        limits = {entry["agent"]: entry for entry in usage_limits()}
         queue = []
         for q in c.execute("SELECT * FROM replay_queue ORDER BY id"):
             original = c.execute("SELECT * FROM pv WHERE id=?", (q["prompt_id"],)).fetchone()
             agents = [dict(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=?", (q["prompt_id"],))]
-            queue.append({**dict(q), "prompt": prompt(q["prompt_id"]),
-                          "estimate": estimate_rerun(dict(original) if original else None, agents, q["model"], prices)})
+            estimate = estimate_rerun(dict(original) if original else None, agents, q["model"], prices)
+            agent = "Codex" if replay.uses_codex(q["model"], original["harness"] if original else "") else "Claude Code"
+            queue.append({**dict(q), "prompt": prompt(q["prompt_id"]), "agent": agent, "estimate": estimate,
+                          "forecast": usage_forecast.forecast(c, limits.get(agent), estimate)})
         launched = []
         for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC LIMIT 200"):
             original = prompt(x["prompt_id"])
