@@ -18,7 +18,6 @@
   <img alt="Claude Code" src="https://img.shields.io/badge/works%20with-Claude%20Code-6250d6">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-2a78d6">
   <img alt="Local first" src="https://img.shields.io/badge/data-stays%20on%20your%20machine-1baf7a">
-  <img alt="Setup" src="https://img.shields.io/badge/setup-60%20seconds-eb6834">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-9a9993">
 </p>
 
@@ -103,25 +102,36 @@ up automatically from official provider pages, with your overrides taking preced
 ### 🔒 Your history stays local
 **No Rerunly account or cloud upload.** Imported history lives in a local SQLite file and a
 local dashboard. Reruns and LLM judging use your installed, authenticated agents; automatic
-price lookups send no prompts and can be disabled.
+price lookups send no prompts and can be disabled. [Account usage checks](#account-usage-and-reset-limits)
+can contact providers using your agents’ existing logins.
 
 </td>
 </tr>
 </table>
 
-## 🚀 Up and running in 60 seconds
+## 🚀 Getting started
+
+Requires **Python 3.11+**, **uv** and **Git**. The status bar icon and start-at-login
+integration target Linux desktops; the foreground web dashboard can run without the tray.
 
 ```bash
-git clone git@github.com:goldener-data/rerunly.git && cd rerunly
+git clone https://github.com/goldener-data/rerunly.git
+cd rerunly
 uv sync
 uv run rerunly start   # runs in the background, with a status bar icon
 ```
 
-Open <http://127.0.0.1:8765>, go to **Setup**, and press:
+Open <http://127.0.0.1:8765> and go to **Setup**:
 
-1. Check the enabled agents and history directories.
+1. Under **Agents**, open **Details** for each linked agent to check its **Transcript directory**.
+   Use **Save path** to change it, or **Remove** / **Add agent** to manage connections.
 2. **Import now**: load your available history from supported agents.
 3. **Start at login** *(optional)*: keep the dashboard running automatically.
+
+For a foreground dashboard without the tray, use `uv run rerunly`. History import needs
+no installed agent or API key when transcript files are already available. Running tasks or
+judges requires an installed, authenticated Claude Code or Codex CLI; selecting a pinned
+CLI release also requires Node.js and `npx`.
 
 New history is imported automatically. For integration-specific setup, including hooks
 and reported costs, see [Supported agents](#-supported-agents).
@@ -268,7 +278,8 @@ The detail available depends on what each agent records; see [Supported agents](
   available. They do not restore the original conversation or repository state.
 - **Same as original** reuses recorded permissions. Terminal mode lets you answer approval
   prompts; background mode needs compatible permissions or an explicit override. Missing
-  directories or permission metadata require attention rather than guessed defaults.
+  directories or permission metadata require attention rather than guessed defaults. Changing
+  agents requires an explicit permission choice; the original agent’s permissions cannot be reused.
 - Check the selected agent's reported usage and reset limits alongside estimated additional
   tokens, API cost and the original duration baseline. The prompt panel supports manual
   refresh and refreshes usage every minute.
@@ -276,7 +287,8 @@ The detail available depends on what each agent records; see [Supported agents](
   selected runs, or all together; review combined cost/tokens, summed run time and the
   longest-run duration baseline before launching. Failed launches stay queued for retry.
 - Estimates reuse original usage at the selected model's prices, assuming a cold cache and
-  unchanged subagent models. Unknown costs stay unknown; actual usage and judge calls can differ.
+  unchanged subagent models. Unpriced models are flagged; displayed estimates can be partial.
+  Actual usage can differ, and judge calls add usage.
   API estimates do not predict subscription charges or future account-limit percentages.
 - Follow launched runs as **running**, **done**, **needs you** or **failed**, then compare
   imported results with the original. Imported rerun prompts get the `rerun` tag and are
@@ -291,12 +303,15 @@ The detail available depends on what each agent records; see [Supported agents](
 - Compare two runs side by side, including the original, reruns and tag reference runs.
   Inspect cost, tokens, time, tool calls, edited files and answer differences.
 - After a rerun is imported, an LLM judge compares its output with the original's substance:
-  similarity from 0–100, better/same/worse, a short explanation and key differences.
+  similarity from 0–100, better/same/worse/unclear, a short explanation and key differences.
 - Verdicts flag **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it** and appear
   wherever rated reruns are listed. They help direct review; they are not a test of correctness.
-- Choose the judge model and supported effort per rerun or comparison, or set the default
-  in Setup. Judging runs through an installed, authenticated agent in an empty scratch folder;
-  it adds usage, with caps and timeouts depending on the agent.
+- Choose a judge model per rerun or comparison. Set the default model and its effort in
+  **Setup** (initially `claude-haiku-5-5`, at the model’s default effort). An explicit model
+  choice uses that model’s default effort. Judging runs through an installed, authenticated
+  agent in an empty scratch folder; it adds usage, with caps and timeouts depending on the agent.
+- The judge receives the request, final answers and edited file names, rather than file
+  contents or a repository diff. Long text is truncated to 30,000 characters per field.
 </details>
 
 <details>
@@ -315,8 +330,10 @@ The detail available depends on what each agent records; see [Supported agents](
   transcript directories. Removing a connection keeps its imported history.
 - Import now, re-import all history, configure periodic imports and start at login.
   Claude Code also offers a Stop hook, cost telemetry, usage capture and retention settings.
-- Leave projects, skills, subagent types, sessions or reruns out of history; manage exclusions
-  and adjust the similarity threshold used to link prompts.
+- Leave projects, sessions, reruns or tags from any category out of history: your tags,
+  models, skills, subagent types, personas, commands and other AI tags. Excluded prompts stay
+  imported and return immediately when included again. Your tags and AI tags with the same
+  name have separate exclusion controls. Adjust the similarity threshold used to link prompts.
 - Edit model prices or let **Automatic model pricing** look up missing prices on official
   provider pages. Inspect lookup status, missing prices and source links; manual overrides
   take precedence. Price lookups send no prompts and can be disabled.
@@ -391,9 +408,11 @@ it is only common words (such as "do it"), which leaves nothing to compare.
     prompts*, search or filter, *Select all*, then *Tag N selected…*;
   - **with rules**, which tag past prompts right away and new ones on every import. A rule is a
     keyword alone, several keywords that must all appear (*any of them* becomes one rule per
-    keyword), or a **skill** the agent used. It applies **in a prompt** (that prompt gets the
-    tag) or **in a session** (the session's title or any of its prompts matches, and every
-    prompt of that session gets the tag). A prompt matching any of a tag's rules gets the tag.
+    keyword), a **skill** the agent used, or another **tag** to include or exclude. Keyword
+    rules can exclude matches too. A rule applies **in a prompt** (that prompt matches) or
+    **in a session** (a matching title, prompt or tag affects every prompt in the session).
+    Inclusion rules add eligible prompts; exclusion rules, explicit exclusions and tag
+    priorities can keep them out. See [Curate prompts within a tag](#curate-prompts-within-a-tag).
 
   Deleting a tag only removes the tag and its rules: the prompts stay.
 
@@ -418,7 +437,8 @@ only sees words.
 ## 🧮 How the numbers are computed
 
 Rerunly groups recorded usage by prompt and its linked subagents, then applies the configured
-model prices. Unknown models are flagged as unpriced. Reported costs, timing precision,
+model prices. The longest matching model-ID prefix wins. Models without a matching price
+are flagged as unpriced and contribute no estimated dollars, so totals can be incomplete. Reported costs, timing precision,
 cache detail and subagent attribution vary by integration; see [Supported agents](#-supported-agents).
 API price estimates measure token usage, not subscription charges or credit consumption.
 
@@ -430,23 +450,26 @@ Skill snapshots, agent versions, model and effort are captured where the transcr
 
 Rerunly currently supports **Claude Code** and **OpenAI Codex**. Both feed the same
 local dashboard: prompt history, filters, tags, comparisons, reference runs, exclusions,
-exports, rerun queue and output judging. Available detail depends on what each agent records.
+rerun queue and output judging. Available detail depends on what each agent records.
 
 | Integration | History location | Updates | Cost source |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects` | Polling; optional Stop hook for immediate updates | API price estimates; reported cost through optional OpenTelemetry |
 | OpenAI Codex CLI and IDE | `$CODEX_HOME/sessions`, or `~/.codex/sessions` | Polling | API price estimates |
 
-Both integrations are enabled by default. Change their directories or disable an integration
-on **Setup**. Importing existing history needs no API key; launching reruns or judges requires
-the selected agent to be installed and authenticated. Automatic imports run every 60 seconds
-by default while the dashboard is running.
+Both integrations are linked by default. On **Setup → Agents**, open **Details** to change
+a transcript directory, **Remove** to stop future imports, or **Add agent** to reconnect.
+Removing a connection keeps its imported history. Importing existing history needs no API
+key; launching reruns or judges requires the selected agent to be installed and authenticated.
+Automatic imports run every 60 seconds by default while the dashboard is running.
 
 ### Claude Code
 
-Use **Setup → Install hook** for updates after each answer, **Enable telemetry** for
-reported API costs, and the retention setting to keep transcripts longer. These settings
-apply to Claude Code only.
+Open **Setup → Agents → Claude Code → Details**. Use **Install hook** for updates after
+each answer, **Enable telemetry** for reported API costs, **Capture usage** to record
+statusline usage limits, and **Set to 3650 days** to keep transcripts longer. These settings
+apply to Claude Code only. Usage capture preserves your existing statusline command and
+restores it when removed; agent settings changes keep a `.bak` copy.
 
 Claude reruns restore recorded skills into a temporary plugin. You can use the installed
 CLI or select a release, model and effort. Unattended runs deny actions that would ask for
@@ -460,9 +483,9 @@ The transcript and telemetry details below explain Claude-specific attribution a
 
 | What | Source |
 |---|---|
-| Prompt | A user line in `<session>.jsonl` with `origin.kind == "human"` (typed text or a slash command). Everything until the next one, including background-task notifications, belongs to it. Local commands that never reach the model (`/plugin`, `/clear`) are dropped. |
+| Prompt | A user line in `<session>.jsonl` with `origin.kind == "human"` (typed text or a slash command). Older transcripts without origin metadata use a text-based fallback that skips tool results and known system notifications. Everything until the next one, including background-task notifications, belongs to it. Local commands that never reach the model (`/plugin`, `/clear`) are dropped. |
 | Tokens | `message.usage` of each assistant message, counted once per message id. Claude Code writes one line per content block, and each line repeats the usage. |
-| Subagents | `<session>/subagents/agent-*.jsonl`, linked to their prompt through `promptId`. The type and description come from `agent-*.meta.json`. |
+| Subagents | `<session>/subagents/agent-*.jsonl`, linked to their prompt through `promptId`. The type and description come from `agent-*.meta.json`, with the recorded brief as a fallback. Older sidechain messages in the main transcript are also supported. |
 | Cost | **Claude Code's own cost** when telemetry is on and covers every API call of the prompt. Claude Code sends a `claude_code.api_request` OpenTelemetry event per API call, with `cost_usd` and a `prompt.id` equal to the transcript's `promptId`; the dashboard receives these events at `/v1/logs` (OTLP, `http/json`). These figures include internal calls the transcripts don't detail, such as WebSearch. **Otherwise**, the price-table estimate: token counts × the price table on the Setup page. Cache writes cost 1.25× the input price (5-minute TTL) or 2× (1-hour TTL), fast mode costs 2×, and web search costs $10 per 1,000 requests. Models missing from the table are flagged. Each prompt shows which source was used. |
 | Active time | Sum of Claude Code's `turn_duration` events for the prompt. |
 | Wall time | From the prompt to its last event, including subagents that finish later. |
@@ -477,23 +500,22 @@ Switch between the two costs at any time with **Official / Price table** in the 
 estimate for the rest; **Price table** always shows the estimate. Each prompt's cost shows the
 other figure underneath.
 
-As a sanity check, Claude Code stores a session-level `cost-state` total: price-table estimates
-land within a few percent of it, and on a test prompt telemetry and the price table agreed
-exactly. Telemetry only applies to Claude Code sessions started after it is enabled, and calls
-made while the dashboard is not running are lost; a prompt missing some of its calls falls back
+Claude Code may also record a session-level `cost-state` total; it does not provide a
+per-prompt cost breakdown. Telemetry applies to Claude Code sessions started after it is
+enabled. Calls made while the dashboard is not running are not captured; a prompt missing some of its calls falls back
 to the estimate.
 </details>
 
 ### OpenAI Codex
 
 Codex CLI and IDE rollout history is imported automatically from
-`$CODEX_HOME/sessions` (or `~/.codex/sessions`). Change **Codex sessions directory**
-on Setup if needed. Existing installations gain the new default model prices without
-replacing edited prices. Refresh imports changed rollouts; the normal polling interval
+`$CODEX_HOME/sessions` (or `~/.codex/sessions`). Change **Transcript directory** under
+**Setup → Agents → OpenAI Codex → Details** if needed. Existing installations gain new
+default model prices without replacing edited prices. Refresh imports changed rollouts; the normal polling interval
 also keeps them current. No API key is needed for importing history.
 
 Codex prompts use the same history, filters, tags, comparisons, references, exclusions,
-exports, rerun queue and output judging as Claude prompts. Imports include the recorded
+rerun queue and output judging as Claude prompts. Imports include the recorded
 model, CLI version, reasoning effort, prompt/answer, token/cache counts, tool calls,
 `apply_patch` file paths, and explicitly injected `<skill>` snapshots. Parent spawn
 outputs identifying child thread IDs link separate subagent rollouts to their prompt.
@@ -540,6 +562,24 @@ Codex-specific behavior and limitations:
 Parsing uses a shared `Source` interface in `rerunly/sources/base.py`. Additional agents
 and harnesses can provide adapters that produce the same session, prompt and usage records.
 
+## Account usage and reset limits
+
+Home, the rerun form and the Reruns page show reported account usage separately from
+estimated API costs. Claude Code local readings come from the optional **Capture usage**
+statusline integration; Codex readings come from rollout history. Observation times show
+how recent each reading is. The rerun form and Reruns page refresh usage every minute and
+provide manual refresh controls.
+
+If local readings are missing or all their windows have reset, Rerunly tries the provider’s
+usage endpoint using the agent’s existing local login. It reads credentials without changing
+or refreshing them and caches the result for 60 seconds. Offline, expired or unavailable
+credentials can leave usage unavailable. These requests send authentication and account
+information to the provider, not prompts or transcripts; they are separate from automatic
+price lookups. The example app never makes these usage requests.
+
+Usage percentages describe the reported account state. They do not predict the percentage
+an upcoming rerun will consume, and API token estimates do not measure subscription charges.
+
 ## Automatic model prices
 
 During import, Rerunly checks newly recorded models (including subagents), locally
@@ -550,7 +590,7 @@ when an older family prefix already supplies a fallback estimate. Dated snapshot
 can share the published base model price.
 
 Successful lookups cache the provider catalog for 24 hours; failures retry after
-one hour without blocking imports. Newly found prices also recalculate existing
+one hour, and imports continue using available prices. Newly found prices also recalculate existing
 history for linked agents whose transcripts remain available. Manual price entries
 and edited family prefixes take precedence. No prompts or session data are sent;
 only the public pricing pages are requested, without API keys or an LLM call.
@@ -581,9 +621,8 @@ The **Excluded as irrelevant** list lets you restore a prompt to the tag the way
 it had it: a prompt you tagged by hand is tagged by hand again, and one tagged
 by a rule comes back only if a rule still matches it. Older exclusions whose
 original assignment was not recorded fall back to manual membership on restore.
-Tag priorities still
-apply to restored prompts. An excluded prompt can also stop serving as an
-example while staying excluded: excluded examples that resemble another one
+Tag priorities still apply to restored prompts. An excluded prompt can also stop serving
+as an example while staying excluded: excluded examples that resemble another one
 are identified so you can stop using them individually or together.
 
 Choose **Add a rule → Include tag** or **Add a rule → Exclude tag**.
