@@ -6,6 +6,9 @@ history or a normal dashboard, including an empty normal dashboard.
 Run from the repository root:
     uv run --with playwright python docs/capture_screenshots.py
 
+Refresh only the prompt page and its expanded rerun panel with --prompt-only.
+Use --model-checks-only for the Reruns page and illustrative availability results.
+
 Requires Chrome, Chromium, or `uv run --with playwright playwright install chromium`.
 No transcripts are imported, agents launched, or agent settings changed.
 """
@@ -64,7 +67,7 @@ def main():
                         raise RuntimeError("Illustrations must come from the example app")
                     page.locator(".examples-banner").wait_for()
                     page.wait_for_load_state("networkidle")
-                    page.locator("#app h1").first.wait_for()
+                    page.locator("#app h1, #app .page-kicker").first.wait_for()
                     page.evaluate("document.fonts.ready")
                     # Wait for Chart.js animations before capturing, and fail on missing charts.
                     page.wait_for_function("typeof Chart !== 'undefined'")
@@ -74,29 +77,217 @@ def main():
                             "el => window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - 75)")
                     else:
                         page.evaluate("window.scrollTo(0, 0)")
+                    if name == "reruns":
+                        page.locator("#rerun-history").wait_for()
+                        page.locator("[data-history-group]").evaluate_all("els => els.forEach(el => el.open = true)")
+                        page.wait_for_timeout(100)
                     page.screenshot(path=str(output / (name + ".png")), full_page=name == "reruns")
                     print(f"Captured {name}")
 
+                def capture_model_checks():
+                    # Explicitly illustrative outcomes, never real agent calls.
+                    import json
+                    from datetime import datetime, timezone
+                    checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    state = {"status": "completed", "started_at": checked, "finished_at": checked, "current": None,
+                        "results": [
+                            {"agent": "codex", "model": "gpt-6.1-sol", "status": "listed", "checked_at": checked,
+                             "message": "Illustrative result: listed in the agent’s menu. No test prompt was sent."},
+                            {"agent": "claude", "model": "claude-sonnet-5-5", "status": "discovery_failed", "checked_at": checked,
+                             "message": "Illustrative result: the agent’s model catalog could not be refreshed."}]}
+                    connection = db.connect(database)
+                    with connection:
+                        connection.execute("INSERT INTO model_check_state(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", (json.dumps(state),))
+                    connection.close()
+                    page.evaluate("viewReruns()")
+                    summary = page.locator("#model-check-tools")
+                    assert summary.locator("button, form, input, select").count() == 0
+                    summary.screenshot(path=str(output / "model-availability-summary.png"), style=".topbar { visibility: hidden !important; }")
+                    # Preview the real Setup component only inside the isolated example app.
+                    # Its controls stay disabled; no personal Setup endpoints are accessed.
+                    page.evaluate("""async () => {
+                        const data = await api('/api/model-checks');
+                        app.innerHTML = '<section id="model-availability" aria-label="Model availability settings">' + modelChecksHtml(data) + '</section>';
+                    }""")
+                    panel = page.locator(".model-checks")
+                    panel.get_by_text("Listed by agent", exact=True).wait_for()
+                    assert panel.get_by_role("button", name="Check now", exact=True).is_disabled()
+                    panel.screenshot(path=str(output / "model-checks.png"), style=".topbar { visibility: hidden !important; }")
+                    for width in (360, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Model checks overflow viewport"
+                    page.set_viewport_size({"width": 1440, "height": 1100})
+                    page.emulate_media(color_scheme="dark")
+                    panel.screenshot(path="/tmp/rerunly-model-checks-dark.png", style=".topbar { visibility: hidden !important; }")
+                    page.emulate_media(color_scheme="light")
+                    page.evaluate("viewReruns()")
+                    page.evaluate("window.scrollTo(0, 0)")
+                    page.screenshot(path=str(output / "reruns.png"), full_page=True)
+
+                if "--model-checks-only" in sys.argv:
+                    connection = db.connect(database)
+                    with connection:
+                        connection.execute("INSERT INTO replay_queue(prompt_id,model,effort,added_at,mode,permission) SELECT id,'codex:gpt-6.1-sol','medium',started_at,'terminal','' FROM prompts WHERE id='rerunly-example:broad-prompt'")
+                    connection.close()
+                    capture("reruns", "/reruns")
+                    capture_model_checks()
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
+
+                if "--prompt-only" in sys.argv:
+                    capture("prompt", "/prompt/rerunly-example:review-skill-v2", focus='h2:has-text("Cost per agent")')
+                    assert page.locator("#compare, #compare-sec, #cmp-cost").count() == 0
+                    planner = page.locator(".rerun-planner")
+                    assert not planner.evaluate("el => el.open")
+                    planner.locator(":scope > summary").click()
+                    page.locator(".replay-impact-estimate").wait_for()
+                    assert page.locator("#replay-current-content").inner_text().strip()
+                    assert planner.locator(".model-access-filter, .model-access-note").count() == 0
+                    assert page.locator("#queue-replay").is_disabled()
+                    assert page.get_by_role("button", name="Rerun now").is_disabled()
+                    assert page.evaluate("""() => {
+                        const y = s => document.querySelector(s).getBoundingClientRect().top;
+                        return y('.replay-head') < y('.replay-current') &&
+                            y('.replay-current') < y('#replay-agent') &&
+                            y('#replay-agent') < y('.replay-impact');
+                    }""")
+                    planner.evaluate("el => window.scrollTo(0, el.getBoundingClientRect().top + scrollY - 75)")
+                    planner.screenshot(path=str(output / "prompt-rerun.png"), style=".topbar { visibility: hidden !important; }")
+                    for width in (390, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Prompt overflows viewport"
+                    page.set_viewport_size({"width": 1440, "height": 1100})
+                    page.emulate_media(color_scheme="dark")
+                    page.screenshot(path="/tmp/rerunly-prompt-dark.png", full_page=True)
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
+
                 capture("home", "/")
-                # A pending illustrative item exposes the queue estimates without launching work.
+                # An incomplete illustrative item exposes queue estimates and configuration needs without launching work.
                 connection = db.connect(database)
                 with connection:
                     connection.execute(
-                        "INSERT INTO replay_queue(prompt_id, model, effort, added_at, mode, permission, release) "
-                        "SELECT id, 'codex:gpt-6.1-sol', 'medium', started_at, 'terminal', 'ask', 'same' "
+                        "INSERT INTO replay_queue(prompt_id, model, effort, added_at, mode, permission, release, budget_usd) "
+                        "SELECT id, 'codex:gpt-6.1-sol', 'medium', started_at, 'terminal', '', 'same', 3 "
                         "FROM prompts WHERE id='rerunly-example:broad-prompt'")
                 connection.close()
                 capture("prompts", "/prompts")
+                page.get_by_role("button", name="Select prompts", exact=True).click()
+                page.locator(".psel").first.click()
+                page.locator("#select-bar").evaluate("el => window.scrollTo(0, el.getBoundingClientRect().top + scrollY - parseFloat(getComputedStyle(el).top))")
+                page.screenshot(path=str(output / "prompt-selection.png"))
+                page.get_by_role("region", name="Selection", exact=True).get_by_role("button", name="Done", exact=True).click()
                 page.evaluate("localStorage.setItem('prompts-prefs', JSON.stringify({layout:'grouped'}))")
                 capture("by-tag", "/prompts")
                 capture("sessions", "/sessions")
                 capture("session", "/session/rerunly-example:review-skill-v2:session")
                 capture("prompt", "/prompt/rerunly-example:review-skill-v2", focus='h2:has-text("Cost per agent")')
+                planner = page.locator(".rerun-planner")
+                planner.locator(":scope > summary").click()
+                page.locator(".replay-impact-estimate").wait_for()
+                planner.screenshot(path=str(output / "prompt-rerun.png"), style=".topbar { visibility: hidden !important; }")
                 capture("tag", "/tag/example:skills")
                 capture("tag-dark", "/tag/example:skills", dark=True)
                 capture("tags", "/tags")
                 capture("reruns", "/reruns")
+                capture_model_checks()
+                assert page.locator("[data-history-group]").count() == 2
+                search = page.locator("#history-search")
+                search.fill("divide(a, b)")
+                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 1")
+                assert page.locator(".rh-attempt").count() == 2
+                assert "q=" in page.url, "History search should be bookmarkable"
+                search.fill("not-a-real-example")
+                page.get_by_text("No reruns match these filters.").wait_for()
+                page.locator("[data-history-clear]").click()
+                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 2")
+                page.locator("#pop-category-example > summary").click()
+                page.locator('[data-category-tag="example:skills"]').click()
+                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 1")
+                assert "tags=example%3Askills" in page.url
+                page.locator("[data-history-clear]").click()
+                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 2")
+                review = page.locator("[data-history-group]").filter(has_text="Review divide")
+                if not review.evaluate("el => el.open"):
+                    review.locator(":scope > summary").click()
+                review.get_by_role("link", name="Compare all reruns").click()
+                page.locator(".rerun-comparison-page").wait_for()
+                assert page.locator(".rc-table tbody tr").count() == 3
+                assert page.locator(".rc-trends canvas").count() == 3
+                assert page.evaluate("Chart.getChart(document.querySelector('#rerun-chart-cost')).data.datasets[1].data[0].p.id") == "rerunly-example:review-skill-v1"
+                assert page.locator(".rc-table a[href^='#/compare?']").count() == 2
+                page.locator('[data-set-rerun-reference="rerunly-example:review-skill-v2"]').click()
+                page.get_by_role("heading", name="Compare with Attempt 1").wait_for()
+                assert page.evaluate("Chart.getChart(document.querySelector('#rerun-chart-cost')).data.datasets[1].data[0].p.id") == "rerunly-example:review-skill-v2"
+                assert page.locator(".rc-reference").count() == 1
+                assert page.get_by_text("Not judged against this reference").count() == 2
+                assert page.locator("[data-judge-run]:disabled").count() == 2
+                page.locator('[data-set-rerun-reference="rerunly-example:review-skill-v1"]').click()
+                page.get_by_role("heading", name="Compare with Original").wait_for()
+                for width in (390, 768):
+                    page.set_viewport_size({"width": width, "height": 900})
+                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Comparison overflows viewport"
+                page.set_viewport_size({"width": 1440, "height": 1100})
+                page.evaluate("window.scrollTo(0, 0)")
+                page.screenshot(path=str(output / "rerun-comparison.png"), full_page=True)
+                print("Captured rerun-comparison")
+                page.goto(base + "#/reruns")
+                page.locator(".reruns-page").wait_for()
+                assert page.locator(".reruns-page .hero-name").text_content().strip() == "Reruns"
+                card = page.locator(".rq-card").first
+                assert card.locator(".rq-title").inner_text().strip()
+                assert card.locator(".rq-estimate").inner_text().strip()
+                card.screenshot(path=str(output / "rerun-queue.png"), style=".topbar { visibility: hidden !important; }")
+                card.locator(".rq-details > summary").click()
+                assert card.locator(".rq-details").evaluate("el => el.open")
+                assert page.locator(".rq-card.selected").count() == 0, "Opening settings selected the card"
+                card.locator("[data-rr-pick]").click()
+                page.locator(".rq-card.selected").wait_for()
+                assert page.locator(".rq-card.selected").count() == 1
+                page.locator(".rq-card [data-rr-pick]").first.click()
+                page.locator(".rq-card.selected").wait_for(state="detached")
+                assert page.locator(".rq-card.selected").count() == 0
+                history = page.locator("#rerun-history")
+                assert page.locator("[data-history-group]").count() == 2
+                assert page.locator(".rh-attempt").count() == 3
+                assert page.locator('.rh-attempt a[href^="#/compare"]').count() == 2
+                history.locator(":scope > summary").click()
+                page.wait_for_timeout(50)
+                assert not history.evaluate("el => el.open")
+                page.evaluate("viewReruns()")
+                assert not page.locator("#rerun-history").evaluate("el => el.open"), "History collapsed state was lost"
+                page.locator("#rerun-history > summary").click()
+                page.wait_for_timeout(50)
+                for width in (390, 768):
+                    page.set_viewport_size({"width": width, "height": 900})
+                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Reruns overflow viewport"
+                page.set_viewport_size({"width": 1440, "height": 1100})
+                page.emulate_media(color_scheme="dark")
+                page.locator("#rerun-history").screenshot(path="/tmp/rerunly-history-dark.png")
+                page.locator(".rq-card").first.screenshot(path="/tmp/rerunly-queue-dark.png", style=".topbar { visibility: hidden !important; }")
+                page.emulate_media(color_scheme="light")
+
+                page.locator("[data-rr-config]").first.click()
+                page.locator("#queue-config-warning").wait_for(state="visible")
+                assert page.locator("#queue-config-form .model-access-filter, #queue-config-form .model-access-note").count() == 0
+                page.wait_for_function("document.querySelector('#queue-config-form [type=submit]').disabled")
+                page.screenshot(path=str(output / "queue-settings.png"))
+                print("Captured queue-settings")
+                page.locator("[data-cancel-config]").click()
                 capture("compare", "/compare?a=rerunly-example:review-skill-v1&b=rerunly-example:cheap-but-incomplete")
+                capture("rerun-detail", "/rerun/rerunly-example:blocked-rerun:session")
+                page.get_by_role("heading", name="Launch settings", exact=True).wait_for()
+                page.get_by_text("No imported transcript is available for this rerun.", exact=True).wait_for()
+                # A missing optional model-check service must not hide the queue or history.
+                page.route("**/api/model-checks", lambda route: route.fulfill(status=404, body="unavailable"))
+                page.goto(base + "#/reruns")
+                page.locator(".rq-card").first.wait_for()
+                assert page.locator("#rerun-history").count() == 1
+                assert "unavailable" in page.locator("#model-check-tools").inner_text().lower()
                 browser.close()
                 if errors:
                     raise RuntimeError("Browser errors: " + "; ".join(errors))

@@ -84,6 +84,19 @@ def claude_argv(prompt: str, session_id: str, model: str = "", effort: str = "",
     return [*argv, prompt]
 
 
+def terminal_run_argv(argv: list[str], keep_open: bool = False) -> list[str]:
+    """Optionally wait for Enter after the agent exits, preserving its exit status.
+
+    Pass the command as positional arguments: prompts never become shell code.
+    """
+    if not keep_open:
+        return argv
+    script = ('"$@"; rerunly_status=$?; '
+              'printf "\\nRerun finished (exit %s). Press Enter to close this terminal.\\n" "$rerunly_status"; '
+              'read -r rerunly_reply; exit "$rerunly_status"')
+    return ["sh", "-c", script, "rerunly-terminal", *argv]
+
+
 def terminal_argv(cwd: str, argv: list[str]) -> list[str] | None:
     """A command opening a terminal window that runs `argv` in `cwd`, or None without a known terminal."""
     if sys.platform == "darwin":

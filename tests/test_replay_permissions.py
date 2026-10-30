@@ -25,3 +25,19 @@ def test_codex_original_sandbox_and_approval_are_preserved():
 def test_unknown_codex_permissions_require_explicit_choice(permissions):
     with pytest.raises(ValueError):
         original_permission_args("Codex", permissions)
+
+
+def test_terminal_keep_open_preserves_arguments_and_exit_status(tmp_path):
+    import subprocess
+    import sys
+    from rerunly.replay import terminal_run_argv
+
+    marker = tmp_path / 'must-not-exist'
+    prompt = f"literal ' quote; $(touch {marker}) `touch {marker}`\nnext line"
+    argv = [sys.executable, '-c', 'import sys; print(sys.argv[1]); sys.exit(7)', prompt]
+    assert terminal_run_argv(argv, False) == argv
+    result = subprocess.run(terminal_run_argv(argv, True), input='\n', text=True, capture_output=True, timeout=5)
+    assert result.returncode == 7
+    assert prompt in result.stdout
+    assert 'Press Enter to close this terminal' in result.stdout
+    assert not marker.exists()

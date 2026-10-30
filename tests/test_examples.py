@@ -49,6 +49,11 @@ def test_example_app_is_apart_from_the_history(tmp_path, monkeypatch):
         # Rerun details expose the seeded illustrative rating on the base prompt.
         original = client.get("/examples/api/prompts/rerunly-example:review-skill-v1").json()
         assert sorted(r["rating"]["score"] for r in original["replays"]) == [55, 95]
+        estimate = client.get("/examples/api/prompts/rerunly-example:broad-prompt/rerun-estimate")
+        assert estimate.status_code == 200
+        assert estimate.json()["estimate"]["total_tokens"] > 0
+        assert estimate.json()["limits"] is None
+        assert client.get("/examples/api/prompts/missing/rerun-estimate").status_code == 404
         assert client.post("/examples/api/prompts/rerunly-example:broad-prompt/replay", json={}).status_code == 400
         # no real judge for illustrative runs
         rate = client.post("/examples/api/ratings", json={"base": "rerunly-example:broad-prompt", "other": "rerunly-example:focused-prompt", "force": True})
@@ -79,3 +84,76 @@ def test_example_app_is_apart_from_the_history(tmp_path, monkeypatch):
     # the example app starts afresh
     with TestClient(create_app(tmp_path / "dashboard.db", background=False)) as client:
         assert client.get("/examples/api/prompts").json()["total"] == 8
+
+
+def test_rerun_history_and_original_include_more_than_200_attempts(tmp_path):
+    path = tmp_path / "examples.db"
+    with TestClient(create_app(path, background=False, examples=True)) as client:
+        c = db.connect(path)
+        with c:
+            c.executemany(
+                "INSERT INTO replays(session_id, prompt_id, launched_at, status) VALUES (?, ?, ?, ?)",
+                [(f"history-test-{i}", "rerunly-example:review-skill-v1", "2020-01-01T00:00:00Z", "failed")
+                 for i in range(205)],
+            )
+        c.close()
+        history = client.get("/api/reruns").json()["launched"]
+        assert len([x for x in history if x["session_id"].startswith("history-test-")]) == 205
+        original = client.get("/api/prompts/rerunly-example:review-skill-v1").json()
+        assert len([x for x in original["replays"] if x["session_id"].startswith("history-test-")]) == 205
+
+
+def test_rerun_reference_is_persistent_scoped_and_reprices_ratings(tmp_path):
+    with TestClient(create_app(tmp_path / "examples.db", background=False, examples=True)) as client:
+        original = "rerunly-example:review-skill-v1"
+        better = "rerunly-example:review-skill-v2"
+        weak = "rerunly-example:cheap-but-incomplete"
+        url = f"/api/reruns/reference/{original}"
+        data = client.get(url).json()
+        assert data["reference_id"] == original
+        assert data["ratings"][better]["score"] == 95
+        assert data["ratings"][weak]["score"] == 55
+        assert client.put(url, json={"reference_id": "rerunly-example:broad-prompt"}).status_code == 400
+        assert client.put(url, json={"reference_id": better}).status_code == 200
+        data = client.get(url).json()
+        assert data["reference_id"] == better
+        assert data["ratings"][weak] is None
+        assert data["ratings"][original] is None
+        assert client.put(url, json={"reference_id": original}).status_code == 200
+        assert client.get(url).json()["ratings"][weak]["score"] == 55
+        assert client.get("/api/reruns/reference/nonexistent").status_code == 404
+
+
+def test_judge_compares_against_selected_rerun_reference(tmp_path, monkeypatch):
+    import time
+    from rerunly import judge
+
+    calls = []
+    def fake_rate(request, reference, other, model, workdir, **kwargs):
+        calls.append((reference["answer"], other["answer"], model))
+        return {"score": 80, "verdict": "minor", "quality": "worse", "look": False,
+                "summary": "Missing a check.", "differences": [], "cost_usd": 0.01}
+    monkeypatch.setattr(judge, "rate", fake_rate)
+    path = tmp_path / "dashboard.db"
+    with TestClient(create_app(path, background=False)) as client:
+        c = db.connect(path)
+        add_examples(c)
+        with c:
+            c.execute("UPDATE prompts SET source='test-data'")
+        c.close()
+        original = "rerunly-example:review-skill-v1"
+        reference = "rerunly-example:review-skill-v2"
+        other = "rerunly-example:cheap-but-incomplete"
+        url = f"/api/reruns/reference/{original}"
+        assert client.put(url, json={"reference_id": reference}).status_code == 200
+        response = client.post("/api/ratings", json={"base": reference, "other": other, "model": "codex:gpt-6.1-sol", "force": True})
+        assert response.status_code == 200
+        for _ in range(50):
+            rating = client.get(url).json()["ratings"][other]
+            if rating and rating["status"] == "done":
+                break
+            time.sleep(0.05)
+        assert rating["score"] == 80 and rating["quality"] == "worse"
+        assert "delegated edge-case" in calls[0][0]
+        assert "Division by zero was not checked" in calls[0][1]
+        assert calls[0][2] == "codex:gpt-6.1-sol"

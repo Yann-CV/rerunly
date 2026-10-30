@@ -5,6 +5,7 @@ from pathlib import Path
 from .config import DEFAULT_SETTINGS
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS model_check_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
 -- Only local usage readings and token counts, never authentication data.
 CREATE TABLE IF NOT EXISTS usage_observations (
     agent TEXT PRIMARY KEY,
@@ -145,6 +146,12 @@ CREATE TABLE IF NOT EXISTS prompt_skill_runs (
     PRIMARY KEY (prompt_id, skill, hash)
 );
 
+-- Prompts the user deleted from the history: the import skips them, so they stay deleted.
+CREATE TABLE IF NOT EXISTS deleted_prompts (
+    prompt_id TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL
+);
+
 -- Replays launched from the dashboard: the session id given to Claude Code, and what it replays.
 CREATE TABLE IF NOT EXISTS replays (
     session_id TEXT PRIMARY KEY,
@@ -172,6 +179,11 @@ CREATE TABLE IF NOT EXISTS run_ratings (
 );
 
 -- The run of a tag (yours or an AI tag) every other run of it is compared with.
+CREATE TABLE IF NOT EXISTS rerun_reference (
+    prompt_id TEXT PRIMARY KEY,
+    reference_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tag_reference (
     tag TEXT PRIMARY KEY,
     prompt_id TEXT NOT NULL
@@ -216,6 +228,9 @@ def connect(path: Path) -> sqlite3.Connection:
 # Columns added after the first release: (table, column, type). Appended at the end of the
 # table, so inserts listing values in table order keep working.
 ADDED_COLUMNS = [
+    ("replay_queue", "keep_terminal_open", "INTEGER"),
+    ("replays", "keep_terminal_open", "INTEGER"),
+    ("replay_queue", "cwd", "TEXT"),
     ("agents", "persona", "TEXT"), ("agents", "skill", "TEXT"), ("tag_meta", "description", "TEXT"),
     ("tag_exclusions", "auto", "INTEGER NOT NULL DEFAULT -1"), ("tag_exclusions", "example", "INTEGER NOT NULL DEFAULT 1"),
     # what ran a prompt, to run it again (inserted in this order, after the original columns)
@@ -235,6 +250,7 @@ ADDED_COLUMNS = [
     ("replay_queue", "restore_skills", "INTEGER"),
     # rate the rerun against its original once imported (1, the default) or not (0)
     ("replays", "auto_rate", "INTEGER"), ("replay_queue", "auto_rate", "INTEGER"),
+    ("run_ratings", "input_hash", "TEXT"),
     # the LLM judging the rerun ("" = the default judge of the Setup page)
     ("replays", "judge_model", "TEXT"), ("replay_queue", "judge_model", "TEXT"),
 ]

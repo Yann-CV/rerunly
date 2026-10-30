@@ -96,7 +96,7 @@ class CodexSource:
                 continue
             sid = meta[p].get("id") or meta[p].get("session_id")
             related = [p] + [f for f in files if self._parent(meta[f]) == sid]
-            signature = "|".join(f"{f}:{f.stat().st_size}:{f.stat().st_mtime_ns}" for f in related)
+            signature = "codex-v2:" + "|".join(f"{f}:{f.stat().st_size}:{f.stat().st_mtime_ns}" for f in related)
             yield str(p), signature
 
     def load(self, session_key):
@@ -122,10 +122,12 @@ class CodexSource:
 
         def start(text, ts, ident=None):
             nonlocal current, current_turn
-            marker = REPLAY_RE.search(text)
+            # Only the launcher prefix on the first user prompt identifies a rerun.
+            # A quoted marker in a review/debugging conversation must not hijack its session.
+            marker = REPLAY_RE.match(text) if not session.prompts else None
             if marker:
                 session.id = marker.group(1)
-                text = REPLAY_RE.sub("", text)
+                text = text[marker.end():]
             current_turn = turn_id
             cwd = context.get("cwd") or meta.get("cwd", "")
             current = PromptRecord(id="codex:" + str(ident or turn_id or f"{native_id}:{len(session.prompts)}"),

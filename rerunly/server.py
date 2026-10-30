@@ -3,19 +3,20 @@ import os
 from datetime import datetime, timezone
 import shlex
 import shutil
+import sys
 import uuid
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, judge, live_limits, otel, replay, runner, statusline, usage_forecast
+from . import background as bg, db, judge, live_limits, model_access, model_checks, otel, replay, runner, statusline, usage_forecast
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT
 from .estimates import estimate_rerun
-from .ingest import apply_curation, apply_rules, ingest, session_texts
+from .ingest import apply_curation, apply_rules, drop_failed_rerun, drop_prompts, ingest, session_texts
 from .pricing import DEFAULT_PRICES
 from .sources.codex import CodexSource
 from .tagging import jaccard, rule_matches, rule_scope, similarity, split_any, words
@@ -24,7 +25,7 @@ STATIC = Path(__file__).parent / "static"
 CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
 HOOK_MARKER = "rerunly"
 LEGACY_HOOK_MARKERS = ("agent-dashboard",)  # hooks installed before the rename to Rerunly
-COMPARE_SCOPES = ("similar", "tag", "similar_tag")
+COMPARE_SCOPES = ("similar", "tag", "similar_tag", "original")
 SPARK_POINTS = 24
 
 
@@ -82,6 +83,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     ingest_lock = threading.Lock()
     usage_lock = threading.Lock()
     stop = threading.Event()
+    checks = model_checks.ModelChecks(db_path, stop)
 
     def conn():
         c = db.connect(db_path)
@@ -117,10 +119,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     rating_lock = threading.Lock()
 
+    def rating_inputs(c, base_id, other_id):
+        return {r["id"]: dict(r) for r in c.execute(
+            "SELECT id, text, answer, files FROM prompts WHERE id IN (?, ?)", (base_id, other_id))}
+
     def rating_of(c, base_id: str, other_id: str) -> dict | None:
         r = c.execute("SELECT * FROM run_ratings WHERE base_id = ? AND other_id = ?", (base_id, other_id)).fetchone()
         if r is None:
             return None
+        if not examples:
+            runs = rating_inputs(c, base_id, other_id)
+            if r["input_hash"] != judge.input_hash(runs):
+                return None
         d = dict(r)
         d["differences"] = json.loads(d["differences"] or "[]")
         d["look"] = bool(d["look"]) if d["look"] is not None else None
@@ -130,9 +140,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         """Have an LLM judge rate `other_id`'s output against `base_id`'s, in the background, with `model` (else the
         default judge of the Setup page); None when one has no answer."""
         c = conn()
-        runs = {r["id"]: dict(r) for r in c.execute("SELECT id, text, answer, files FROM prompts WHERE id IN (?, ?)", (base_id, other_id))}
+        runs = rating_inputs(c, base_id, other_id)
         if base_id == other_id or len(runs) != 2 or not runs[base_id]["answer"] or not runs[other_id]["answer"]:
             return None
+        fingerprint = judge.input_hash(runs)
         with rating_lock:
             current = rating_of(c, base_id, other_id)
             if current and (current["status"] == "rating" or (current["status"] == "done" and not force)):
@@ -143,8 +154,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             model = model or settings["judge_model"]
             with c:
                 label = f"{model or 'default model'} · {effort} effort" if effort else model  # "Judged by …" on the page
-                c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at) VALUES (?,?,?,?,?)",
-                          (base_id, other_id, "rating", label, runner.now()))
+                c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at, input_hash) VALUES (?,?,?,?,?,?)",
+                          (base_id, other_id, "rating", label, runner.now(), fingerprint))
 
         def work():
             files = lambda r: json.loads(r["files"] or "[]")
@@ -158,7 +169,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             w = conn()
             with w:
                 w.execute("UPDATE run_ratings SET status=?, score=?, verdict=?, quality=?, look=?, summary=?, differences=?, cost_usd=?, "
-                          "error=?, rated_at=? WHERE base_id=? AND other_id=?", (*values, runner.now(), base_id, other_id))
+                          "error=?, rated_at=? WHERE base_id=? AND other_id=? AND input_hash=?",
+                          (*values, runner.now(), base_id, other_id, fingerprint))
 
         threading.Thread(target=work, daemon=True).start()
         return rating_of(c, base_id, other_id)
@@ -186,8 +198,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     async def lifespan(_app):
         if background:
             threading.Thread(target=loop, daemon=True).start()
+            if not examples:
+                threading.Thread(target=checks.loop, daemon=True).start()
         yield
         stop.set()
+        checks.cancel.set()
 
     app = FastAPI(title="Rerunly examples" if examples else "Rerunly", lifespan=lifespan)
     app.mount("/static", FreshStaticFiles(directory=STATIC), name="static")
@@ -221,6 +236,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     @app.put("/api/settings")
     def put_settings(values: dict = Body(...)):
         c = conn()
+        if "model_checks" in values:
+            values["model_checks"] = check_config(values["model_checks"])
         if isinstance(values.get("prices"), dict):
             # Setup sends the whole table back: keep only what the user set, so found prices stay automatic.
             found = {**DEFAULT_PRICES, **db.get_settings(c)["auto_prices"]}
@@ -268,7 +285,52 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         used = set()
         for row in c.execute("SELECT models FROM prompts"):
             used.update(json.loads(row[0]))
-        return replay.agent_models(list(db.get_settings(c)["prices"]), sorted(used))
+        models = replay.agent_models(list(db.get_settings(c)["prices"]), sorted(used))
+        if examples:
+            return [{**m, "access": "unknown", "account_mode": "unknown", "account_plan": None, "is_default": False} for m in models]
+        return model_access.annotate(models, model_access.accounts())
+
+    @app.get("/api/model-checks")
+    def model_check_status():
+        return checks.status()
+
+    def check_config(values):
+        if not isinstance(values, dict) or set(values) != {"enabled", "interval_hours", "agents"}:
+            raise HTTPException(400, "Supply enabled, interval_hours and agents.")
+        if type(values["enabled"]) is not bool or type(values["interval_hours"]) is not int or values["interval_hours"] not in model_checks.INTERVALS:
+            raise HTTPException(400, "Choose a schedule of 6, 24 or 168 hours.")
+        if not isinstance(values["agents"], list) or not values["agents"] or any(a not in ("claude", "codex") for a in values["agents"]):
+            raise HTTPException(400, "Choose at least one supported agent.")
+        return {**values, "agents": list(dict.fromkeys(values["agents"]))}
+
+    @app.put("/api/model-checks")
+    def configure_model_checks(values: dict = Body(...)):
+        if examples:
+            raise HTTPException(400, "Model checks are disabled in the example app.")
+        config = check_config(values)
+        c = conn()
+        try:
+            db.save_settings(c, {"model_checks": config})
+        finally:
+            c.close()
+        return checks.status()
+
+    @app.post("/api/model-checks/start")
+    def start_model_checks():
+        if examples:
+            raise HTTPException(400, "Model checks are disabled in the example app.")
+        try:
+            checks.start()
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return checks.status()
+
+    @app.post("/api/model-checks/cancel")
+    def cancel_model_checks():
+        if examples:
+            raise HTTPException(400, "Model checks are disabled in the example app.")
+        checks.cancel.set()
+        return checks.status()
 
     @app.get("/api/setup/status")
     def setup_status():
@@ -513,7 +575,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         "tokens": "p.total_tokens DESC",
     }
 
-    def prompt_filters(q: str, tag: str, project: str, since: str) -> tuple[str, list]:
+    def prompt_filters(q: str, tag: str, project: str, since: str, exclude_reruns: bool = False, tags: list[str] | None = None) -> tuple[str, list]:
         """WHERE clause (or "") over the prompts view `p` shared by the prompt list and the overview."""
         where, args = [], []
         if since:
@@ -528,18 +590,28 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if tag:
             where.append("p.id IN (SELECT prompt_id FROM tags WHERE tag = ?)")
             args.append(tag)
+        categories: dict[str, list[str]] = {}
+        for selected_tag in dict.fromkeys(tags or []):
+            category = selected_tag.split(":", 1)[0] if ":" in selected_tag else ""
+            categories.setdefault(category, []).append(selected_tag)
+        for choices in categories.values():
+            placeholders = ",".join("?" for _ in choices)
+            where.append(f"p.id IN (SELECT prompt_id FROM tags WHERE tag IN ({placeholders}))")
+            args.extend(choices)
+        if exclude_reruns:
+            where.append("NOT EXISTS (SELECT 1 FROM replays x WHERE x.session_id = p.session_id)")
         return ("WHERE " + " AND ".join(where) if where else ""), args
 
     @app.get("/api/prompts")
     def list_prompts(
         q: str = "", tag: str = "", project: str = "", since: str = "", sort: str = "recent",
-        limit: int = 100, offset: int = 0,
+        limit: int = 100, offset: int = 0, exclude_reruns: bool = False, tags: list[str] = Query(default=[]),
     ):
         """Prompts matching the filters, plus `summary`: totals over all of them (not just this page)."""
         if sort not in PROMPT_SORTS:
             raise HTTPException(400, f"sort must be one of {list(PROMPT_SORTS)}")
         c = conn()
-        where, args = prompt_filters(q, tag, project, since)
+        where, args = prompt_filters(q, tag, project, since, exclude_reruns, tags)
         sql = f"SELECT {LIST_COLS} FROM pv p {where}"
         summary = dict(c.execute(
             "SELECT COUNT(*) count, SUM(total_cost_usd) cost_usd, SUM(total_tokens) tokens, "
@@ -553,12 +625,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return {"total": summary["count"], "summary": summary, "items": rows}
 
     @app.get("/api/prompts/{prompt_id}")
-    def get_prompt(prompt_id: str, compare: str = "similar", tag: str = ""):
+    def get_prompt(prompt_id: str, compare: str = "", tag: str = "", exclude_reruns: bool = False):
         """`compare` picks the prompts shown next to this one:
         similar = similar text; tag = every prompt with `tag`; similar_tag = similar and with `tag`."""
-        if compare not in COMPARE_SCOPES:
+        if compare and compare not in COMPARE_SCOPES:
             raise HTTPException(400, f"compare must be one of {COMPARE_SCOPES}")
-        if compare != "similar" and not tag:
+        if compare in ("tag", "similar_tag") and not tag:
             raise HTTPException(400, "tag is required for this comparison")
         c = conn()
         r = c.execute("SELECT * FROM pv WHERE id=?", (prompt_id,)).fetchone()
@@ -626,22 +698,27 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         except ValueError:
             prompt["rerun"]["permission_args"] = None
 
+        if not compare:
+            compare = "original" if prompt["replay_of"] and prompt["replay_of"]["id"] else "similar"
         threshold = db.get_settings(c)["similarity_threshold"]
         my_tags = {t["tag"] for t in prompt["tags"]}
         all_tags: dict[str, dict[str, int]] = {}
         for t in c.execute("SELECT prompt_id, tag, auto FROM tags ORDER BY tag"):
             all_tags.setdefault(t[0], {})[t[1]] = t[2]
         compared = []
-        for o in c.execute(f"SELECT {LIST_COLS} FROM pv p WHERE p.id != ?", (prompt_id,)):
+        rerun_filter = " AND NOT EXISTS (SELECT 1 FROM replays x WHERE x.session_id = p.session_id)" if exclude_reruns else ""
+        for o in c.execute(f"SELECT {LIST_COLS} FROM pv p WHERE p.id != ?{rerun_filter}", (prompt_id,)):
             other_tags = all_tags.get(o["id"], {})
-            if compare != "similar" and tag not in other_tags:
+            if compare == "original" and o["id"] != (prompt["replay_of"] or {}).get("id"):
+                continue
+            if compare in ("tag", "similar_tag") and tag not in other_tags:
                 continue
             score = similarity(prompt["text"], my_tags, o["text"], set(other_tags))
-            if compare != "tag" and score < threshold:
+            if compare in ("similar", "similar_tag") and score < threshold:
                 continue
             compared.append({**_row(o), "score": round(score, 3), "tags": [_tag(t, a) for t, a in other_tags.items()]})
         compared.sort(key=lambda x: x["started_at"], reverse=True)
-        prompt["compare"] = {"scope": compare, "tag": tag, "reference": reference_of(c, tag) if tag else None}
+        prompt["compare"] = {"scope": compare, "tag": tag, "reference": prompt["replay_of"] if compare == "original" else reference_of(c, tag) if tag else None}
         prompt["similar"] = compared
         return prompt
 
@@ -894,6 +971,20 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         apply_curation(c)
         return tags_for(c, [prompt_id])[prompt_id]
 
+    @app.delete("/api/prompts/{prompt_id}")
+    def delete_prompt(prompt_id: str):
+        """Delete a prompt from the history, with its subagents, tags, ratings and queued reruns. Its transcript is
+        left alone: the import remembers the deletion and skips it. Reruns of it stay, without their original."""
+        c = conn()
+        row = c.execute("SELECT session_id FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404)
+        with c:
+            c.execute("INSERT OR REPLACE INTO deleted_prompts(prompt_id, deleted_at) VALUES (?, ?)",
+                      (prompt_id, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+            drop_prompts(c, [prompt_id])
+        return {"deleted": prompt_id, "session_id": row["session_id"]}
+
     # ---- tags & projects ------------------------------------------------------
 
     @app.get("/api/tags")
@@ -1108,7 +1199,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.get("/api/sessions")
     def list_sessions(
-        q: str = "", project: str = "", since: str = "", sort: str = "recent", limit: int = 100, offset: int = 0,
+        q: str = "", project: str = "", since: str = "", sort: str = "recent", limit: int = 100, offset: int = 0, exclude_reruns: bool = False,
+        tag: str = "", tags: list[str] = Query(default=[]),
     ):
         """Sessions matching the filters (`q` searches titles and prompts; `since` keeps sessions started after it),
         plus `summary` over all of them and, on the first page, `highlights`: the priciest, busiest and longest."""
@@ -1122,6 +1214,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if q:
             where.append("(s.title LIKE ? OR s.id IN (SELECT session_id FROM prompts WHERE text LIKE ?))")
             args += [f"%{q}%", f"%{q}%"]
+        if tag or tags:
+            tag_where, tag_args = prompt_filters("", tag, "", "", tags=tags)
+            where.append(f"s.id IN (SELECT p.session_id FROM pv p {tag_where})")
+            args.extend(tag_args)
+        if exclude_reruns:
+            where.append("NOT EXISTS (SELECT 1 FROM replays x WHERE x.session_id = s.id)")
         sql = (
             f"SELECT {SESSION_COLS}, (SELECT text FROM prompts f WHERE f.session_id = s.id ORDER BY f.started_at LIMIT 1) first_prompt "
             f"FROM sessions s JOIN pv p ON p.session_id = s.id {'WHERE ' + ' AND '.join(where) if where else ''} GROUP BY s.id"
@@ -1230,11 +1328,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return found
 
     @app.get("/api/overview")
-    def overview(q: str = "", tag: str = "", project: str = "", since: str = ""):
+    def overview(q: str = "", tag: str = "", project: str = "", since: str = "", exclude_reruns: bool = False, tags: list[str] = Query(default=[])):
         """Totals, the priciest prompt, the most repeated prompt text, the repeated text costing the most in total
         and usage per tag, over the prompts matching the same filters as /api/prompts."""
         c = conn()
-        where, args = prompt_filters(q, tag, project, since)
+        where, args = prompt_filters(q, tag, project, since, exclude_reruns, tags)
         totals = dict(c.execute(
             "SELECT COUNT(*) prompts, COUNT(DISTINCT p.session_id) sessions, SUM(p.total_cost_usd) cost_usd, "
             "SUM(p.total_tokens) tokens, SUM(COALESCE(p.active_ms, p.wall_ms)) duration_ms, "
@@ -1308,7 +1406,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             raise HTTPException(403, "replays start from the dashboard only")
         return await request.json()
 
-    def rerun_options(body: dict) -> dict:
+    def rerun_options(body: dict, *, draft: bool = False) -> dict:
         """How to rerun: model, effort, Claude Code release ("" installed, "same" the prompt's own, or a
         version such as a reference run's), mode ("background": unattended, or "terminal": interactive),
         what it may do without asking (background), a budget cap in USD, and whether to restore the skills."""
@@ -1320,11 +1418,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         release = str(body.get("version") or "") or ("same" if body.get("same_version") else "")
         if release not in ("", "same") and not replay.VERSION_RE.match(release):
             raise HTTPException(400, "unknown Claude Code version")
-        permission = str(body.get("permission") or "same")
+        permission = "" if draft and "permission" in body and not body["permission"] else str(body.get("permission") or "same")
         mode = str(body.get("mode") or ("terminal" if permission == "same" else "background"))
         if mode not in ("background", "terminal"):
             raise HTTPException(400, "mode must be background or terminal")
-        if permission not in {*runner.PERMISSIONS, "same"}:
+        if permission not in {*runner.PERMISSIONS, "same", *([""] if draft else [])}:
             raise HTTPException(400, "permission must be same, ask, or edits")
         try:
             budget = float(body["budget_usd"]) if body.get("budget_usd") not in (None, "") else None
@@ -1336,7 +1434,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if judge_model and not replay.MODEL_RE.match(judge_model):
             raise HTTPException(400, "unknown judge model")
         return {"model": model, "effort": effort, "release": release, "mode": mode, "permission": permission,
-                "budget": budget, "restore_skills": body.get("restore_skills", True) is not False,
+                "budget": budget, "keep_terminal_open": str(body.get("keep_terminal_open", "false")).lower() in ("true", "1"),
+                "restore_skills": body.get("restore_skills", True) is not False,
                 "rate": body.get("rate", True) is not False, "judge_model": judge_model}
 
     def replayable(c, prompt_id: str):
@@ -1356,10 +1455,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if model and not replay.MODEL_RE.match(model):
             raise HTTPException(400, "unknown model")
         c = conn()
-        original = replayable(c, prompt_id)
-        row = dict(c.execute("SELECT * FROM pv WHERE id=?", (prompt_id,)).fetchone())
+        recorded = c.execute("SELECT * FROM pv WHERE id=?", (prompt_id,)).fetchone()
+        if recorded is None:
+            raise HTTPException(404, f"no prompt {prompt_id}")
+        row = dict(recorded)
         agents = [dict(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=?", (prompt_id,))]
-        agent = "Codex" if replay.uses_codex(model, original["harness"]) else "Claude Code"
+        agent = "Codex" if replay.uses_codex(model, row["harness"]) else "Claude Code"
         limits = next((entry for entry in usage_limits() if entry["agent"] == agent), None)
         estimate = estimate_rerun(row, agents, model, db.get_settings(c)["prices"])
         return {"agent": agent, "limits": limits, "estimate": estimate,
@@ -1383,6 +1484,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             c.execute("UPDATE replays SET status = ?, result = ?, denials = ?, cost_usd = ?, ended_at = ? WHERE session_id = ?",
                       (out["status"], out["result"], json.dumps({"denied": out["denials"], "blocked": out["blocked"]}),
                        out["cost_usd"], runner.now(), session_id))
+            if out["status"] == "failed":
+                drop_failed_rerun(c, session_id)
         runner.remove_plugin(reruns_dir / session_id / "plugin")
 
     def refresh_reruns(c) -> None:
@@ -1391,10 +1494,60 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             if not runner.alive(x["pid"]):
                 finish_rerun(x["session_id"])
 
+    def queue_options(q):
+        q = dict(q)
+        return {"model": q["model"] or "", "effort": q["effort"] or "",
+                "release": q["release"] if q["release"] is not None else ("same" if q["same_version"] else ""),
+                "mode": q["mode"] or "background", "permission": q["permission"] if q["permission"] is not None else "same",
+                "budget": q["budget_usd"], "cwd": q.get("cwd") or "", "keep_terminal_open": bool(q.get("keep_terminal_open")),
+                "restore_skills": q["restore_skills"] is None or bool(q["restore_skills"]),
+                "rate": q["auto_rate"] is None or bool(q["auto_rate"]), "judge_model": q["judge_model"] or ""}
+
+    def configuration_issues(c, prompt_id, opts):
+        issues = []
+        try:
+            r = replayable(c, prompt_id)
+        except HTTPException as error:
+            return [{"field": "prompt", "message": error.detail}]
+        codex = replay.uses_codex(opts["model"], r["harness"])
+        if not opts["permission"]:
+            issues.append({"field": "permission", "message": "Choose permissions for the selected agent."})
+        elif opts["permission"] == "same":
+            if codex != (r["harness"] == "Codex"):
+                issues.append({"field": "permission", "message": "Original permissions belong to another agent. Choose explicit permissions when changing agents."})
+            else:
+                try:
+                    _, interactive = replay.original_permission_args(r["harness"], json.loads(r["permissions"] or "{}"))
+                    if interactive and opts["mode"] == "background":
+                        issues.append({"field": "permission", "message": "Original permissions can ask for approval. Choose a terminal or explicit unattended permissions."})
+                except ValueError as error:
+                    issues.append({"field": "permission", "message": str(error)})
+        if codex and opts["mode"] == "background" and opts["budget"] is not None:
+            issues.append({"field": "budget_usd", "message": "Codex cannot enforce a USD budget cap; clear the budget to continue."})
+        if not (opts.get("cwd") or r["cwd"]):
+            issues.append({"field": "cwd", "message": "Choose a working directory; the original directory was not recorded."})
+        elif opts.get("cwd") and (not Path(opts["cwd"]).is_absolute() or not Path(opts["cwd"]).is_dir()):
+            issues.append({"field": "cwd", "message": "Choose an existing absolute working directory."})
+        return issues
+
+    def queued_inputs(c, rows):
+        return [{"id": q["id"], "prompt_id": q["prompt_id"], "issues": issues}
+                for q in rows if (issues := configuration_issues(c, q["prompt_id"], queue_options(q)))]
+
+    def selected_queue(c, body):
+        try:
+            ids = list(dict.fromkeys(int(i) for i in body.get("ids") or []))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "queue ids must be numbers") from None
+        return [q for item_id in ids if (q := c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone())]
+
     def start_replay(c, prompt_id: str, opts: dict) -> dict:
         """Rerun a prompt with Claude Code: the same folder and prompt, the skills as they ran, the model,
         effort and release asked for; in the background (unattended) or in a terminal window."""
         r = replayable(c, prompt_id)
+        issues = configuration_issues(c, prompt_id, opts)
+        if issues:
+            raise HTTPException(400, issues[0]["message"])
         opts = dict(opts)
         codex = replay.uses_codex(opts["model"], r["harness"])
         if codex and opts["mode"] == "background" and opts["budget"] is not None:
@@ -1419,7 +1572,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if opts["release"] == "same" and not same_harness:
             version = ""
         session_id = str(uuid.uuid4())
-        cwd = r["cwd"]
+        cwd = opts.get("cwd") or r["cwd"]
         if not cwd:
             raise HTTPException(400, "The original working directory was not recorded; this prompt cannot be rerun in the same directory.")
         # the skills as they ran, in a plugin for this session only: the user's copies stay untouched
@@ -1434,7 +1587,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
                "harness_version": version, "launched_at": runner.now(), "mode": opts["mode"], "skills": json.dumps(skills),
                "permission": opts["permission"], "budget_usd": opts["budget"], "auto_rate": int(opts.get("rate", True)),
-               "judge_model": opts.get("judge_model", "")}
+               "judge_model": opts.get("judge_model", ""), "keep_terminal_open": int(opts.get("keep_terminal_open", False))}
         if opts["mode"] == "terminal":
             note = "\n".join(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with."
                               for k in skills)
@@ -1443,6 +1596,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version, note=note, original_permissions=recorded_permissions)
             elif recorded_permissions is not None:
                 argv = [*argv[:-1], *permission_args, argv[-1]]
+            settings = db.get_settings(c)
+            argv = [sys.executable, str(Path(__file__).with_name("terminal.py")),
+                    settings["codex_sessions_dir" if codex else "claude_projects_dir"],
+                    session_id, str(codex).lower(), str(opts.get("keep_terminal_open", False)).lower(), *argv]
             launched = replay.launch(cwd, argv)
             row.update(status="interactive")
         else:
@@ -1487,10 +1644,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     async def queue_reruns(request: Request):
         """Queue prompts for a rerun with these options; a prompt already queued with them is not added twice."""
         body = await dashboard_json(request)
-        o = rerun_options(body)
+        o = rerun_options(body, draft=True)
         values = {"model": o["model"], "effort": o["effort"], "release": o["release"], "mode": o["mode"], "permission": o["permission"],
                   "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"]), "auto_rate": int(o["rate"]),
-                  "judge_model": o["judge_model"]}
+                  "judge_model": o["judge_model"], "cwd": str(body.get("cwd") or "").strip(),
+                  "keep_terminal_open": int(o["keep_terminal_open"])}
         c = conn()
         ids = [str(i) for i in body.get("prompt_ids") or []]
         for i in ids:
@@ -1507,13 +1665,47 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             )
         return {"added": added, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
 
+    def comparison_members(c, prompt_id: str):
+        original = c.execute("SELECT id, answer FROM pv WHERE id=?", (prompt_id,)).fetchone()
+        if original is None:
+            raise HTTPException(404, "Original prompt not found")
+        members = {original["id"]: dict(original)}
+        for row in c.execute(
+            "SELECT p.id, p.answer FROM replays x JOIN pv p ON p.session_id = x.session_id "
+            "WHERE x.prompt_id = ? AND p.id = (SELECT id FROM pv WHERE session_id=x.session_id ORDER BY started_at LIMIT 1)",
+            (prompt_id,),
+        ):
+            members[row["id"]] = dict(row)
+        return members
+
+    @app.get("/api/reruns/reference/{prompt_id}")
+    def rerun_reference(prompt_id: str):
+        c = conn()
+        members = comparison_members(c, prompt_id)
+        saved = c.execute("SELECT reference_id FROM rerun_reference WHERE prompt_id=?", (prompt_id,)).fetchone()
+        reference = saved[0] if saved and saved[0] in members else prompt_id
+        return {"reference_id": reference,
+                "answers": {pid: bool(row["answer"]) for pid, row in members.items()},
+                "ratings": {pid: rating_of(c, reference, pid) for pid in members if pid != reference}}
+
+    @app.put("/api/reruns/reference/{prompt_id}")
+    def set_rerun_reference(prompt_id: str, reference_id: str = Body(..., embed=True)):
+        c = conn()
+        members = comparison_members(c, prompt_id)
+        if reference_id not in members:
+            raise HTTPException(400, "Reference must be the original or an imported rerun of this prompt")
+        with c:
+            c.execute("INSERT INTO rerun_reference(prompt_id, reference_id) VALUES (?, ?) "
+                      "ON CONFLICT(prompt_id) DO UPDATE SET reference_id=excluded.reference_id", (prompt_id, reference_id))
+        return {"reference_id": reference_id}
+
     @app.get("/api/reruns")
     def list_reruns():
         """The queue, and the reruns launched so far with how they ended, the prompt they replay and, once
         imported, the rerun itself."""
         c = conn()
         refresh_reruns(c)
-        prompt_cols = "id, text, project, started_at, total_cost_usd, total_tokens, active_ms, wall_ms, harness_version, cwd"
+        prompt_cols = "id, text, project, started_at, total_cost_usd, total_tokens, active_ms, wall_ms, harness_version, cwd, requested_model, harness, effort"
         def prompt(pid):
             r = c.execute(f"SELECT {prompt_cols} FROM pv WHERE id = ?", (pid,)).fetchone()
             return dict(r) if r else None
@@ -1525,10 +1717,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             agents = [dict(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=?", (q["prompt_id"],))]
             estimate = estimate_rerun(dict(original) if original else None, agents, q["model"], prices)
             agent = "Codex" if replay.uses_codex(q["model"], original["harness"] if original else "") else "Claude Code"
+            issues = configuration_issues(c, q["prompt_id"], queue_options(q))
             queue.append({**dict(q), "prompt": prompt(q["prompt_id"]), "agent": agent, "estimate": estimate,
+                          "issues": issues, "needs_input": bool(issues),
                           "forecast": usage_forecast.forecast(c, limits.get(agent), estimate)})
         launched = []
-        for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC LIMIT 200"):
+        for x in c.execute("SELECT * FROM replays ORDER BY launched_at DESC"):
             original = prompt(x["prompt_id"])
             done = c.execute(f"SELECT {prompt_cols} FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
             launched.append({**rerun_row(x), "original": original, "replay": dict(done) if done else None,
@@ -1542,6 +1736,72 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         d.pop("pid", None), d.pop("log_path", None)
         return d
 
+    @app.get("/api/reruns/launched/{session_id}")
+    def rerun_detail(session_id: str):
+        c = conn()
+        refresh_reruns(c)
+        row = c.execute("SELECT * FROM replays WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Rerun not found")
+        original = c.execute("SELECT id, text, cwd FROM pv WHERE id = ?", (row["prompt_id"],)).fetchone()
+        imported = c.execute("SELECT id FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (session_id,)).fetchone()
+        return {**rerun_row(row), "original": dict(original) if original else None,
+                "replay": dict(imported) if imported else None}
+
+    @app.get("/api/reruns/queue/count")
+    def rerun_queue_count():
+        """Navigation count without fetching rerun details or account usage."""
+        c = conn()
+        try:
+            return {"queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
+        finally:
+            c.close()
+
+    def edited_queue_values(q, body):
+        saved = queue_options(q)
+        saved.update(version=saved.pop("release"), budget_usd=saved.pop("budget"))
+        saved.update(body)
+        o = rerun_options(saved, draft=True)
+        values = {"model": o["model"], "effort": o["effort"], "release": o["release"], "mode": o["mode"],
+                  "permission": o["permission"], "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"]),
+                  "auto_rate": int(o["rate"]), "judge_model": o["judge_model"], "same_version": int(o["release"] == "same"),
+                  "cwd": str(saved.get("cwd") or "").strip(), "keep_terminal_open": int(o["keep_terminal_open"])}
+        return values
+
+    @app.post("/api/reruns/queue/{item_id}/validate")
+    async def validate_queued_rerun(item_id: int, request: Request):
+        body = await dashboard_json(request)
+        c = conn()
+        try:
+            q = c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone()
+            if q is None:
+                raise HTTPException(404, "queued rerun not found")
+            proposed = {**dict(q), **edited_queue_values(q, body)}
+            issues = configuration_issues(c, proposed["prompt_id"], queue_options(proposed))
+            return {"needs_input": bool(issues), "issues": issues}
+        finally:
+            c.close()
+
+    @app.patch("/api/reruns/queue/{item_id}")
+    async def update_queued_rerun(item_id: int, request: Request):
+        body = await dashboard_json(request)
+        c = conn()
+        q = c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone()
+        if q is None:
+            raise HTTPException(404, "queued rerun not found")
+        values = edited_queue_values(q, body)
+        with c:
+            c.execute(f"UPDATE replay_queue SET {', '.join(k + '=?' for k in values)} WHERE id=?", (*values.values(), item_id))
+        updated = c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone()
+        issues = configuration_issues(c, updated["prompt_id"], queue_options(updated))
+        return {"id": item_id, "needs_input": bool(issues), "issues": issues}
+
+    @app.post("/api/reruns/preflight")
+    async def preflight_reruns(request: Request):
+        body = await dashboard_json(request)
+        c = conn()
+        return {"needs_input": queued_inputs(c, selected_queue(c, body))}
+
     @app.delete("/api/reruns/queue/{item_id}")
     def unqueue(item_id: int):
         c = conn()
@@ -1554,16 +1814,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         """Launch queued reruns together and take them out of the queue."""
         body = await dashboard_json(request)
         c = conn()
+        rows = selected_queue(c, body)
+        needs_input = queued_inputs(c, rows)
+        if needs_input:
+            return {"results": [], "needs_input": needs_input,
+                    "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
         results = []
-        for item_id in dict.fromkeys(body.get("ids") or []):
-            q = c.execute("SELECT * FROM replay_queue WHERE id = ?", (int(item_id),)).fetchone()
-            if q is None:
-                continue
-            release = q["release"] if q["release"] is not None else ("same" if q["same_version"] else "")
-            opts = {"model": q["model"] or "", "effort": q["effort"] or "", "release": release, "mode": q["mode"] or "background",
-                    "permission": q["permission"] or "same", "budget": q["budget_usd"],
-                    "restore_skills": q["restore_skills"] is None or bool(q["restore_skills"]),
-                    "rate": q["auto_rate"] is None or bool(q["auto_rate"]), "judge_model": q["judge_model"] or ""}
+        for q in rows:
+            opts = queue_options(q)
             try:
                 results.append({"id": q["id"], **start_replay(c, q["prompt_id"], opts)})
             except HTTPException as e:
@@ -1571,7 +1829,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 continue  # keep failed items queued so a batch launch can be retried
             with c:
                 c.execute("DELETE FROM replay_queue WHERE id = ?", (q["id"],))
-        return {"results": results}
+        return {"results": results, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
 
     @app.post("/api/ratings")
     async def rate_pair(request: Request):

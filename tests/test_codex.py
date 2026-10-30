@@ -272,3 +272,74 @@ def test_claude_efforts_come_from_its_help(monkeypatch):
     monkeypatch.setattr(replay.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": help_text})())
     assert replay.claude_efforts() == ("low", "medium", "high", "xhigh", "max")
     replay.claude_efforts.cache_clear()
+
+
+@pytest.mark.parametrize('text', [
+    'Review this transcript:\n<rerunly-replay id="rerun-123"/>\nFix',
+    'A quoted example: <rerunly-replay id="rerun-123"/>\nFix',
+])
+def test_quoted_replay_marker_does_not_change_session_identity(tmp_path, text):
+    path = rollout(tmp_path, records=[context(), user(text), count(tokens(10))])
+    session = CodexSource(tmp_path).load(str(path))
+    assert session.id == 'codex:s1'
+    assert session.prompts[0].session_id == session.id
+    assert session.prompts[0].text == text
+
+
+def test_only_first_prompt_can_identify_replay_session(tmp_path):
+    first = '<rerunly-replay id="rerun-123"/>\nFix'
+    followup = '<rerunly-replay id="quoted-id"/>\nExplain this marker'
+    path = rollout(tmp_path, records=[context(), user(first), count(tokens(10)),
+                                     context('t2'), user(followup)])
+    session = CodexSource(tmp_path).load(str(path))
+    assert session.id == 'rerun-123'
+    assert [p.session_id for p in session.prompts] == ['rerun-123', 'rerun-123']
+    assert session.prompts[0].text == 'Fix'
+    assert session.prompts[1].text == followup
+
+
+@pytest.mark.parametrize('reviewer_id', ['a-reviewer', 'z-reviewer'])
+def test_reimport_repairs_marker_collision_and_queues_draft(tmp_path, reviewer_id, monkeypatch):
+    from rerunly.ingest import store_session
+    from rerunly import server
+
+    monkeypatch.setattr(server, 'CLAUDE_SETTINGS', tmp_path / 'claude-settings.json')
+    root = tmp_path / 'sessions'
+    marker = '<rerunly-replay id="rerun-123"/>\n'
+    pid = 'codex:msg-reported-prompt'
+    main = rollout(root, 'm-main', [context(), ('response_item', {
+        'type': 'message', 'role': 'user', 'id': 'msg-reported-prompt',
+        'content': [{'type': 'input_text', 'text': marker + 'Fix the issue'}]}), count(tokens(30))])
+    review = rollout(root, reviewer_id, [context('review-turn'), user('Review the following:\n' + marker + 'Fix the issue'), count(tokens(10))])
+    source = CodexSource(root)
+    path = tmp_path / 'dashboard.db'
+    c = db.connect(path)
+    db.save_settings(c, {'codex_sessions_dir': str(root), 'claude_projects_dir': str(tmp_path / 'none')})
+    settings = db.get_settings(c)
+    # Reproduce the old parser replacing the real rerun with a transcript quoting its marker.
+    original = source.load(str(main))
+    incorrect = source.load(str(review))
+    incorrect.id = 'rerun-123'
+    for prompt in incorrect.prompts:
+        prompt.session_id = incorrect.id
+    with c:
+        store_session(c, original, settings)
+        c.execute("INSERT INTO tags(prompt_id,tag,auto) VALUES(?, 'keep-this-tag', 0)", (pid,))
+        store_session(c, incorrect, settings)
+    assert c.execute('SELECT 1 FROM prompts WHERE id=?', (pid,)).fetchone() is None
+    assert ingest(c)['updated'] == 2
+    assert c.execute('SELECT session_id FROM prompts WHERE id=?', (pid,)).fetchone()[0] == 'rerun-123'
+    assert c.execute('SELECT 1 FROM tags WHERE prompt_id=? AND tag=?', (pid, 'keep-this-tag')).fetchone()
+    assert c.execute('SELECT id FROM sessions WHERE path=?', (str(review),)).fetchone()[0] == 'codex:' + reviewer_id
+    assert ingest(c)['updated'] == 0
+    # Subsequent refreshes must keep both sessions and the prompt queued from the open page.
+    with TestClient(create_app(path, background=False)) as client:
+        for _ in range(2):
+            response = client.post('/api/reruns/queue', json={'prompt_ids': [pid], 'permission': '', 'mode': 'terminal'})
+            assert response.status_code == 200, response.text
+            q = client.get('/api/reruns').json()['queue'][0]
+            assert q['prompt_id'] == pid and q['permission'] == '' and q['needs_input']
+            assert q['issues'][0]['field'] == 'permission'
+            assert ingest(c, force=True)['updated'] == 2
+            assert client.get('/api/prompts/' + pid).status_code == 200
+    assert c.execute('SELECT COUNT(*) FROM replay_queue').fetchone()[0] == 1

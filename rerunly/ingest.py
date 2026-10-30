@@ -98,19 +98,54 @@ def _store_skill_version(conn: sqlite3.Connection, run, used_at: str) -> str:
     return h
 
 
+# what is kept per prompt, beyond its row: removed with it
+PROMPT_TABLES = ("agents", "tags", "tag_exclusions", "tag_suppressed", "prompt_skill_runs", "tag_reference", "replay_queue")
+
+
+def drop_prompts(conn: sqlite3.Connection, ids: list[str]) -> None:
+    """Remove prompts from the history with everything kept about them (no transaction of its own)."""
+    for table in PROMPT_TABLES:
+        conn.executemany(f"DELETE FROM {table} WHERE prompt_id = ?", [(i,) for i in ids])
+    conn.executemany("DELETE FROM rerun_reference WHERE prompt_id = ? OR reference_id = ?", [(i, i) for i in ids])
+    conn.executemany("DELETE FROM run_ratings WHERE base_id = ? OR other_id = ?", [(i, i) for i in ids])
+    conn.executemany("DELETE FROM prompts WHERE id = ?", [(i,) for i in ids])
+
+
+def failed_rerun(conn: sqlite3.Connection, session_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM replays WHERE session_id = ? AND status = 'failed'", (session_id,)).fetchone() is not None
+
+
+def drop_failed_rerun(conn: sqlite3.Connection, session_id: str) -> None:
+    """A rerun that failed says nothing about its prompt: its prompts are never kept, even imported while it ran."""
+    drop_prompts(conn, [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (session_id,))])
+
+
 def store_session(conn: sqlite3.Connection, session: SessionRecord, settings: dict) -> None:
-    old_ids = [r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id=?", (session.id,))]
+    # Parser corrections can change a file's session identity. Remove its previous
+    # attribution first, so duplicate-prompt handling cannot strand its prompts there.
+    obsolete = [r[0] for r in conn.execute(
+        "SELECT id FROM sessions WHERE source=? AND path=? AND id!=?",
+        (session.source, session.path, session.id))]
+    replaced = [session.id, *obsolete]
+    slots = ",".join("?" for _ in replaced)
+    old_ids = [r[0] for r in conn.execute(f"SELECT id FROM prompts WHERE session_id IN ({slots})", replaced)]
     conn.executemany("DELETE FROM tags WHERE prompt_id=? AND auto != 0", [(i,) for i in old_ids])
     conn.executemany("DELETE FROM prompt_skill_runs WHERE prompt_id=?", [(i,) for i in old_ids])
-    conn.execute("DELETE FROM agents WHERE session_id=?", (session.id,))
-    conn.execute("DELETE FROM prompts WHERE session_id=?", (session.id,))
+    conn.execute(f"DELETE FROM agents WHERE session_id IN ({slots})", replaced)
+    conn.execute(f"DELETE FROM prompts WHERE session_id IN ({slots})", replaced)
+    conn.executemany("DELETE FROM sessions WHERE id=?", [(sid,) for sid in obsolete])
     _insert(conn, "sessions", (
         session.id, session.source, session.project, session.title, session.path, session.signature,
         session.reported_cost_usd,
     ))
+    if failed_rerun(conn, session.id):
+        drop_failed_rerun(conn, session.id)  # human tags of prompts imported while it ran
+        return
     for prompt in session.prompts:
         # A forked/resumed session replays earlier prompts: keep them in their first session.
-        if conn.execute("SELECT 1 FROM prompts WHERE id=?", (prompt.id,)).fetchone():
+        # A prompt the user deleted stays deleted.
+        if conn.execute("SELECT 1 FROM prompts WHERE id=? UNION ALL SELECT 1 FROM deleted_prompts WHERE prompt_id=?",
+                        (prompt.id, prompt.id)).fetchone():
             continue
         _insert_prompt(conn, prompt, session.source, settings)
     _link_replay(conn, session.id)

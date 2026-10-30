@@ -563,6 +563,26 @@ def test_session_filters(client):
     assert client.get("/api/sessions", params={"sort": "nope"}).status_code == 400
 
 
+def test_session_tag_filters_keep_whole_conversations(client):
+    baseline = client.get("/api/sessions").json()
+    client.post("/api/prompts/prompt-3/tags", json={"tag": "task:review"})
+    client.post("/api/prompts/prompt-3/tags", json={"tag": "favorite"})
+    client.post("/api/prompts/prompt-4/tags", json={"tag": "task:release"})
+    params = [("tags", "task:review"), ("tags", "favorite")]
+    matched = client.get("/api/sessions", params=params).json()
+    assert matched == baseline  # All prompts, costs, and highlights are retained.
+    assert client.get("/api/sessions", params={"tag": "task:review"}).json() == baseline
+    assert client.get("/api/sessions", params=[("tags", "task:review"), ("tags", "task:release")]).json() == baseline
+    assert client.get("/api/sessions", params=[*params, ("offset", 1)]).json()["items"] == []
+    for filters in [
+        [("tag", "unknown")],
+        [*params, ("project", "unknown")],
+    ]:
+        empty = client.get("/api/sessions", params=filters).json()
+        assert empty["total"] == 0 and empty["items"] == []
+        assert empty["summary"]["count"] == 0 and "highlights" not in empty
+
+
 def test_prompt_filters(client):
     data = client.get("/api/prompts", params={"since": "2026-10-02T00:00:00Z"}).json()
     assert [p["id"] for p in data["items"]] == ["prompt-4", "prompt-3"]
@@ -791,6 +811,21 @@ def test_exclude_other_tag_categories(client):
                 for t in cat["tags"] if t["tag"] == model["tag"])["excluded"]
 
 
+def test_delete_prompt_stays_deleted_after_reimport(client):
+    total = client.get("/api/overview").json()["totals"]["prompts"]
+    client.post("/api/prompts/prompt-3/tags", json={"tag": "chore"})
+    assert client.delete("/api/prompts/prompt-3").json()["deleted"] == "prompt-3"
+    assert client.get("/api/prompts/prompt-3").status_code == 404
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - 1
+    # your tag stays, without the prompt
+    assert {t["tag"]: t["prompts"] for t in client.get("/api/tags").json()}["chore"] == 0
+    # its transcript changes and is imported again: the prompt does not come back
+    client.post("/api/ingest", params={"force": True})
+    assert client.get("/api/prompts/prompt-3").status_code == 404
+    assert client.get("/api/overview").json()["totals"]["prompts"] == total - 1
+    assert client.delete("/api/prompts/prompt-3").status_code == 404
+
+
 def test_tag_reference(client):
     client.post("/api/tags/task:ref/prompts", json={"prompt_ids": ["prompt-1", "prompt-3"]})
     assert client.get("/api/tags/task:ref/reference").json()["reference"] is None
@@ -863,11 +898,13 @@ def test_replay(client, monkeypatch):
     out = r.json()
     [(cwd, argv)] = launched
     assert cwd == CWD and out["terminal"] == "gnome-terminal"
-    assert argv == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
+    assert Path(argv[1]).name == "terminal.py"
+    assert argv[3:6] == [out["session_id"], "false", "false"]
+    assert argv[6:] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
                     "--model", "claude-haiku-5-5", "--effort", "high", "--permission-mode", "default", "write the release notes"]
     # the installed Claude Code unless asked otherwise, and the prompt's own settings by default
     client.post("/api/prompts/prompt-4/replay", json={"mode": "terminal"})
-    assert launched[1][1][:3] == ["claude", "--session-id", launched[1][1][2]] and launched[1][1][-1] == "write the release notes"
+    assert launched[1][1][6:8] == ["claude", "--session-id"] and launched[1][1][-1] == "write the release notes"
     # only from the dashboard, with sane values
     assert client.post("/api/prompts/prompt-4/replay", content="{}", headers={"content-type": "text/plain"}).status_code == 415
     assert client.post("/api/prompts/prompt-4/replay", json={}, headers={"origin": "https://evil.example"}).status_code == 403
@@ -907,6 +944,22 @@ def test_replay_is_linked(projects, tmp_path):
     client.put("/api/settings", json={"excluded_tags": ["rerun"]})
     assert client.get("/api/overview").json()["totals"]["prompts"] == total - 3
 
+
+
+def test_failed_rerun_is_never_imported(projects, tmp_path):
+    conn = db.connect(tmp_path / "r.db")
+    db.save_settings(conn, {"claude_projects_dir": str(projects)})
+    ingest(conn)  # imported while it ran
+    session = {r[0] for r in conn.execute("SELECT id FROM prompts WHERE session_id = ?", (SESSION,))}
+    total = conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+    assert session
+    with conn:
+        conn.execute("INSERT INTO replays(session_id, prompt_id, launched_at, status) VALUES (?,?,?,?)",
+                     (SESSION, "gone", "2026-10-04T00:00:00Z", "failed"))
+    for _ in range(2):  # it failed: its prompts go, and do not come back
+        ingest(conn, force=True)
+        assert conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == total - len(session)
+        assert not conn.execute(f"SELECT 1 FROM tags WHERE prompt_id IN ({','.join('?' * len(session))})", list(session)).fetchone()
 
 
 def test_prompt_rerun_impact_uses_selected_agent_limits_and_model(client, monkeypatch):
@@ -988,12 +1041,14 @@ def test_legacy_permissions_are_reimported_without_transcript_changes(client, tm
 
 
 def test_rerun_queue(client, monkeypatch):
+    assert client.get("/api/reruns/queue/count").json() == {"queued": 0}
     from rerunly import replay
 
     launched = []
     monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append(argv) or "gnome-terminal")
     q = client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1", "prompt-4"], "model": "claude-haiku-5-5", "mode": "terminal"}).json()
     assert q == {"added": 2, "queued": 2}
+    assert client.get("/api/reruns/queue/count").json() == {"queued": 2}
     # queued again with the same settings: not twice; other settings: a new item
     assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "model": "claude-haiku-5-5", "mode": "terminal"}).json()["added"] == 0
     assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "effort": "high", "mode": "terminal"}).json()["queued"] == 3
@@ -1007,10 +1062,12 @@ def test_rerun_queue(client, monkeypatch):
     assert queue[0]["estimate"]["total_tokens"] == queue[0]["prompt"]["total_tokens"]
     assert queue[0]["estimate"]["cost_usd"] > 0
     client.delete(f"/api/reruns/queue/{queue[2]['id']}")
+    assert client.get("/api/reruns/queue/count").json() == {"queued": 2}
     # launch two together: two terminals, out of the queue, listed as launched
     out = client.post("/api/reruns/launch", json={"ids": [queue[0]["id"], queue[1]["id"], queue[0]["id"]]}).json()["results"]
     assert len(out) == 2 and len(launched) == 2 and all("--model" in a for a in launched)
     data = client.get("/api/reruns").json()
+    assert client.get("/api/reruns/queue/count").json() == {"queued": 0}
     assert data["queue"] == [] and len(data["launched"]) == 2 and data["launched"][0]["replay"] is None
     assert {x["original"]["id"] for x in data["launched"]} == {"prompt-1", "prompt-4"}
     assert client.post("/api/reruns/launch", json={"ids": [1]}, headers={"content-type": "text/plain"}).status_code == 415
@@ -1047,14 +1104,14 @@ def test_rerun_with_reference_settings(client, monkeypatch):
     assert client.get("/api/prompts/prompt-1").json()["references"] == []  # the reference itself
     # rerun with the reference's settings: its release pinned
     client.post("/api/prompts/prompt-4/replay", json={"model": ref["model"], "effort": ref["effort"], "version": ref["harness_version"], "mode": "terminal"})
-    assert launched[-1][:3] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0"] and "--effort" in launched[-1]
+    assert launched[-1][6:9] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0"] and "--effort" in launched[-1]
     assert client.post("/api/prompts/prompt-4/replay", json={"version": "latest; rm"}).status_code == 400
     # queued with a release, launched with it
     client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-4"], "version": "2.1.0", "mode": "terminal"})
     [q] = client.get("/api/reruns").json()["queue"]
     assert q["release"] == "2.1.0"
     client.post("/api/reruns/launch", json={"ids": [q["id"]]})
-    assert launched[-1][2] == "@anthropic-ai/claude-code@2.1.0"
+    assert launched[-1][8] == "@anthropic-ai/claude-code@2.1.0"
 
 
 def test_rerun_outcome(tmp_path):
@@ -1287,3 +1344,281 @@ def test_usage_presentation_preserves_cached_readings(client, monkeypatch):
     assert result["limits"]["windows"][0]["used_percent"] == 10
     assert result["forecast"]["status"] == "learning"
     assert result["forecast"]["windows"][0]["models"][0]["samples"] == 0
+
+
+def test_draft_queue_requires_completion_before_any_selected_run_starts(client, monkeypatch):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append((cwd, argv)) or "terminal")
+    assert client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "model": "codex:gpt-6-luna",
+                                                "permission": "", "mode": "terminal"}).json()["added"] == 1
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-4"], "mode": "terminal"})
+    queue = client.get("/api/reruns").json()["queue"]
+    draft, ready = queue
+    assert draft["permission"] == "" and draft["needs_input"]
+    assert draft["issues"][0]["field"] == "permission"
+    assert not ready["needs_input"]
+    ids = [ready["id"], draft["id"]]  # a complete item first must not launch either
+    preflight = client.post("/api/reruns/preflight", json={"ids": ids}).json()
+    assert [q["id"] for q in preflight["needs_input"]] == [draft["id"]]
+    result = client.post("/api/reruns/launch", json={"ids": ids}).json()
+    assert result["results"] == [] and result["queued"] == 2 and not launched
+    assert client.patch(f"/api/reruns/queue/{draft['id']}", json={"permission": "ask"}).json()["needs_input"] is False
+    assert client.post("/api/reruns/preflight", json={"ids": ids}).json() == {"needs_input": []}
+    result = client.post("/api/reruns/launch", json={"ids": ids}).json()
+    assert result["queued"] == 0 and len(result["results"]) == 2 and len(launched) == 2
+
+
+def test_queue_configuration_detects_incompatible_permissions_and_budget(client):
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "model": "codex:gpt-6-luna",
+                                        "permission": "same", "mode": "background", "budget_usd": 1})
+    q = client.get("/api/reruns").json()["queue"][0]
+    assert {issue["field"] for issue in q["issues"]} == {"permission", "budget_usd"}
+    response = client.patch(f"/api/reruns/queue/{q['id']}", json={"permission": "edits", "budget_usd": None}).json()
+    assert not response["needs_input"]
+    assert client.patch(f"/api/reruns/queue/{q['id']}", json={"model": "invalid;model"}).status_code == 400
+    assert client.patch(f"/api/reruns/queue/{q['id']}", json={"permission": "invalid"}).status_code == 400
+    assert client.patch(f"/api/reruns/queue/{q['id']}", json={}, headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.patch("/api/reruns/queue/9999", json={}).status_code == 404
+
+
+def test_queue_can_complete_missing_directory_and_permissions(client, tmp_path, monkeypatch):
+    from rerunly import replay
+
+    conn = db.connect(tmp_path / "d.db")
+
+    with conn:
+        conn.execute("UPDATE prompts SET cwd=NULL, permissions=NULL WHERE id='prompt-1'")
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "mode": "terminal"})
+    q = client.get("/api/reruns").json()["queue"][0]
+    assert {issue["field"] for issue in q["issues"]} == {"cwd", "permission"}
+    assert client.patch(f"/api/reruns/queue/{q['id']}", json={"cwd": "/missing/example/workspace", "permission": "ask"}).json()["needs_input"]
+    assert not client.patch(f"/api/reruns/queue/{q['id']}", json={"cwd": str(tmp_path)}).json()["needs_input"]
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append(cwd) or "terminal")
+    client.post("/api/reruns/launch", json={"ids": [q["id"]]})
+    assert launched == [str(tmp_path)]
+
+
+def test_queue_background_original_approvals_need_a_choice(client):
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "mode": "background", "permission": "same"})
+    q = client.get("/api/reruns").json()["queue"][0]
+    assert q["needs_input"] and "terminal" in q["issues"][0]["message"]
+    assert not client.patch(f"/api/reruns/queue/{q['id']}", json={"mode": "terminal"}).json()["needs_input"]
+
+
+def test_queue_validation_checks_unsaved_edits_without_changing_queue(client, tmp_path):
+    client.post("/api/reruns/queue", json={"prompt_ids": ["prompt-1"], "model": "codex:gpt-6-luna",
+                                        "permission": "", "mode": "background", "budget_usd": 1})
+    before = client.get("/api/reruns").json()["queue"][0]
+    url = f"/api/reruns/queue/{before['id']}/validate"
+    result = client.post(url, json={"permission": "same"}).json()
+    assert {issue["field"] for issue in result["issues"]} == {"permission", "budget_usd"}
+    assert "explicit permissions" in result["issues"][0]["message"]
+    assert client.post(url, json={"permission": "ask", "budget_usd": "", "cwd": str(tmp_path)}).json() == {"needs_input": False, "issues": []}
+    result = client.post(url, json={"permission": "ask", "budget_usd": "", "cwd": "/missing/example"}).json()
+    assert result["needs_input"] and result["issues"][0]["field"] == "cwd"
+    assert client.post(url, json={"budget_usd": -1}).status_code == 400
+    assert client.post(url, json={}, headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.post("/api/reruns/queue/9999/validate", json={}).status_code == 404
+    after = client.get("/api/reruns").json()["queue"][0]
+    for key in ("permission", "model", "mode", "budget_usd", "cwd"):
+        assert before[key] == after[key]
+
+
+@pytest.mark.parametrize('keep_open', [False, True])
+def test_terminal_preference_is_saved_and_applied(client, monkeypatch, keep_open):
+    from rerunly import replay
+
+    launched = []
+    monkeypatch.setattr(replay, 'launch', lambda cwd, argv: launched.append(argv) or 'terminal')
+    response = client.post('/api/prompts/prompt-1/replay', json={'mode': 'terminal', 'keep_terminal_open': keep_open})
+    assert response.status_code == 200
+    assert (launched[-1][5] == 'true') is keep_open
+    assert bool(client.get('/api/reruns').json()['launched'][0]['keep_terminal_open']) is keep_open
+    client.post('/api/reruns/queue', json={'prompt_ids': ['prompt-4'], 'mode': 'terminal', 'keep_terminal_open': keep_open})
+    q = client.get('/api/reruns').json()['queue'][0]
+    assert bool(q['keep_terminal_open']) is keep_open
+    client.patch(f"/api/reruns/queue/{q['id']}", json={'keep_terminal_open': 'false' if keep_open else 'true'})
+    updated = client.get('/api/reruns').json()['queue'][0]
+    assert bool(updated['keep_terminal_open']) is not keep_open
+    result = client.post('/api/reruns/launch', json={'ids': [q['id']]}).json()
+    assert len(result['results']) == 1
+    assert (launched[-1][5] == 'true') is not keep_open
+
+
+def test_rerun_defaults_to_its_basis_even_with_different_prompt_text(client, tmp_path):
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("INSERT INTO replays(session_id, prompt_id, launched_at) VALUES (?,?,?)",
+                  (SESSION, "prompt-4", "2026-10-04T00:00:00Z"))
+    detail = client.get("/api/prompts/prompt-1").json()
+    assert detail["compare"]["scope"] == "original"
+    assert detail["compare"]["reference"]["id"] == "prompt-4"
+    assert [p["id"] for p in detail["similar"]] == ["prompt-4"]
+    # Request overlap remains independent of the output rating.
+    assert detail["similar"][0]["score"] < 0.2
+    assert detail["replay_of"]["rating"] is None
+    similar = client.get("/api/prompts/prompt-1", params={"compare": "similar"}).json()
+    assert similar["compare"]["scope"] == "similar"
+    assert "prompt-4" not in [p["id"] for p in similar["similar"]]
+    c.close()
+
+
+def test_judge_invalidates_changed_inputs(client, tmp_path, monkeypatch):
+    """A rating of a streamed preamble must not survive the imported final answer."""
+    import threading
+    import time
+    from rerunly import judge
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def fake_rate(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        finished.set()
+        return {"score": 5, "verdict": "major", "quality": "worse", "look": True,
+                "summary": "Only a preamble", "differences": [], "cost_usd": 0}
+
+    monkeypatch.setattr(judge, "rate", fake_rate)
+    c = db.connect(tmp_path / "d.db")
+    try:
+        client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4"})
+        assert started.wait(5)
+        with c:
+            c.execute("UPDATE prompts SET answer=? WHERE id='prompt-4'", ("Complete LinkedIn post about a different paper",))
+        params = {"a": "prompt-1", "b": "prompt-4"}
+        assert client.get("/api/compare", params=params).json()["rating"] is None
+        release.set()
+        assert finished.wait(5)
+        # Even after the old worker saves, its result does not match the new output.
+        for _ in range(100):
+            if c.execute("SELECT status FROM run_ratings").fetchone()[0] == "done":
+                break
+            time.sleep(0.01)
+        assert client.get("/api/compare", params=params).json()["rating"] is None
+        monkeypatch.setattr(judge, "rate", lambda *a, **k: {
+            "score": 20, "verdict": "major", "quality": "same", "look": True,
+            "summary": "Different paper, comparable deliverable", "differences": ["Different subjects"], "cost_usd": 0})
+        client.post("/api/ratings", json={"base": "prompt-1", "other": "prompt-4"})
+        for _ in range(100):
+            rating = client.get("/api/compare", params=params).json()["rating"]
+            if rating and rating["status"] == "done":
+                break
+            time.sleep(0.01)
+        assert rating["score"] == 20
+        with c:
+            c.execute("UPDATE prompts SET files='[\"post.txt\"]' WHERE id='prompt-1'")
+        assert client.get("/api/compare", params=params).json()["rating"] is None
+    finally:
+        release.set()
+        c.close()
+
+
+def test_exclude_reruns_filters_list_and_overview(client, tmp_path):
+    before = client.get('/api/prompts').json()
+    c = db.connect(tmp_path / 'd.db')
+    with c:
+        c.execute('INSERT INTO replays(session_id, prompt_id, launched_at) VALUES (?,?,?)',
+                  (SESSION, 'prompt-4', '2026-10-04T00:00:00Z'))
+    c.close()
+    expected = [p for p in before['items'] if p['session_id'] != SESSION]
+    assert client.get('/api/prompts').json()['total'] == before['total']
+    params = {'exclude_reruns': 'true'}
+    filtered = client.get('/api/prompts', params=params).json()
+    assert {p['id'] for p in filtered['items']} == {p['id'] for p in expected}
+    assert filtered['total'] == filtered['summary']['count'] == len(expected)
+    assert (filtered['summary']['cost_usd'] or 0) == pytest.approx(sum(p['total_cost_usd'] for p in expected))
+    overview = client.get('/api/overview', params=params).json()
+    assert overview['totals']['prompts'] == len(expected)
+
+
+def test_exclude_reruns_from_prompt_comparison(client, tmp_path):
+    c = db.connect(tmp_path / 'd.db')
+    with c:
+        c.execute('INSERT INTO replays(session_id, prompt_id, launched_at) VALUES (?,?,?)',
+                  (SESSION, 'prompt-4', '2026-10-04T00:00:00Z'))
+    c.close()
+    for prompt_id in ['prompt-1', 'prompt-4']:
+        client.post(f'/api/prompts/{prompt_id}/tags', json={'tag': 'task:comparison'})
+    params = {'compare': 'tag', 'tag': 'task:comparison'}
+    assert client.get('/api/prompts/prompt-4', params=params).json()['similar']
+    params['exclude_reruns'] = 'true'
+    assert client.get('/api/prompts/prompt-4', params=params).json()['similar'] == []
+
+
+def test_exclude_rerun_sessions(client, tmp_path):
+    before = client.get('/api/sessions').json()
+    c = db.connect(tmp_path / 'd.db')
+    with c:
+        c.execute('INSERT INTO replays(session_id, prompt_id, launched_at) VALUES (?,?,?)',
+                  (SESSION, 'prompt-4', '2026-10-04T00:00:00Z'))
+    c.close()
+    assert client.get('/api/sessions').json()['total'] == before['total']
+    expected = [s for s in before['items'] if s['id'] != SESSION]
+    result = client.get('/api/sessions', params={'exclude_reruns': 'true'}).json()
+    assert {s['id'] for s in result['items']} == {s['id'] for s in expected}
+    assert result['total'] == result['summary']['count'] == len(expected)
+    assert (result['summary']['cost_usd'] or 0) == pytest.approx(sum(s['cost_usd'] for s in expected))
+    assert all(s['id'] != SESSION for s in result.get('highlights', {}).values())
+
+
+def test_failed_rerun_details_without_imported_prompt(client, tmp_path):
+    conn = db.connect(tmp_path / 'd.db')
+    error = 'Usage credits required. ' + 'Full error details. ' * 30
+    with conn:
+        conn.execute(
+            "INSERT INTO replays(session_id, prompt_id, model, effort, harness_version, launched_at, "
+            "status, result, mode, permission, budget_usd, skills, log_path, pid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ('failed-launch', 'prompt-1', 'claude-fable-5', 'high', '2.1.0', '2026-10-28T15:53:15Z',
+             'failed', error, 'background', 'edits', 2.5,
+             json.dumps([{'skill': 'review', 'source': 'commit123'}]), '/private/log', 123),
+        )
+    result = client.get('/api/reruns/launched/failed-launch')
+    assert result.status_code == 200
+    detail = result.json()
+    assert detail['status'] == 'failed' and detail['result'] == error
+    assert detail['original']['id'] == 'prompt-1' and detail['replay'] is None
+    assert (detail['model'], detail['effort'], detail['harness_version']) == ('claude-fable-5', 'high', '2.1.0')
+    assert (detail['mode'], detail['permission'], detail['budget_usd']) == ('background', 'edits', 2.5)
+    assert detail['skills'] == [{'skill': 'review', 'source': 'commit123'}]
+    assert 'log_path' not in detail and 'pid' not in detail
+    assert client.get('/api/reruns/launched/unknown').status_code == 404
+    # Detail links survive removal of the original from visible history.
+    with conn:
+        conn.execute("DELETE FROM prompts WHERE id = 'prompt-1'")
+    assert client.get('/api/reruns/launched/failed-launch').json()['original'] is None
+
+
+def test_combined_tag_category_filters(client):
+    client.post('/api/prompts/prompt-1/tags', json={'tag': 'task:filters'})
+    client.post('/api/prompts/prompt-3/tags', json={'tag': 'task:filters'})
+    client.post('/api/prompts/prompt-1/tags', json={'tag': 'favorite'})
+    params = [('tags', 'task:filters'), ('tags', 'favorite')]
+    result = client.get('/api/prompts', params=params).json()
+    assert [p['id'] for p in result['items']] == ['prompt-1']
+    overview = client.get('/api/overview', params=params).json()
+    assert overview['totals']['prompts'] == result['summary']['count'] == 1
+    assert overview['totals']['cost_usd'] == result['summary']['cost_usd']
+    assert client.get('/api/prompts', params=[*params, ('tag', 'missing')]).json()['total'] == 0
+    assert client.get('/api/prompts', params=[*params, ('tags', "unknown:' OR 1=1 --")]).json()['total'] == 0
+
+
+def test_multiple_values_in_each_tag_category(client):
+    for pid, tags in {'prompt-1': ['task:one', 'chosen'],
+                      'prompt-3': ['task:two', 'also-chosen'],
+                      'prompt-4': ['task:three', 'chosen']}.items():
+        for tag in tags:
+            client.post(f'/api/prompts/{pid}/tags', json={'tag': tag})
+    params = [('tags', 'task:one'), ('tags', 'task:two'),
+              ('tags', 'chosen'), ('tags', 'also-chosen')]
+    result = client.get('/api/prompts', params=params).json()
+    assert {p['id'] for p in result['items']} == {'prompt-1', 'prompt-3'}
+    assert client.get('/api/overview', params=params).json()['totals']['prompts'] == 2
+    sessions = client.get('/api/sessions', params=params).json()
+    assert {s['id'] for s in sessions['items']} == {p['session_id'] for p in result['items']}
+    # A locked tag scope still applies independently of the multi-select choices.
+    scoped = client.get('/api/prompts', params=[*params, ('tag', 'task:one')]).json()
+    assert [p['id'] for p in scoped['items']] == ['prompt-1']
