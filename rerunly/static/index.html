@@ -24,9 +24,14 @@
         title="Cost reported by the agent itself (OpenTelemetry) for prompts it fully covers; the price table for the others">Official</button>
       <button type="button" data-cost-source="prices" title="Token counts × the price table configured on the Setup page">Price table</button>
     </div>
+    <button id="usage-reopen" class="btn" type="button" hidden>Show usage</button>
     <button id="refresh" class="btn" title="Import new transcripts now">Refresh</button>
   </header>
   <main id="app"></main>
+  <aside id="usage-panel" class="hero-limits" aria-label="Usage limits" hidden>
+    <div class="usage-panel-controls"><button id="usage-drag" type="button" aria-label="Move usage panel" title="Drag to move; use arrow keys to adjust">⠿</button><button id="usage-close" type="button" aria-label="Close usage panel" title="Close usage panel">×</button></div>
+    <details open><summary>Usage limits</summary><div class="hero-limits-content"></div></details>
+  </aside>
   <script src="/static/app.js"></script>
 </body>
 </html>

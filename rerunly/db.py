@@ -178,6 +178,22 @@ CREATE TABLE IF NOT EXISTS run_ratings (
     PRIMARY KEY (base_id, other_id)
 );
 
+-- Completed judge attempts are kept when a pair is judged again.
+CREATE TABLE IF NOT EXISTS judge_rating_history (
+    id INTEGER PRIMARY KEY, base_id TEXT NOT NULL, other_id TEXT NOT NULL,
+    score INTEGER, verdict TEXT, quality TEXT, look INTEGER, summary TEXT, differences TEXT,
+    model TEXT, cost_usd REAL, rated_at TEXT, input_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS judge_rating_history_pair ON judge_rating_history(base_id, other_id);
+
+-- Human assessments are context for future judgments of the same pair and inputs.
+CREATE TABLE IF NOT EXISTS judge_feedback (
+    base_id TEXT NOT NULL, other_id TEXT NOT NULL, input_hash TEXT NOT NULL,
+    model TEXT NOT NULL, judge_score INTEGER NOT NULL, human_score INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+    PRIMARY KEY (base_id, other_id)
+);
+
 -- The run of a tag (yours or an AI tag) every other run of it is compared with.
 CREATE TABLE IF NOT EXISTS rerun_reference (
     prompt_id TEXT PRIMARY KEY,
@@ -228,6 +244,12 @@ def connect(path: Path) -> sqlite3.Connection:
 # Columns added after the first release: (table, column, type). Appended at the end of the
 # table, so inserts listing values in table order keep working.
 ADDED_COLUMNS = [
+    ("run_ratings", "duration_ms", "INTEGER"), ("run_ratings", "total_tokens", "INTEGER"),
+    ("judge_rating_history", "duration_ms", "INTEGER"), ("judge_rating_history", "total_tokens", "INTEGER"),
+    ("run_ratings", "origin", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("judge_rating_history", "origin", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("replay_queue", "kind", "TEXT NOT NULL DEFAULT 'prompt'"),
+    ("replay_queue", "other_prompt_id", "TEXT"),
     ("replay_queue", "keep_terminal_open", "INTEGER"),
     ("replays", "keep_terminal_open", "INTEGER"),
     ("replay_queue", "cwd", "TEXT"),

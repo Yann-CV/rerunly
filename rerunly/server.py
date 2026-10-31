@@ -6,6 +6,7 @@ import shutil
 import sys
 import uuid
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -123,6 +124,31 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return {r["id"]: dict(r) for r in c.execute(
             "SELECT id, text, answer, files FROM prompts WHERE id IN (?, ?)", (base_id, other_id))}
 
+    def rating_feedback(c, base, other, runs):
+        if len(runs) != 2:
+            return None
+        row = c.execute("SELECT human_score, note FROM judge_feedback WHERE base_id=? AND other_id=? AND input_hash=?",
+                        (base, other, judge.input_hash(runs))).fetchone()
+        return dict(row) if row else None
+
+    def judge_usage_estimate(c, base, other, model, limits):
+        runs = rating_inputs(c, base, other)
+        model = model or db.get_settings(c)["judge_model"]
+        agent_id, model_id = judge.judge_agent(model)
+        agent = "Codex" if agent_id == "codex" else "Claude Code"
+        if base == other or len(runs) != 2 or not all(r["answer"] for r in runs.values()):
+            return {"agent": agent, "model": model_id, "estimate": None, "forecast": None}
+        def data(row):
+            return {"text": row["text"], "answer": row["answer"], "files": json.loads(row["files"] or "[]")}
+        prompt = judge.rating_prompt(runs[base]["text"], data(runs[base]), data(runs[other]), rating_feedback(c, base, other, runs))
+        input_tokens = max(1, (len(prompt.encode("utf-8")) + 3) // 4)
+        output_tokens = 512
+        estimate = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens, "cost_usd": None, "duration_ms": None,
+                    "tokens_by_model": {model_id: input_tokens + output_tokens} if model_id else {}}
+        return {"agent": agent, "model": model_id, "estimate": estimate,
+                "forecast": usage_forecast.forecast(c, limits.get(agent), estimate)}
+
     def rating_of(c, base_id: str, other_id: str) -> dict | None:
         r = c.execute("SELECT * FROM run_ratings WHERE base_id = ? AND other_id = ?", (base_id, other_id)).fetchone()
         if r is None:
@@ -134,9 +160,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         d = dict(r)
         d["differences"] = json.loads(d["differences"] or "[]")
         d["look"] = bool(d["look"]) if d["look"] is not None else None
+        if d["status"] == "done":
+            d["human_feedback"] = rating_feedback(c, base_id, other_id, rating_inputs(c, base_id, other_id))
         return d
 
-    def start_rating(base_id: str, other_id: str, force: bool = False, model: str = "") -> dict | None:
+    def start_rating(base_id: str, other_id: str, force: bool = False, model: str = "", origin: str = "explicit") -> dict | None:
         """Have an LLM judge rate `other_id`'s output against `base_id`'s, in the background, with `model` (else the
         default judge of the Setup page); None when one has no answer."""
         c = conn()
@@ -144,6 +172,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if base_id == other_id or len(runs) != 2 or not runs[base_id]["answer"] or not runs[other_id]["answer"]:
             return None
         fingerprint = judge.input_hash(runs)
+        human_feedback = rating_feedback(c, base_id, other_id, runs)
         with rating_lock:
             current = rating_of(c, base_id, other_id)
             if current and (current["status"] == "rating" or (current["status"] == "done" and not force)):
@@ -153,24 +182,32 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             effort = "" if model else settings["judge_effort"]
             model = model or settings["judge_model"]
             with c:
+                c.execute("INSERT INTO judge_rating_history(base_id,other_id,score,verdict,quality,look,summary,differences,model,cost_usd,rated_at,input_hash,origin,duration_ms,total_tokens) "
+                          "SELECT base_id,other_id,score,verdict,quality,look,summary,differences,model,cost_usd,rated_at,input_hash,origin,duration_ms,total_tokens "
+                          "FROM run_ratings WHERE base_id=? AND other_id=? AND status='done'", (base_id, other_id))
                 label = f"{model or 'default model'} · {effort} effort" if effort else model  # "Judged by …" on the page
-                c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at, input_hash) VALUES (?,?,?,?,?,?)",
-                          (base_id, other_id, "rating", label, runner.now(), fingerprint))
+                c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at, input_hash, origin) VALUES (?,?,?,?,?,?,?)",
+                          (base_id, other_id, "rating", label, runner.now(), fingerprint, origin))
 
         def work():
+            started = time.monotonic()
             files = lambda r: json.loads(r["files"] or "[]")
             try:
+                options = {"effort": effort}
+                if human_feedback:
+                    options["human_feedback"] = human_feedback
                 out = judge.rate(runs[base_id]["text"], {"answer": runs[base_id]["answer"], "files": files(runs[base_id])},
-                                 {"answer": runs[other_id]["answer"], "files": files(runs[other_id])}, model, db_path.parent / "judge", effort=effort)
+                                 {"text": runs[other_id]["text"], "answer": runs[other_id]["answer"], "files": files(runs[other_id])}, model, db_path.parent / "judge", **options)
                 values = ("done", out["score"], out["verdict"], out["quality"], int(out["look"]), out["summary"],
-                          json.dumps(out["differences"]), out["cost_usd"], None)
+                          json.dumps(out["differences"]), out["cost_usd"], None, out.get("total_tokens"))
             except Exception as e:  # noqa: BLE001 - any failure is reported on the page
-                values = ("failed", None, None, None, None, None, None, None, str(e)[:300])
+                values = ("failed", None, None, None, None, None, None, None, str(e)[:300], None)
+            elapsed_ms = round((time.monotonic() - started) * 1000)
             w = conn()
             with w:
                 w.execute("UPDATE run_ratings SET status=?, score=?, verdict=?, quality=?, look=?, summary=?, differences=?, cost_usd=?, "
-                          "error=?, rated_at=? WHERE base_id=? AND other_id=? AND input_hash=?",
-                          (*values, runner.now(), base_id, other_id, fingerprint))
+                          "error=?, total_tokens=?, duration_ms=?, rated_at=? WHERE base_id=? AND other_id=? AND input_hash=?",
+                          (*values, elapsed_ms, runner.now(), base_id, other_id, fingerprint))
 
         threading.Thread(target=work, daemon=True).start()
         return rating_of(c, base_id, other_id)
@@ -181,7 +218,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "SELECT x.prompt_id base, x.judge_model, (SELECT id FROM prompts WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) other "
             "FROM replays x WHERE COALESCE(x.auto_rate, 1) = 1").fetchall():
             if x["other"] and not rating_of(c, x["base"], x["other"]):
-                start_rating(x["base"], x["other"], model=x["judge_model"] or "")
+                start_rating(x["base"], x["other"], model=x["judge_model"] or "", origin="automatic")
 
     def loop():
         while not stop.is_set():
@@ -575,6 +612,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         "tokens": "p.total_tokens DESC",
     }
 
+    def tag_category(tag: str) -> str:
+        return tag.split(":", 1)[0] if ":" in tag else ""
+
     def prompt_filters(q: str, tag: str, project: str, since: str, exclude_reruns: bool = False, tags: list[str] | None = None) -> tuple[str, list]:
         """WHERE clause (or "") over the prompts view `p` shared by the prompt list and the overview."""
         where, args = [], []
@@ -592,8 +632,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             args.append(tag)
         categories: dict[str, list[str]] = {}
         for selected_tag in dict.fromkeys(tags or []):
-            category = selected_tag.split(":", 1)[0] if ":" in selected_tag else ""
-            categories.setdefault(category, []).append(selected_tag)
+            categories.setdefault(tag_category(selected_tag), []).append(selected_tag)
         for choices in categories.values():
             placeholders = ",".join("?" for _ in choices)
             where.append(f"p.id IN (SELECT prompt_id FROM tags WHERE tag IN ({placeholders}))")
@@ -655,7 +694,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         refresh_reruns(c)
         prompt["replays"] = []
         for x in c.execute("SELECT * FROM replays WHERE prompt_id = ? ORDER BY launched_at DESC", (prompt_id,)).fetchall():
-            done = c.execute("SELECT id, started_at, total_cost_usd, total_tokens, active_ms, wall_ms FROM pv WHERE session_id = ? "
+            done = c.execute("SELECT id, text, started_at, total_cost_usd, total_tokens, active_ms, wall_ms FROM pv WHERE session_id = ? "
                              "ORDER BY started_at LIMIT 1", (x["session_id"],)).fetchone()
             prompt["replays"].append({**rerun_row(x), "prompt": dict(done) if done else None,
                                       "rating": rating_of(c, prompt_id, done["id"]) if done else None})
@@ -872,6 +911,38 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         add_rules(c, tag, made)
         return {"tag": tag, "prompts": c.execute("SELECT COUNT(*) FROM tags WHERE tag = ?", (tag,)).fetchone()[0]}
 
+    @app.put("/api/tags/{tag:path}/name")
+    def rename_tag(tag: str, name: str = Body(..., embed=True)):
+        """Rename a user tag and every stored reference to it in one transaction."""
+        c = conn()
+        require_human_tag(c, tag)
+        name = name.strip()
+        if not name:
+            raise HTTPException(400, "empty tag")
+        if name == tag:
+            return {"tag": tag}
+        if c.execute("SELECT 1 FROM tag_meta WHERE tag=? UNION SELECT 1 FROM tags WHERE tag=?", (name, name)).fetchone():
+            raise HTTPException(409, f"the tag {name} already exists")
+        # Historical exclusions and references can outlive their visible tag.
+        for table in ("tag_exclusions", "tag_suppressed", "tag_reference"):
+            if c.execute(f"SELECT 1 FROM {table} WHERE tag=?", (name,)).fetchone():
+                raise HTTPException(409, f"the tag {name} already has stored history")
+        if c.execute("SELECT 1 FROM tag_priorities WHERE tag=? OR preferred_tag=?", (name, name)).fetchone():
+            raise HTTPException(409, f"the tag {name} already has stored history")
+        settings = db.get_settings(c)
+        if any(rule.get(key) == name for rule in settings["tag_rules"] for key in ("tag", "include_tag", "preferred_tag")) or name in settings["excluded_your_tags"]:
+            raise HTTPException(409, f"the tag {name} already has stored history")
+        rules = [{key: name if key in ("tag", "include_tag", "preferred_tag") and value == tag else value
+                  for key, value in rule.items()} for rule in settings["tag_rules"]]
+        excluded = [name if value == tag else value for value in settings["excluded_your_tags"]]
+        with c:
+            for table in ("tags", "tag_meta", "tag_exclusions", "tag_suppressed", "tag_reference", "tag_priorities"):
+                c.execute(f"UPDATE {table} SET tag=? WHERE tag=?", (name, tag))
+            c.execute("UPDATE tag_priorities SET preferred_tag=? WHERE preferred_tag=?", (name, tag))
+            for key, value in (("tag_rules", rules), ("excluded_your_tags", excluded)):
+                c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
+        return {"tag": name}
+
     @app.put("/api/tags/{tag:path}/description")
     def set_tag_description(tag: str, description: str = Body(..., embed=True)):
         c = conn()
@@ -1016,6 +1087,50 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             for tag, (created, desc) in described.items() if tag not in used
         ]
         return out
+
+    @app.get("/api/tag-counts")
+    def tag_counts(
+        scope: str = "prompts", q: str = "", tag: str = "", project: str = "", since: str = "",
+        exclude_reruns: bool = False, tags: list[str] = Query(default=[]),
+    ):
+        """What each tag would leave in the `scope` list (prompts, sessions or reruns) if selected. `tag` is pinned;
+        selections in a tag's own category are ignored for it, as choosing another value there widens the list."""
+        if scope not in ("prompts", "sessions", "reruns"):
+            raise HTTPException(400, "scope must be one of prompts, sessions, reruns")
+        c = conn()
+
+        def counted(category: str | None = None) -> dict[str, int]:
+            others = [t for t in tags if tag_category(t) != category]
+            kept_project = "" if category == "project" else project
+            if scope == "sessions":
+                # as /api/sessions: session filters on the session, tag filters on one of its prompts
+                where, args = prompt_filters("", tag, "", "", tags=others)
+                session_where, session_args = session_filters(q, kept_project, exclude_reruns)
+                if since:
+                    session_where.append("(SELECT MIN(f.started_at) FROM pv f WHERE f.session_id = s.id) >= ?")
+                    session_args.append(since)
+                if session_where:
+                    where += f"{' AND' if where else 'WHERE'} p.session_id IN (SELECT s.id FROM sessions s WHERE {' AND '.join(session_where)})"
+                return dict(c.execute(
+                    f"SELECT t.tag, COUNT(DISTINCT p.session_id) FROM tags t JOIN pv p ON p.id = t.prompt_id {where} GROUP BY t.tag",
+                    [*args, *session_args],
+                ).fetchall())
+            where, args = prompt_filters(q, tag, kept_project, since, exclude_reruns, others)
+            if scope == "prompts":
+                return dict(c.execute(f"SELECT t.tag, COUNT(*) FROM tags t JOIN pv p ON p.id = t.prompt_id {where} GROUP BY t.tag", args).fetchall())
+            # as the rerun history: an attempt matches through its original prompt or its imported rerun
+            return dict(c.execute(
+                "SELECT t.tag, COUNT(DISTINCT x.session_id) FROM replays x JOIN pv p ON p.id = x.prompt_id "
+                "OR p.id = (SELECT r.id FROM pv r WHERE r.session_id = x.session_id ORDER BY r.started_at LIMIT 1) "
+                f"JOIN tags t ON t.prompt_id = p.id {where} GROUP BY t.tag",
+                args,
+            ).fetchall())
+
+        selected = {tag_category(t) for t in tags} | ({"project"} if project else set())
+        counts = {t: n for t, n in counted().items() if tag_category(t) not in selected}
+        for category in selected:
+            counts.update({t: n for t, n in counted(category).items() if tag_category(t) == category})
+        return counts
 
     def reference_of(c, tag: str) -> dict | None:
         """The tag's reference run, while it still carries the tag and is in the history."""
@@ -1197,6 +1312,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         "tokens": "total_tokens DESC",
     }
 
+    def session_filters(q: str, project: str, exclude_reruns: bool) -> tuple[list[str], list]:
+        """Conditions over the sessions table `s`, shared by the session list and its tag counts."""
+        where, args = [], []
+        if project:
+            where.append("s.project = ?")
+            args.append(project)
+        if q:
+            where.append("(s.title LIKE ? OR s.id IN (SELECT session_id FROM prompts WHERE text LIKE ?))")
+            args += [f"%{q}%", f"%{q}%"]
+        if exclude_reruns:
+            where.append("NOT EXISTS (SELECT 1 FROM replays x WHERE x.session_id = s.id)")
+        return where, args
+
     @app.get("/api/sessions")
     def list_sessions(
         q: str = "", project: str = "", since: str = "", sort: str = "recent", limit: int = 100, offset: int = 0, exclude_reruns: bool = False,
@@ -1207,19 +1335,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if sort not in SESSION_SORTS:
             raise HTTPException(400, f"sort must be one of {list(SESSION_SORTS)}")
         c = conn()
-        where, args = [], []
-        if project:
-            where.append("s.project = ?")
-            args.append(project)
-        if q:
-            where.append("(s.title LIKE ? OR s.id IN (SELECT session_id FROM prompts WHERE text LIKE ?))")
-            args += [f"%{q}%", f"%{q}%"]
+        where, args = session_filters(q, project, exclude_reruns)
         if tag or tags:
             tag_where, tag_args = prompt_filters("", tag, "", "", tags=tags)
             where.append(f"s.id IN (SELECT p.session_id FROM pv p {tag_where})")
             args.extend(tag_args)
-        if exclude_reruns:
-            where.append("NOT EXISTS (SELECT 1 FROM replays x WHERE x.session_id = s.id)")
         sql = (
             f"SELECT {SESSION_COLS}, (SELECT text FROM prompts f WHERE f.session_id = s.id ORDER BY f.started_at LIMIT 1) first_prompt "
             f"FROM sessions s JOIN pv p ON p.session_id = s.id {'WHERE ' + ' AND '.join(where) if where else ''} GROUP BY s.id"
@@ -1489,10 +1609,34 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         runner.remove_plugin(reruns_dir / session_id / "plugin")
 
     def refresh_reruns(c) -> None:
-        """Background reruns whose process ended while the dashboard was not watching it."""
-        for x in c.execute("SELECT session_id, pid FROM replays WHERE status = 'running'").fetchall():
+        """Reconcile tracked background and terminal processes with their recorded state."""
+        for x in c.execute("SELECT session_id, pid, launched_at FROM replays WHERE status = 'running'").fetchall():
+            # The row is inserted before the child is started and its PID is saved.
+            if x["pid"] is None and (datetime.now(timezone.utc) - datetime.fromisoformat(x["launched_at"].replace('Z', '+00:00'))).total_seconds() < 30:
+                continue
             if not runner.alive(x["pid"]):
                 finish_rerun(x["session_id"])
+        for x in c.execute("SELECT session_id, launched_at FROM replays WHERE status = 'interactive'").fetchall():
+            sid = x["session_id"]
+            if Path(sid).name != sid:
+                continue
+            try:
+                marker = json.loads((reruns_dir / sid / 'terminal-status.json').read_text())
+            except (OSError, ValueError):
+                marker = {}
+            state = marker.get('state')
+            if state in ('done', 'failed'):
+                with c:
+                    c.execute("UPDATE replays SET status=?, result=?, ended_at=? WHERE session_id=? AND status='interactive'",
+                              (state, marker.get('detail') or '', runner.now(), sid))
+                runner.remove_plugin(reruns_dir / sid / 'plugin')
+                continue
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(x['launched_at'].replace('Z', '+00:00'))).total_seconds()
+            if age >= 120 and runner.terminal_process(sid) is False:
+                with c:
+                    c.execute("UPDATE replays SET status='failed', result=?, ended_at=? WHERE session_id=? AND status='interactive'",
+                              ('No matching terminal rerun process was found; the run stopped without a recorded completion.', runner.now(), sid))
+                runner.remove_plugin(reruns_dir / sid / 'plugin')
 
     def queue_options(q):
         q = dict(q)
@@ -1532,7 +1676,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     def queued_inputs(c, rows):
         return [{"id": q["id"], "prompt_id": q["prompt_id"], "issues": issues}
-                for q in rows if (issues := configuration_issues(c, q["prompt_id"], queue_options(q)))]
+                for q in rows if q["kind"] != "judge" and (issues := configuration_issues(c, q["prompt_id"], queue_options(q)))]
 
     def selected_queue(c, body):
         try:
@@ -1599,7 +1743,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             settings = db.get_settings(c)
             argv = [sys.executable, str(Path(__file__).with_name("terminal.py")),
                     settings["codex_sessions_dir" if codex else "claude_projects_dir"],
-                    session_id, str(codex).lower(), str(opts.get("keep_terminal_open", False)).lower(), *argv]
+                    session_id, str(codex).lower(), str(opts.get("keep_terminal_open", False)).lower(),
+                    '--status-file', str(reruns_dir / session_id / 'terminal-status.json'), *argv]
             launched = replay.launch(cwd, argv)
             row.update(status="interactive")
         else:
@@ -1658,11 +1803,32 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             added = sum(
                 c.execute(
                     f"INSERT INTO replay_queue(prompt_id, same_version, added_at, {', '.join(values)}) "
-                    f"SELECT ?, ?, ?, {', '.join('?' * len(values))} WHERE NOT EXISTS (SELECT 1 FROM replay_queue WHERE prompt_id = ? AND {same})",
+                    f"SELECT ?, ?, ?, {', '.join('?' * len(values))} WHERE NOT EXISTS (SELECT 1 FROM replay_queue WHERE prompt_id = ? AND kind='prompt' AND {same})",
                     (i, int(o["release"] == "same"), runner.now(), *values.values(), i, *values.values()),
                 ).rowcount
                 for i in ids
             )
+        return {"added": added, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
+
+    @app.post("/api/reruns/queue/judge")
+    async def queue_judge(request: Request):
+        body = await dashboard_json(request)
+        base, other, model = str(body.get("base") or ""), str(body.get("other") or ""), str(body.get("model") or "")
+        if model and not replay.MODEL_RE.match(model):
+            raise HTTPException(400, "unknown judge model")
+        c = conn()
+        runs = rating_inputs(c, base, other)
+        if base == other or len(runs) != 2 or not all(row["answer"] for row in runs.values()):
+            raise HTTPException(400, "Both runs need a final answer and must be different")
+        for pid in (base, other):
+            row = c.execute("SELECT source FROM pv WHERE id=?", (pid,)).fetchone()
+            if not row or row["source"] == "rerunly-examples":
+                raise HTTPException(400, "Judge runs require two real prompts in the history")
+        with c:
+            added = c.execute("INSERT INTO replay_queue(prompt_id,other_prompt_id,kind,model,added_at) "
+                              "SELECT ?,?,'judge',?,? WHERE NOT EXISTS (SELECT 1 FROM replay_queue "
+                              "WHERE kind='judge' AND prompt_id=? AND other_prompt_id=? AND COALESCE(model,'')=?)",
+                              (base, other, model, runner.now(), base, other, model)).rowcount
         return {"added": added, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
 
     def comparison_members(c, prompt_id: str):
@@ -1713,6 +1879,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         limits = {entry["agent"]: entry for entry in usage_limits()}
         queue = []
         for q in c.execute("SELECT * FROM replay_queue ORDER BY id"):
+            if q["kind"] == "judge":
+                estimate = judge_usage_estimate(c, q["prompt_id"], q["other_prompt_id"], q["model"], limits)
+                queue.append({**dict(q), "prompt": prompt(q["prompt_id"]), "other_prompt": prompt(q["other_prompt_id"]),
+                              "agent": estimate["agent"], "judge_estimate_model": estimate["model"],
+                              "estimate": estimate["estimate"], "forecast": estimate["forecast"], "issues": [], "needs_input": False})
+                continue
             original = c.execute("SELECT * FROM pv WHERE id=?", (q["prompt_id"],)).fetchone()
             agents = [dict(a) for a in c.execute("SELECT * FROM agents WHERE prompt_id=?", (q["prompt_id"],))]
             estimate = estimate_rerun(dict(original) if original else None, agents, q["model"], prices)
@@ -1747,6 +1919,31 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         imported = c.execute("SELECT id FROM pv WHERE session_id = ? ORDER BY started_at LIMIT 1", (session_id,)).fetchone()
         return {**rerun_row(row), "original": dict(original) if original else None,
                 "replay": dict(imported) if imported else None}
+
+    @app.get("/api/reruns/launched/{session_id}/diagnostics")
+    def rerun_diagnostics(session_id: str):
+        c = conn()
+        refresh_reruns(c)
+        row = c.execute("SELECT * FROM replays WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Rerun not found")
+        process = ('running' if runner.alive(row['pid']) else 'not running') if row['status'] == 'running' and row['pid'] else 'not tracked'
+        if row['status'] == 'interactive':
+            found = runner.terminal_process(session_id)
+            process = 'running' if found is True else 'not found' if found is False else 'unavailable'
+        log = ''
+        # Only read this rerun's own managed log, never an arbitrary stored path.
+        if Path(session_id).name == session_id and row['mode'] == 'background':
+            try:
+                with (reruns_dir / session_id / 'stream.jsonl').open('rb') as stream:
+                    stream.seek(0, 2)
+                    size = stream.tell()
+                    stream.seek(max(0, size - 16000))
+                    log = stream.read().decode('utf-8', errors='replace')
+            except OSError:
+                pass
+        return {"status": row['status'], "process": process, "checked_at": runner.now(), "log": log,
+                "message": "Terminal output remains in the terminal and agent transcript." if row['mode'] == 'terminal' else "Showing up to the last 16 KB of the background log."}
 
     @app.get("/api/reruns/queue/count")
     def rerun_queue_count():
@@ -1821,15 +2018,42 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                     "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
         results = []
         for q in rows:
-            opts = queue_options(q)
             try:
-                results.append({"id": q["id"], **start_replay(c, q["prompt_id"], opts)})
+                if q["kind"] == "judge":
+                    base, other = q["prompt_id"], q["other_prompt_id"]
+                    runs = rating_inputs(c, base, other)
+                    if base == other or len(runs) != 2 or not all(row["answer"] for row in runs.values()):
+                        raise HTTPException(400, "Both prompts must still have final answers")
+                    for pid in (base, other):
+                        visible = c.execute("SELECT source FROM pv WHERE id=?", (pid,)).fetchone()
+                        if not visible or visible["source"] == "rerunly-examples":
+                            raise HTTPException(400, "Both real prompts must still be in the history")
+                    existing = rating_of(c, base, other)
+                    if existing and existing["status"] == "rating":
+                        raise HTTPException(400, "This pair is already being judged; launch this queued run when it finishes")
+                    rating = start_rating(base, other, force=True, model=q["model"] or "")
+                    if rating is None:
+                        raise HTTPException(400, "Could not start the judge")
+                    results.append({"id": q["id"], "kind": "judge", "mode": "background", "prompt_id": base})
+                else:
+                    results.append({"id": q["id"], "kind": "prompt", **start_replay(c, q["prompt_id"], queue_options(q))})
             except HTTPException as e:
                 results.append({"id": q["id"], "prompt_id": q["prompt_id"], "error": e.detail})
                 continue  # keep failed items queued so a batch launch can be retried
             with c:
                 c.execute("DELETE FROM replay_queue WHERE id = ?", (q["id"],))
         return {"results": results, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
+
+    @app.get("/api/ratings/estimate")
+    def estimate_rating(base: str, other: str, model: str = ""):
+        if model and not replay.MODEL_RE.match(model):
+            raise HTTPException(400, "unknown judge model")
+        c = conn()
+        result = judge_usage_estimate(c, base, other, model, {entry["agent"]: entry for entry in usage_limits()})
+        if result["estimate"] is None:
+            raise HTTPException(400, "both runs need a final answer to be rated (and two different runs)")
+        return {"agent": result["agent"], "model": result["model"], "input_tokens": result["estimate"]["input_tokens"],
+                "output_tokens": result["estimate"]["output_tokens"], "forecast": result["forecast"]}
 
     @app.post("/api/ratings")
     async def rate_pair(request: Request):
@@ -1851,6 +2075,62 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             raise HTTPException(400, "both runs need a final answer to be rated (and two different runs)")
         return rating
 
+    @app.get("/api/ratings/history")
+    def rating_history():
+        c = conn()
+        rows = c.execute("SELECT base_id,other_id,score,verdict,quality,look,summary,differences,model,cost_usd,rated_at,input_hash,duration_ms,total_tokens "
+                         "FROM judge_rating_history WHERE origin='explicit' UNION ALL "
+                         "SELECT base_id,other_id,score,verdict,quality,look,summary,differences,model,cost_usd,rated_at,input_hash,duration_ms,total_tokens "
+                         "FROM run_ratings WHERE status='done' AND origin='explicit'").fetchall()
+        groups = {}
+        for row in rows:
+            base, other = row["base_id"], row["other_id"]
+            runs = rating_inputs(c, base, other)
+            if len(runs) != 2 or (not examples and row["input_hash"] != judge.input_hash(runs)):
+                continue
+            key = (base, other)
+            if key not in groups:
+                feedback = c.execute("SELECT human_score,note,input_hash FROM judge_feedback WHERE base_id=? AND other_id=?", key).fetchone()
+                groups[key] = {"base": base, "other": other, "base_text": runs[base]["text"], "other_text": runs[other]["text"],
+                               "human_feedback": {"human_score": feedback["human_score"], "note": feedback["note"]}
+                               if feedback and feedback["input_hash"] == judge.input_hash(runs) else None, "ratings": []}
+            rating = dict(row)
+            rating["differences"] = json.loads(rating["differences"] or "[]")
+            groups[key]["ratings"].append(rating)
+        for group in groups.values():
+            group["ratings"].sort(key=lambda rating: rating["rated_at"] or "", reverse=True)
+        return sorted(groups.values(), key=lambda group: group["ratings"][0]["rated_at"] or "", reverse=True)
+
+    @app.put("/api/ratings/feedback")
+    async def save_rating_feedback(request: Request):
+        body = await dashboard_json(request)
+        base, other = str(body.get("base") or ""), str(body.get("other") or "")
+        score, note = body.get("score"), body.get("note", "")
+        if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
+            raise HTTPException(400, "Score must be a whole number from 0 to 100")
+        if not isinstance(note, str) or len(note) > 2000:
+            raise HTTPException(400, "Note must be at most 2000 characters")
+        c = conn()
+        rating = rating_of(c, base, other)
+        if not rating or rating["status"] != "done":
+            raise HTTPException(400, "A completed judge rating is required")
+        fingerprint = judge.input_hash(rating_inputs(c, base, other))
+        with c:
+            c.execute("INSERT INTO judge_feedback(base_id,other_id,input_hash,model,judge_score,human_score,note,updated_at) "
+                      "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(base_id,other_id) DO UPDATE SET "
+                      "input_hash=excluded.input_hash,model=excluded.model,judge_score=excluded.judge_score,"
+                      "human_score=excluded.human_score,note=excluded.note,updated_at=excluded.updated_at",
+                      (base, other, fingerprint, rating["model"] or "", rating["score"], score, note.strip(), runner.now()))
+        return rating_of(c, base, other)
+
+    @app.delete("/api/ratings/feedback")
+    async def delete_rating_feedback(request: Request):
+        body = await dashboard_json(request)
+        c = conn()
+        with c:
+            c.execute("DELETE FROM judge_feedback WHERE base_id=? AND other_id=?", (str(body.get("base") or ""), str(body.get("other") or "")))
+        return {"ok": True}
+
     @app.get("/api/compare")
     def compare_runs(a: str, b: str):
         """Two runs side by side: their figures, files and answers, their rating, and the runs related to the
@@ -1867,20 +2147,29 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             d["rerun_of"] = dict(x) if x else None
             return d
         first, second = run(a), run(b)
-        original = (first["rerun_of"] or {}).get("prompt_id") or a
-        related = [original] + [r[0] for r in c.execute(
-            "SELECT (SELECT id FROM pv WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) FROM replays x "
-            "WHERE x.prompt_id = ? ORDER BY x.launched_at", (original,)) if r[0]]
-        related += [r[0] for r in c.execute(
-            "SELECT r.prompt_id FROM tag_reference r JOIN tags t ON t.tag = r.tag AND t.prompt_id = ? JOIN pv p ON p.id = r.prompt_id",
-            (original,))]
+        originals = list(dict.fromkeys((run_data["rerun_of"] or {}).get("prompt_id") or run_data["id"]
+                                       for run_data in (first, second)))
+        related, references = [], set()
+        for original in originals:
+            members = [original] + [r[0] for r in c.execute(
+                "SELECT (SELECT id FROM pv WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) FROM replays x "
+                "WHERE x.prompt_id = ? ORDER BY x.launched_at", (original,)) if r[0]]
+            related.extend(members)
+            saved = c.execute("SELECT reference_id FROM rerun_reference WHERE prompt_id=?", (original,)).fetchone()
+            references.add(saved[0] if saved and saved[0] in members else original)
+            tag_refs = [r[0] for r in c.execute(
+                "SELECT r.prompt_id FROM tag_reference r JOIN tags t ON t.tag = r.tag AND t.prompt_id = ? JOIN pv p ON p.id = r.prompt_id",
+                (original,))]
+            related.extend(tag_refs)
+            references.update(pid for pid in tag_refs if pid not in members)
         candidates = []
         for pid in dict.fromkeys([*related, a, b]):
-            r = c.execute("SELECT id, started_at, total_cost_usd, session_id FROM pv WHERE id = ?", (pid,)).fetchone()
+            r = c.execute("SELECT id, text, started_at, total_cost_usd, session_id FROM pv WHERE id = ?", (pid,)).fetchone()
             if r:
                 is_rerun = c.execute("SELECT 1 FROM replays WHERE session_id = ?", (r["session_id"],)).fetchone()
-                candidates.append({"id": r["id"], "started_at": r["started_at"], "total_cost_usd": r["total_cost_usd"],
-                                   "kind": "original" if pid == original else "rerun" if is_rerun else "reference"})
+                candidates.append({"id": r["id"], "text": r["text"], "started_at": r["started_at"], "total_cost_usd": r["total_cost_usd"],
+                                   "kind": "original" if pid in originals else "rerun" if is_rerun else "reference",
+                                   "is_reference": pid in references})
         return {"a": first, "b": second, "rating": rating_of(c, a, b), "candidates": candidates}
 
     @app.get("/api/skill-versions/{hash}")

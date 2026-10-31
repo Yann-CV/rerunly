@@ -158,12 +158,12 @@ def test_codex_judge_stream(tmp_path, monkeypatch):
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
-        events = [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(rating)}}, {"type": "turn.completed"}]
+        events = [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(rating)}}, {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": 20}}]
         return type("Result", (), {"returncode": 0, "stdout": "\n".join(json.dumps(e) for e in events), "stderr": ""})()
 
     monkeypatch.setattr(judge.subprocess, "run", run)
     result = judge.rate("Fix", {"answer": "Fixed"}, {"answer": "Fixed"}, "codex:gpt-6-luna", tmp_path)
-    assert result["score"] == 95 and result["cost_usd"] is None
+    assert result["score"] == 95 and result["cost_usd"] is None and result["total_tokens"] == 120
     argv, opts = calls[0]
     assert "--ephemeral" in argv and "read-only" in argv and opts["timeout"] == 600
     assert 'approval_policy="never"' in argv
@@ -343,3 +343,9 @@ def test_reimport_repairs_marker_collision_and_queues_draft(tmp_path, reviewer_i
             assert ingest(c, force=True)['updated'] == 2
             assert client.get('/api/prompts/' + pid).status_code == 200
     assert c.execute('SELECT COUNT(*) FROM replay_queue').fetchone()[0] == 1
+
+
+def test_judge_token_counts_include_separate_claude_cache():
+    assert judge.usage_tokens({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 7}, cached_separate=True) == 42
+    assert judge.usage_tokens({}, cached_separate=True) is None
+    assert judge.usage_tokens(None, cached_separate=False) is None

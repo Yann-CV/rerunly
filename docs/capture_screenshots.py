@@ -8,6 +8,9 @@ Run from the repository root:
 
 Refresh only the prompt page and its expanded rerun panel with --prompt-only.
 Use --model-checks-only for the Reruns page and illustrative availability results.
+Use --compare-only for the comparison page and judge result.
+Use --rerun-comparison-only for the all-reruns comparison.
+Use --rerun-detail-only for the rerun details page.
 
 Requires Chrome, Chromium, or `uv run --with playwright playwright install chromium`.
 No transcripts are imported, agents launched, or agent settings changed.
@@ -124,12 +127,140 @@ def main():
                     page.evaluate("window.scrollTo(0, 0)")
                     page.screenshot(path=str(output / "reruns.png"), full_page=True)
 
+                if "--rerun-detail-only" in sys.argv:
+                    capture("rerun-detail", "/rerun/rerunly-example:blocked-rerun:session")
+                    page.get_by_role("button", name="Check process and logs").click()
+                    page.get_by_text("Recorded status:", exact=False).wait_for()
+                    for width in (360, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.locator(".rerun-diagnostics").evaluate("el => el.getBoundingClientRect().right <= innerWidth + 1")
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
+
+                if "--rerun-comparison-only" in sys.argv:
+                    capture("rerun-comparison", "/rerun-comparison/rerunly-example:review-skill-v1")
+                    reference = page.locator(".rc-reference-feature")
+                    assert "Original" in reference.inner_text()
+                    page.locator(".rc-original-prompt summary").click()
+                    assert page.locator(".rc-original-prompt pre").is_visible()
+                    attempt = page.locator(".rc-table tbody tr").nth(1)
+                    attempt.locator(".rc-prompt summary").click()
+                    assert attempt.locator(".rc-prompt pre").inner_text().strip()
+                    page.locator('[data-set-rerun-reference="rerunly-example:review-skill-v2"]').click()
+                    page.get_by_role("heading", name="Reference run · Attempt 1").wait_for()
+                    page.locator('.rc-table a[href^="#/compare?"]').first.click()
+                    page.get_by_role("link", name="All reruns comparison").wait_for()
+                    page.locator("#swap").click()
+                    page.get_by_role("link", name="All reruns comparison").click()
+                    page.get_by_role("heading", name="Reference run · Attempt 1").wait_for()
+                    for width in (390, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Comparison overflows viewport"
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
+
+                if "--compare-only" in sys.argv:
+                    capture("compare", "/compare?a=rerunly-example:review-skill-v1&b=rerunly-example:cheap-but-incomplete")
+                    assert page.locator(".compare-role-reference select").input_value() == "rerunly-example:review-skill-v1"
+                    assert page.locator(".compare-role-other select").input_value() == "rerunly-example:cheap-but-incomplete"
+                    assert "Reference ·" in page.locator(".compare-figures th").nth(1).inner_text()
+                    assert "Compared run ·" in page.locator(".compare-figures th").nth(2).inner_text()
+                    back = page.get_by_role("link", name="All reruns comparison")
+                    assert back.get_attribute("href") == "#/rerun-comparison/rerunly-example%3Areview-skill-v1"
+                    judge = page.locator(".judge-card")
+                    assert judge.locator(".judge-score .big").is_visible()
+                    assert judge.locator(".judge-summary").is_visible()
+                    assert judge.locator(".judge-diffs li").count() > 0
+                    assert judge.get_by_text("Take another look").is_visible()
+                    assert judge.get_by_role("button", name="Judge again").is_disabled()
+                    judge.get_by_text("Estimated limit impact").wait_for()
+                    judge.get_by_text("Rough estimate:", exact=False).wait_for()
+                    assert "unavailable" in judge.locator("#judge-impact-content").inner_text().lower()
+                    for width in (360, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert judge.evaluate("el => el.getBoundingClientRect().right <= innerWidth + 1"), "Judge card overflows viewport"
+                    page.locator("#swap").click()
+                    page.wait_for_function("document.querySelector('#pick-a')?.value === 'rerunly-example:cheap-but-incomplete'")
+                    assert page.locator("#pick-b").input_value() == "rerunly-example:review-skill-v1"
+                    # Add a second illustrative judge run for this pair, without calling an agent.
+                    connection = db.connect(database)
+                    with connection:
+                        connection.execute("INSERT INTO judge_rating_history(base_id,other_id,score,verdict,quality,look,summary,differences,model,rated_at,origin,duration_ms,total_tokens,cost_usd) "
+                            "SELECT base_id,other_id,65,'minor','worse',0,'The output omits a required check.',differences,'Example judge B',rated_at,'explicit',7300,3200,0.023 "
+                            "FROM run_ratings WHERE base_id=? AND other_id=?",
+                            ("rerunly-example:review-skill-v1", "rerunly-example:cheap-but-incomplete"))
+                    connection.close()
+                    page.goto(base + "#/reruns?judge_history=1")
+                    pair = page.locator(".judge-history-group").filter(has_text="2 judge runs")
+                    pair.locator("summary").click()
+                    pair.get_by_role("link", name="Compare all judge runs").click()
+                    page.locator(".judge-comparison-run").first.wait_for()
+                    assert page.locator(".judge-comparison-run").count() == 2
+                    outputs = page.locator(".judge-output-column")
+                    assert outputs.count() == 2
+                    second_run = outputs.nth(0).locator("option").filter(has_text="Example judge B").get_attribute("value")
+                    outputs.nth(0).locator("select").select_option(second_run)
+                    assert outputs.nth(0).get_by_text("The output omits a required check.").is_visible()
+                    outputs.nth(0).locator("select").select_option("0")
+                    assert page.get_by_text("Average score").is_visible()
+                    assert page.locator(".judge-metric-chart").count() == 3
+                    assert page.locator(".judge-metric-row").count() == 6
+                    assert page.get_by_role("link", name="Judge run history").get_attribute("href") == "#/reruns?judge_history=1"
+                    page.set_viewport_size({"width": 1440, "height": 1100})
+                    page.screenshot(path=str(output / "judge-comparison.png"), full_page=True)
+                    for width in (360, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Judge comparison overflows viewport"
+                    action = page.locator(".judge-comparison-action")
+                    action.get_by_text("Estimated limit impact").wait_for()
+                    assert action.get_by_role("button", name="Judge again").is_disabled()
+                    calls = []
+                    def mock_judge(route):
+                        calls.append(route.request.post_data_json)
+                        route.fulfill(json={"added": 1} if route.request.url.endswith("/queue/judge") else {"status": "rating"})
+                    page.route("**/api/reruns/queue/judge", mock_judge)
+                    page.route("**/api/ratings", mock_judge)
+                    action.locator("#queue-judge, #judge-form button[type=submit]").evaluate_all("buttons => buttons.forEach(button => button.disabled = false)")
+                    action.get_by_role("button", name="Add judgment to queue").click()
+                    action.get_by_text("Judgment added to the", exact=False).wait_for()
+                    action.get_by_role("button", name="Judge again").click()
+                    assert len(calls) == 2 and all(call["base"] == "rerunly-example:review-skill-v1" and call["other"] == "rerunly-example:cheap-but-incomplete" for call in calls)
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
+
                 if "--model-checks-only" in sys.argv:
                     connection = db.connect(database)
                     with connection:
                         connection.execute("INSERT INTO replay_queue(prompt_id,model,effort,added_at,mode,permission) SELECT id,'codex:gpt-6.1-sol','medium',started_at,'terminal','' FROM prompts WHERE id='rerunly-example:broad-prompt'")
+                        connection.execute("INSERT INTO replay_queue(prompt_id,other_prompt_id,kind,model,added_at) SELECT id,'rerunly-example:cheap-but-incomplete','judge','codex:gpt-6.1-sol',started_at FROM prompts WHERE id='rerunly-example:review-skill-v1'")
                     connection.close()
                     capture("reruns", "/reruns")
+                    assert page.locator(".judge-queue-card .run-kind").is_visible()
+                    assert page.locator(".run-kind-prompt").is_visible()
+                    assert "tokens" in page.locator(".judge-queue-card").inner_text()
+                    page.get_by_role("checkbox", name="Select judge run 2").check()
+                    page.get_by_role("heading", name="Selected judgments").wait_for()
+                    assert page.locator("#selected-quota-forecast").is_visible()
+                    assert page.get_by_role("button", name="Prompt run history").is_visible()
+                    assert page.get_by_role("button", name="Judge run history").is_visible()
+                    assert page.locator(".judge-history-link").count() == 0
+                    page.get_by_role("button", name="Judge run history").click()
+                    page.locator("#judge-history[open]").wait_for()
+                    page.locator(".judge-history-group summary").first.click()
+                    page.locator(".judge-history-run").first.wait_for()
+                    assert page.get_by_role("link", name="Compare all judge runs").count() == 1
+                    page.get_by_role("button", name="Prompt run history").click()
+                    page.locator("#rerun-history[open]").wait_for()
+                    for width in (360, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Mixed queue overflows viewport"
+                    page.set_viewport_size({"width": 1440, "height": 1100})
                     capture_model_checks()
                     if errors:
                         raise RuntimeError("Browser errors: " + "; ".join(errors))
@@ -166,7 +297,7 @@ def main():
                     browser.close()
                     return
 
-                capture("home", "/")
+                capture("home", "/", focus=".home-reruns")
                 # An incomplete illustrative item exposes queue estimates and configuration needs without launching work.
                 connection = db.connect(database)
                 with connection:

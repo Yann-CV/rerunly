@@ -617,6 +617,7 @@ function splitSummaryHtml(groups) {
 const groupedLayout = () => listState.layout === "grouped" && !listState.lockTag;
 
 function filtersFromQuery(query) {
+  listState.tagCounts = null;
   listState.categoryTags = categoryTagsFromQuery(query);
   listState.exclude_reruns = query.get("exclude_reruns") === "true";
   listState.q = query.get("q") || "";
@@ -877,6 +878,32 @@ function selectedCategoryTags(state, cat) {
   return selected;
 }
 
+/** What a filter menu counts for `scope`: every active filter, the page's pinned tag apart from the others. */
+function tagCountsQuery(state, scope) {
+  const query = new URLSearchParams({ scope });
+  const since = RANGES[state.range][1];
+  if (state.q) query.set("q", state.q);
+  if (since) query.set("since", since().toISOString());
+  if (state.lockTag) query.set("tag", state.lockTag);
+  if (state.project) query.set("project", state.project);
+  if (state.exclude_reruns) query.set("exclude_reruns", "true");
+  Object.values(state.categoryTags).flat().forEach((tag) => query.append("tags", tag));
+  if (state.tag && state.tag !== state.lockTag) query.append("tags", state.tag);
+  return query;
+}
+
+/** Blank until the counts for the current filters have loaded. */
+const tagCount = (state, tag) => state.tagCounts ? state.tagCounts[tag] || 0 : "";
+
+/** Updates the counts in place: an open menu keeps its search and scroll position. */
+function showTagCounts(bar, state) {
+  bar.querySelectorAll("[data-category-tag]:not([data-category-tag=''])").forEach((button) => {
+    const count = tagCount(state, button.dataset.categoryTag);
+    button.querySelector(".mi-count").textContent = count;
+    button.classList.toggle("no-match", count === 0);
+  });
+}
+
 function tagFilterMenusHtml(state) {
   const categories = [...new Set(["project", "model", "skill", "agent", "persona", "cmd", ...state.tags.map((t) => promptTagCategory(t.tag)), ...Object.keys(state.categoryTags)])].filter(Boolean);
   return [...categories, ""].map((cat) => {
@@ -885,8 +912,8 @@ function tagFilterMenusHtml(state) {
     const choices = state.tags.filter((t) => promptTagCategory(t.tag) === cat && t.tag !== state.lockTag);
     const body = `<input type="search" class="menu-search" placeholder="Find ${esc(label.toLowerCase())}…" aria-label="Find ${esc(label.toLowerCase())}">
       <button type="button" class="menu-item ${!selected.length ? "on" : ""}" data-set-category="${esc(cat)}" data-category-tag="">All</button>
-      <div class="menu-list">${choices.map((t) => `<button type="button" role="checkbox" aria-checked="${selected.includes(t.tag)}" class="menu-item ${selected.includes(t.tag) ? "on" : ""}" data-set-category="${esc(cat)}" data-category-tag="${esc(t.tag)}">
-        <span class="filter-check" aria-hidden="true">${selected.includes(t.tag) ? "☑" : "☐"}</span><span class="mi-text">${esc(cat ? t.tag.slice(cat.length + 1) : t.tag)}</span><span class="mi-count">${t.prompts}</span></button>`).join("") || '<p class="muted">No tags</p>'}</div>`;
+      <div class="menu-list">${choices.map((t) => `<button type="button" role="checkbox" aria-checked="${selected.includes(t.tag)}" class="menu-item ${selected.includes(t.tag) ? "on" : ""} ${tagCount(state, t.tag) === 0 ? "no-match" : ""}" data-set-category="${esc(cat)}" data-category-tag="${esc(t.tag)}">
+        <span class="filter-check" aria-hidden="true">${selected.includes(t.tag) ? "☑" : "☐"}</span><span class="mi-text">${esc(cat ? t.tag.slice(cat.length + 1) : t.tag)}</span><span class="mi-count">${tagCount(state, t.tag)}</span></button>`).join("") || '<p class="muted">No tags</p>'}</div>`;
     const value = selected.length > 1 ? `${selected.length} selected` : selected.length ? (cat ? selected[0].slice(cat.length + 1) : selected[0]) : "";
     return pillMenu(`pop-category-${cat || "tag"}`, label, value, body);
   }).join("");
@@ -927,13 +954,16 @@ async function loadPrompts() {
   const all = listState.layout === "grouped" || listState.lockTag;
   const filters = promptQuery();
   filters.delete("sort");
-  const [data, overview] = await Promise.all([
+  const [data, overview, tagCounts] = await Promise.all([
     api(`/api/prompts?${promptQuery({ limit: all ? 100000 : LIST_PAGE, offset: 0 })}`),
     api(`/api/overview?${filters}`),
+    api(`/api/tag-counts?${tagCountsQuery(listState, "prompts")}`),
   ]);
   listState.items = data.items;
   listState.summary = data.summary;
   listState.overview = overview;
+  listState.tagCounts = tagCounts;
+  showTagCounts(document.getElementById("prompt-toolbar"), listState);
 }
 
 async function renderPrompts({ reload = true } = {}) {
@@ -1641,23 +1671,40 @@ function judgeBadge(r) {
   return `<span class="rerun-status ${cls}" title="${esc(r.summary || "")}">${icon} ${label} · ${r.score}${quality}</span>`;
 }
 
-/** The judge's rating in full, and a way to judge again with a model of your choice. */
-function judgeCardHtml(r, models, defaultModel) {
+function judgeActionHtml(r, models, defaultModel) {
   const opt = (v, label, cur) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(label)}</option>`;
   const current = r?.model || defaultModel || "";
   const list = [...new Set([current, ...models].filter(Boolean))];
+  return `<form class="judge-form" id="judge-form">
+      <div class="judge-action-intro"><span class="judge-action-icon" aria-hidden="true">↻</span><div><strong>${r && r.status !== "failed" ? "Take another look" : "Review these outputs"}</strong>
+        <span>${EXAMPLES ? "Examples use an illustrative verdict." : "Choose a model to compare both prompts and answers. This adds usage and may incur cost."}</span></div></div>
+      <div class="judge-action-controls"><label>Judge with <select id="judge-model" data-default-model="${esc(defaultModel || "")}">${opt("", `Default (${defaultModel || "Claude Code's"})`, "")}${list.map((m) => opt(m, m, "")).join("")}</select></label>
+        <button class="btn" type="button" id="queue-judge" ${EXAMPLES ? "disabled" : ""}>＋ Add judgment to queue</button>
+        <button class="btn primary" type="submit" ${r?.status === "rating" || EXAMPLES ? "disabled" : ""}><span aria-hidden="true">✦</span> ${r?.status === "rating" ? "Judging…" : r && r.status !== "failed" ? "Judge again" : "Judge them"}</button></div>
+      <p class="muted" id="queue-judge-status" role="status" hidden></p>
+      <div class="judge-impact" aria-live="polite"><div class="judge-impact-heading"><span aria-hidden="true">◷</span><div><strong>Estimated limit impact</strong><small>Before you run the judge</small></div></div><div id="judge-impact-content"><p class="muted">Estimating usage…</p></div></div>
+    </form>`;
+}
+
+/** The judge's rating in full, and a way to judge again with a model of your choice. */
+function judgeCardHtml(r, models, defaultModel, base, other) {
   const body = !r ? '<p class="muted">Not judged yet.</p>'
     : r.status === "rating" ? `<p class="muted">${esc(r.model || "The judge")} is comparing the two outputs…</p>`
     : r.status === "failed" ? `<p class="status-warn">The judge failed: ${esc(r.error || "no reason given")}</p>`
-    : `<div class="judge-score"><span class="big">${r.score}</span><span class="unit">/ 100 same substance</span> ${judgeBadge(r)}</div>
-       <p class="judge-summary">${esc(r.summary)}</p>
-       ${r.differences.length ? `<ul class="judge-diffs">${r.differences.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
-       <p class="muted judge-meta">Judged by ${esc(r.model || "Claude Code's default model")} · ${esc(fmtDate(r.rated_at))}${r.cost_usd != null ? ` · ${fmtCost(r.cost_usd)}` : ""}</p>`;
-  return `<div class="judge-card"><div class="judge-head"><strong>LLM judge</strong>
-      <span class="muted">Says whether the second output keeps the first one's substance, so you know whether to read the differences.</span></div>
+    : `<div class="judge-result"><div class="judge-score"><span class="judge-label">Substance match</span><div><span class="big">${esc(r.score)}</span><span class="unit"> / 100</span></div><span class="judge-score-caption">Same substance</span>${judgeBadge(r)}</div>
+       <div class="judge-findings"><div><span class="judge-label">Conclusion</span><p class="judge-summary">${esc(r.summary)}</p></div>
+       ${r.differences.length ? `<div class="judge-observations"><span class="judge-label">Observations</span><ul class="judge-diffs">${r.differences.map((d) => `<li>${esc(d)}</li>`).join("")}</ul></div>` : ""}</div></div>
+       <p class="muted judge-meta">Judged by ${esc(r.model || "Claude Code's default model")} · ${esc(fmtDate(r.rated_at))}${r.cost_usd != null ? ` · ${fmtCost(r.cost_usd)}` : ""}</p>
+       <form class="human-rating" id="human-rating"><div class="human-rating-heading"><span class="human-rating-icon" aria-hidden="true">✎</span><div><strong>Add your judgment</strong><p>How similar are these outputs in substance? Your score and reason provide context the next time this pair is judged.</p></div></div>
+         <div class="human-rating-fields"><label>Your score <span><input name="score" type="number" min="0" max="100" step="1" required value="${esc(r.human_feedback?.human_score ?? r.score)}"> / 100</span></label>
+         <label class="human-rating-note">Reason <span class="muted">(optional)</span><textarea name="note" rows="2" maxlength="2000" placeholder="What should the judge have considered?">${esc(r.human_feedback?.note || "")}</textarea></label></div>
+         <div class="human-rating-actions"><button class="btn primary" type="submit">${r.human_feedback ? "Update my rating" : "Save my rating"}</button>${r.human_feedback ? '<button class="btn" type="button" data-remove-feedback>Remove rating</button>' : ""}<span class="muted" role="status" id="human-rating-status"></span></div>
+         <p class="human-rating-calibration">Your feedback applies to these exact prompts and answers. Existing judge scores stay as recorded.</p></form>`;
+  return `<div class="judge-card"><div class="judge-head"><span class="judge-icon" aria-hidden="true">✦</span><div><span class="judge-label">Output review</span><strong>LLM judge</strong>
+      <span class="muted">Compares both prompts and whether the second output keeps the first one's substance.</span></div></div>
     ${body}
-    <form class="judge-form" id="judge-form"><label>Judge with <select id="judge-model" data-default-model="${esc(defaultModel)}">${opt("", `Default (${defaultModel || "Claude Code's"})`, "")}${list.map((m) => opt(m, m, "")).join("")}</select></label>
-      <button class="btn">${r && r.status !== "failed" ? "Judge again" : "Judge them"}</button></form></div>`;
+    ${r?.status === "done" && r.origin === "explicit" && base && other ? `<p class="judge-meta"><a href="${esc(judgeComparisonUrl(base, other))}">Compare judge runs for these prompts →</a></p>` : ""}
+    ${judgeActionHtml(r, models, defaultModel)}</div>`;
 }
 
 /** Two runs side by side (`a` first): figures, files edited, and their final answers. */
@@ -1673,7 +1720,11 @@ function compareRunsHtml(a, b, labels = ["Original", "Rerun"]) {
     return `<li class="file-${where[0]}"><code>${esc(f)}</code> <span class="muted">${where[1]}</span></li>`;
   }).join("");
   const same = (a.answer || "").trim() === (b.answer || "").trim();
-  return `<table class="compare-figures"><thead><tr><th></th><th class="num">${esc(labels[0])}</th><th class="num">${esc(labels[1])}</th><th class="num">Change</th></tr></thead>
+  const samePrompt = (a.text || "").trim() === (b.text || "").trim();
+  return `<div class="compare-requests"><div class="compare-answers-head"><strong>Prompts</strong>${samePrompt ? '<span class="trend down">identical</span>' : '<span class="muted">Compare the requests given to each run</span>'}</div>
+      <div class="answers"><div><span class="muted">${esc(labels[0])}</span><pre>${esc(a.text || "(no prompt recorded)")}</pre></div>
+      <div><span class="muted">${esc(labels[1])}</span><pre>${esc(b.text || "(no prompt recorded)")}</pre></div></div></div>
+    <table class="compare-figures"><thead><tr><th></th><th class="num">${esc(labels[0])}</th><th class="num">${esc(labels[1])}</th><th class="num">Change</th></tr></thead>
       <tbody>${rows.map(([label, x, y, fmt]) => `<tr><td>${label}</td><td class="num">${x == null ? "–" : fmt(x)}</td><td class="num">${y == null ? "–" : fmt(y)}</td>
         <td class="num">${x && y != null ? refDelta(y, x, { against: "" }) : ""}</td></tr>`).join("")}</tbody></table>
     <div class="compare-files"><strong>Files edited</strong>${files ? `<ul>${files}</ul>` : '<p class="muted">Neither run edited a file.</p>'}</div>
@@ -1697,11 +1748,53 @@ function bindCompare(base, other, after) {
     diff.hidden = !diff.hidden; side.hidden = !diff.hidden;
     toggleDiff.textContent = diff.hidden ? "Show differences" : "Show side by side";
   };
+  const humanForm = document.getElementById("human-rating");
+  if (humanForm) {
+    const status = humanForm.querySelector("#human-rating-status");
+    const saveFeedback = async (method) => {
+      const button = humanForm.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const body = {base, other};
+        if (method === "PUT") { body.score = Number(humanForm.elements.score.value); body.note = humanForm.elements.note.value; }
+        await api("/api/ratings/feedback", {method, body});
+        await after();
+      } catch (error) { status.textContent = error.message; if (button.isConnected) button.disabled = false; }
+    };
+    humanForm.onsubmit = (event) => { event.preventDefault(); saveFeedback("PUT"); };
+    humanForm.querySelector("[data-remove-feedback]")?.addEventListener("click", () => saveFeedback("DELETE"));
+  }
   const form = document.getElementById("judge-form");
   bindModelAccess(document.getElementById("judge-model"), document.getElementById("judge-model")?.dataset.defaultModel || "");
+  const impact = document.getElementById("judge-impact-content"), model = document.getElementById("judge-model");
+  let impactRequest = 0;
+  const updateJudgeImpact = async () => {
+    const request = ++impactRequest;
+    impact.innerHTML = '<p class="muted">Estimating usage…</p>';
+    try {
+      const data = await api(`/api/ratings/estimate?${new URLSearchParams({base, other, model: model.value})}`);
+      if (!impact.isConnected || request !== impactRequest) return;
+      impact.innerHTML = `<p class="judge-impact-tokens"><strong>≈ ${fmtTokens(data.input_tokens + data.output_tokens)} tokens</strong> <span>· ${esc(data.agent)}${data.model ? ` · ${esc(data.model)}` : ""}</span></p>${quotaForecast(data.forecast)}<p class="judge-impact-note">Rough estimate: input uses 1 token per 4 UTF-8 bytes, plus 512 output tokens. Actual tokenization, reasoning and CLI overhead vary; limit forecasts use local observations and may be incomplete.</p>`;
+    } catch (error) {
+      if (!(error instanceof StaleNavigation) && impact.isConnected && request === impactRequest) impact.innerHTML = `<p class="muted">Usage estimate unavailable: ${esc(error.message)}</p>`;
+    }
+  };
+  if (impact && model) { model.addEventListener("change", updateJudgeImpact); updateJudgeImpact(); }
+  const queueJudge = document.getElementById("queue-judge");
+  if (queueJudge) queueJudge.onclick = async () => {
+    if (!model.reportValidity()) return;
+    queueJudge.disabled = true;
+    const status = document.getElementById("queue-judge-status");
+    try {
+      const result = await api("/api/reruns/queue/judge", {method: "POST", body: {base, other, model: model.value}});
+      status.innerHTML = result.added ? 'Judgment added to the <a href="#/reruns">queue</a>.' : 'This judgment is already in the <a href="#/reruns">queue</a>.';
+    } catch (error) { status.textContent = error.message; }
+    status.hidden = false;
+    if (queueJudge.isConnected) queueJudge.disabled = false;
+  };
   if (form) form.onsubmit = async (e) => {
     e.preventDefault();
-    form.querySelector("button").disabled = true;
+    form.querySelector('button[type="submit"]').disabled = true;
     try {
       await api("/api/ratings", { method: "POST", body: { base, other, model: document.getElementById("judge-model").value, force: true } });
     } catch (err) { alert(err.message); }
@@ -1722,7 +1815,7 @@ function compareOriginalHtml(p, models, defaultJudge) {
   const rerun = { ...p, answer: p.answer || o.result || "" };
   return `<h2 class="page-sec" id="compare-original">Compared with the original <a class="link-btn" href="#/compare?a=${encodeURIComponent(o.id)}&b=${encodeURIComponent(p.id)}">Open in Compare</a></h2>
     <div class="card compare-original">
-      ${judgeCardHtml(o.rating, models, defaultJudge)}
+      ${judgeCardHtml(o.rating, models, defaultJudge, o.id, p.id)}
       ${compareRunsHtml(o, rerun)}
     </div>`;
 }
@@ -2355,7 +2448,8 @@ function tagHeadHtml(info) {
         ? "Every run of this task: is it getting cheaper or faster? Select runs to regroup them under another tag."
         : "Every run where this applied: how its cost and time evolve. Select runs to group them under a tag of yours.")}
       <div class="tag-head-title"><span class="tag-dot"></span><h1>${name}</h1>
-        ${cat === "human" ? '<span class="by-you">yours</span>' : `<span class="by-ai">${CATEGORY_INFO[cat].label}</span>`}</div>
+        ${cat === "human" ? '<span class="by-you">yours</span><button type="button" class="link-btn" id="rename-tag">Rename</button>' : `<span class="by-ai">${CATEGORY_INFO[cat].label}</span>`}</div>
+      ${cat === "human" ? `<form id="rename-tag-form" class="rename-tag-form" hidden><label for="rename-tag-input">Edit tag name</label><p>Prompt assignments, rules and history will follow the new name.</p><div class="rename-tag-fields"><input id="rename-tag-input" value="${esc(info.tag)}" required autocomplete="off"><button type="submit" class="btn primary">Save name</button><button type="button" class="btn" id="rename-tag-cancel">Cancel</button></div><p id="rename-tag-error" class="status-warn" role="alert" hidden></p></form>` : ""}
       ${cat === "human"
         ? `<div class="tag-desc-edit"><p class="tag-head-desc" id="tag-desc">${info.description ? esc(info.description) : '<span class="muted">No description yet.</span>'}</p>
             <button type="button" class="link-btn" id="edit-desc">${info.description ? "Edit" : "Add a description"}</button></div>
@@ -2398,6 +2492,38 @@ function referenceCardHtml() {
     <button type="button" class="link-btn" data-ref="${esc(r.id)}">Clear</button></div>`;
 }
 
+function bindTagRename(tag, enc) {
+  const form = document.getElementById("rename-tag-form");
+  const input = document.getElementById("rename-tag-input");
+  const button = document.getElementById("rename-tag");
+  const errorBox = document.getElementById("rename-tag-error");
+  const toggle = (editing) => {
+    form.hidden = !editing;
+    button.hidden = editing;
+    button.setAttribute("aria-expanded", String(editing));
+    errorBox.hidden = true;
+    if (editing) { input.value = tag; input.focus(); input.select(); }
+    else button.focus();
+  };
+  button.setAttribute("aria-controls", "rename-tag-form");
+  button.setAttribute("aria-expanded", "false");
+  button.onclick = () => toggle(true);
+  document.getElementById("rename-tag-cancel").onclick = () => toggle(false);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector('[type="submit"]');
+    errorBox.hidden = true;
+    submit.disabled = true;
+    try {
+      const result = await api(`/api/tags/${enc}/name`, { method: "PUT", body: { name: input.value } });
+      if (result.tag === tag) { toggle(false); return; }
+      location.hash = `#/tag/${encodeURIComponent(result.tag)}`;
+    } catch (error) {
+      if (!(error instanceof StaleNavigation)) { errorBox.textContent = error.message; errorBox.hidden = false; }
+    } finally { submit.disabled = false; }
+  };
+}
+
 async function viewTag(tag, query = new URLSearchParams()) {
   filtersFromQuery(query);
   Object.assign(listState, { lockTag: tag, tag: listState.tag || tag, split: query.get("split") in SPLITS ? query.get("split") : "" });
@@ -2433,6 +2559,7 @@ async function viewTag(tag, query = new URLSearchParams()) {
       </details>
     </div>
     ${tagDialogHtml({ forPrompts: true })}`;
+  if (tagCategory(info) === "human") bindTagRename(tag, enc);
   Object.assign(listState, { selecting: false, selected: new Set() });
   app.querySelectorAll(".tag-page-section").forEach((section) => {
     section.addEventListener("toggle", () => {
@@ -2632,6 +2759,7 @@ const SESSION_SORTS = { recent: "Newest", cost: "Most expensive", prompts: "Most
 const sessState = { tag: "", categoryTags: {}, tags: [], exclude_reruns: false, q: "", project: "", range: "all", sort: "recent", items: [], summary: null, highlights: null };
 
 function sessionFiltersFromQuery(query) {
+  sessState.tagCounts = null;
   sessState.tag = query.get("tag") || "";
   sessState.categoryTags = categoryTagsFromQuery(query);
   sessState.exclude_reruns = query.get("exclude_reruns") === "true";
@@ -2747,8 +2875,12 @@ let sessionProjects = [];
 async function renderSessions({ reload = true } = {}) {
   syncSessionUrl();
   if (reload) {
-    const data = await api(`/api/sessions?${sessionQuery({ limit: LIST_PAGE, offset: 0 })}`);
-    Object.assign(sessState, { items: data.items, summary: data.summary, highlights: data.highlights || null });
+    const [data, tagCounts] = await Promise.all([
+      api(`/api/sessions?${sessionQuery({ limit: LIST_PAGE, offset: 0 })}`),
+      api(`/api/tag-counts?${tagCountsQuery(sessState, "sessions")}`),
+    ]);
+    Object.assign(sessState, { items: data.items, summary: data.summary, highlights: data.highlights || null, tagCounts });
+    showTagCounts(document.getElementById("session-toolbar"), sessState);
   }
   const { items, summary: s } = sessState;
   const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
@@ -3186,15 +3318,15 @@ async function viewSetup() {
 // ---- Home page: every page, and the highlights of the period ----------------------
 
 const HOME_PAGES = [
-  ["prompts", "Prompts", "Every prompt you gave your coding agent with its cost, tokens and time. Search it, filter by project, tag or period, sort by cost, or group by tag to follow a task.",
+  ["prompts", "Prompts", "Explore every prompt with its cost, tokens and time. Search, filter and group runs to follow a task.",
     (o) => `${o.totals.prompts || 0} prompt${o.totals.prompts === 1 ? "" : "s"}`],
-  ["sessions", "Sessions", "One row per agent session: its prompts, the cost of the main agent and each subagent, and the total the agent reports.",
+  ["sessions", "Sessions", "Browse agent sessions, their prompts and the cost of the main agent and recorded subagents.",
     (o) => `${o.totals.sessions || 0} session${o.totals.sessions === 1 ? "" : "s"}`],
-  ["tags", "Tags", "Cost and time by task, project, model or skill. Create your own tags to group the runs of one task and see if your prompt changes paid off.",
+  ["tags", "Tags", "Compare cost and time by task, project, model or skill, and create tags to group related runs.",
     (o) => `${o.tags.length} tag${o.tags.length === 1 ? "" : "s"}`],
-  ["reruns", "Reruns", "Queue prompts to run again, with the same model or another, then launch them together and see what each rerun cost against the original.",
+  ["reruns", "Reruns", "Queue and launch prompts again with different settings, then compare each attempt with the original.",
     () => "Queue and launch"],
-  ["setup", "Setup", "Import your transcripts, install the live-update hook, start at login, turn on the agent's own cost reporting, and edit prices and auto-tag rules.",
+  ["setup", "Setup", "Import transcripts and manage live updates, pricing, auto-tag rules and other settings.",
     () => "Import, hook, prices"],
 ];
 
@@ -3292,9 +3424,9 @@ function quotaForecast(forecast) {
   const pct = (value) => Number(value).toFixed(1);
   return `<div class="quota-forecast">${forecast.windows.map((w) => {
     const samples = (w.models || []).map((m) => `${esc(m.model)}: ${m.samples} sample${m.samples === 1 ? "" : "s"}${m.tokens_per_percentage_point ? ` · ≈ ${fmtTokens(m.tokens_per_percentage_point)} tokens/percentage point` : ""}`).join(" · ");
-    if (w.status !== "estimated") return `<p class="muted">${windowLabel(w.window_minutes)} impact: learning (${samples || "model unknown"}). Needs at least 3 usable observations per model and 3 percentage points of observed usage.</p>`;
+    if (w.status !== "estimated") return `<div class="quota-window"><span class="quota-window-label">${windowLabel(w.window_minutes)} window</span><strong>Learning</strong><p class="muted">${samples || "Model unknown"}. Needs at least 3 usable observations per model and 3 percentage points of observed usage.</p></div>`;
     const projected = w.projected_percent == null ? "" : ` · projected ${pct(w.projected_percent_low)}–${pct(w.projected_percent_high)}% used`;
-    return `<p><strong>${windowLabel(w.window_minutes)}: +${pct(w.additional_percent_low)}–${pct(w.additional_percent_high)} percentage points</strong>${projected}<br><span class="muted">Low confidence · observed range · ${samples}</span>${w.projected_percent_high >= 100 ? '<br><span class="status-warn">May exhaust the remaining allowance.</span>' : ""}${w.may_cross_reset ? '<br><span class="status-warn">Run may cross the reported reset; projection assumes the current window.</span>' : ""}</p>`;
+    return `<div class="quota-window"><span class="quota-window-label">${windowLabel(w.window_minutes)} window</span><strong>+${pct(w.additional_percent_low)}–${pct(w.additional_percent_high)} percentage points</strong><p>${projected.replace(/^ · /, "")}</p><p class="muted">Low confidence · observed range · ${samples}</p>${w.projected_percent_high >= 100 ? '<p class="status-warn">May exhaust the remaining allowance.</p>' : ""}${w.may_cross_reset ? '<p class="status-warn">Run may cross the reported reset; projection assumes the current window.</p>' : ""}</div>`;
   }).join("")}</div>`;
 }
 
@@ -3355,10 +3487,11 @@ function homeLimits(limits) {
 async function viewHome(query = new URLSearchParams()) {
   const range = RANGES[query.get("range")] ? query.get("range") : "all";
   const since = RANGES[range][1];
-  const [o, limits] = await Promise.all([
+  const [o, reruns] = await Promise.all([
     api(`/api/overview${since ? `?${new URLSearchParams({ since: since().toISOString() })}` : ""}`),
-    api("/api/limits").catch((error) => { if (error instanceof StaleNavigation) throw error; return []; }),
+    api("/api/reruns").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; }),
   ]);
+  const originals = [...new Map((reruns?.launched || []).filter((run) => run.original).map((run) => [run.original.id, run.original])).values()];
   const t = o.totals;
   const fact = (label, value, sub = "") => `<div class="hero-fact"><span class="label">${label}</span><span class="value">${value}</span><span class="sub">${sub}</span></div>`;
   const rangeQuery = range === "all" ? "" : `?range=${range}`;
@@ -3371,7 +3504,6 @@ async function viewHome(query = new URLSearchParams()) {
           <p>Cost, tokens and time for every prompt you give your coding agent, so each rerun tells you if your last change made it
             <strong>cheaper</strong>, <strong>faster</strong>, or neither.</p>
         </div>
-        ${limits.length ? `<aside class="hero-limits" aria-label="Usage limits"><span class="hl-label">Usage limits</span>${homeLimits(limits)}</aside>` : ""}
       </header>
       <div class="home-range segmented" role="group" aria-label="Period">${Object.entries(RANGES).map(([key, [label]]) =>
         `<button type="button" data-range="${key}" aria-pressed="${key === range}">${label}</button>`).join("")}</div>
@@ -3390,10 +3522,20 @@ async function viewHome(query = new URLSearchParams()) {
         <div class="top-tags">${homeTopTags(o, { by: "cost" })}</div>` : ""}`
       : `<div class="empty-state"><div class="empty-icon">⌕</div><p>${range === "all" ? "Nothing imported yet." : "No prompt in this period."}</p>
           ${range === "all" ? '<p>Go to <a href="#/setup">Setup</a> and press <strong>Import now</strong>.</p>' : ""}</div>`}
-      <h2 class="page-sec">Pages</h2>
-      <nav class="page-cards" aria-label="Pages">${HOME_PAGES.filter(([id]) => !(EXAMPLES && id === "setup")).map(([id, label, text, stat]) =>
-        `<a class="page-card" href="#/${id}${id === "prompts" ? rangeQuery : ""}"><span class="pc-head"><strong>${label}</strong><span class="mi-count">${esc(stat(o))}</span></span>
-          <span class="pc-text">${text}</span><span class="hl-link">Open ${label} →</span></a>`).join("")}</nav>
+      <section class="home-reruns" aria-labelledby="home-reruns-title">
+        <div class="home-reruns-intro"><span class="rerun-eyebrow">Run it again. Learn what works.</span>
+          <h2 id="home-reruns-title">Turn changes into better results</h2>
+          <p>Rerun the same prompt with different settings, then compare cost, time, tokens and output quality to see what paid off.</p>
+          <a href="#/reruns">Explore reruns →</a></div>
+        <div class="home-reruns-history"><div class="home-history-heading"><div><span class="home-history-kicker">Your experiments</span><h3>Rerun history</h3></div>${reruns === null ? "" : `<span class="home-history-count">${originals.length} ${originals.length === 1 ? "prompt" : "prompts"}</span>`}</div>
+          ${reruns === null ? '<p class="muted">Could not load rerun history. Visit <a href="#/reruns">Reruns</a> to try again.</p>' : originals.length
+            ? `<ul>${originals.map((p, i) => `<li><a href="#/rerun-comparison/${encodeURIComponent(p.id)}"><span class="home-history-index" aria-hidden="true">${String(i + 1).padStart(2, "0")}</span><span class="home-history-prompt">${esc(p.text)}</span><span class="home-history-arrow" aria-hidden="true">↗</span></a></li>`).join("")}</ul>`
+            : '<p class="muted">No reruns yet. Open a prompt to try your first rerun.</p>'}</div>
+      </section>
+      <h2 class="page-sec">Explore Rerunly</h2>
+      <nav class="page-cards" aria-label="Explore Rerunly">${HOME_PAGES.filter(([id]) => !(EXAMPLES && id === "setup")).map(([id, label, text, stat]) =>
+        `<a class="page-card" href="#/${id}${id === "prompts" ? rangeQuery : ""}"><span class="pc-main"><span class="pc-head"><strong>${label}</strong><span class="mi-count">${esc(stat(o))}</span></span>
+          <span class="pc-text">${text}</span></span><span class="pc-arrow" aria-hidden="true">→</span></a>`).join("")}</nav>
     </div>`;
   app.querySelectorAll("[data-range]").forEach((b) => b.onclick = () => {
     location.hash = b.dataset.range === "all" ? "#/" : `#/?range=${b.dataset.range}`;
@@ -3421,7 +3563,7 @@ function rerunStatusHtml(x, { details = true } = {}) {
     ? `<span class="rerun-needs">${esc(x.result.slice(0, 200))}</span>` : ""}`;
 }
 
-const rerunState = { picked: new Set(), historyOpen: true, historyGroups: new Map() };
+const rerunState = { picked: new Set(), historyOpen: true, historyGroups: new Map(), judgeHistoryOpen: false, judgeHistoryGroups: new Map() };
 
 function rerunSettings(x) {
   const skills = Array.isArray(x.skills) ? x.skills : [];
@@ -3468,6 +3610,7 @@ async function viewRerun(sessionId) {
       ${x.denials?.blocked ? `<p>${esc(x.denials.blocked)}</p>` : ""}
       ${x.denials?.denied?.length ? `<h3>Denied actions</h3><pre style="white-space: pre-wrap; overflow-wrap: anywhere">${esc(JSON.stringify(x.denials.denied, null, 2))}</pre>` : ""}
     </section>
+    <section class="card rerun-diagnostics"><div class="rerun-diagnostics-head"><div><h2>Process and logs</h2><p class="muted">Check whether the rerun command is still running and inspect recent output.</p></div><button type="button" class="btn" id="rerun-check-process">Check process and logs</button></div><div id="rerun-diagnostics-result" aria-live="polite"><p class="muted">Check for the latest status.</p></div></section>
     <section class="card"><h2>Launch settings</h2><dl>${settings.map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join("")}</dl>
       <h3>Restored skills</h3>${x.skills.length ? `<ul>${x.skills.map(s => `<li>${esc(s.skill)} · ${esc(s.source || s.hash || "Version not recorded")}</li>`).join("")}</ul>` : '<p>No restored skills recorded.</p>'}
     </section>
@@ -3475,6 +3618,18 @@ async function viewRerun(sessionId) {
       ${x.original ? `<a href="#/prompt/${encodeURIComponent(x.original.id)}">Initial prompt →</a>` : ""}
       ${x.replay ? `<p><a href="#/prompt/${encodeURIComponent(x.replay.id)}">Imported rerun →</a></p>` : '<p class="muted">No imported transcript is available for this rerun.</p>'}
     </section></div>`;
+  document.getElementById("rerun-check-process").onclick = async (event) => {
+    const button = event.currentTarget, box = document.getElementById("rerun-diagnostics-result");
+    button.disabled = true;
+    box.innerHTML = '<p class="muted">Checking…</p>';
+    try {
+      const data = await api(`/api/reruns/launched/${encodeURIComponent(sessionId)}/diagnostics`);
+      if (!box.isConnected) return;
+      box.innerHTML = `<p><strong>Recorded status: ${esc(data.status || "unknown")}</strong> · Process: ${esc(data.process)} · Checked ${esc(fmtDate(data.checked_at))}</p><p class="muted">${esc(data.message)}</p>${data.log ? `<details><summary>Recent background log</summary><pre>${esc(data.log)}</pre></details>` : '<p class="muted">No background log is available.</p>'}${data.status !== x.status ? '<p><button class="btn" type="button" id="rerun-refresh-status">Refresh displayed status</button></p>' : ''}`;
+      document.getElementById("rerun-refresh-status")?.addEventListener("click", () => viewRerun(sessionId));
+    } catch (error) { if (!(error instanceof StaleNavigation) && box.isConnected) box.innerHTML = `<p class="status-warn">Could not check the rerun: ${esc(error.message)}</p>`; }
+    finally { if (button.isConnected) button.disabled = false; }
+  };
 }
 
 function groupRerunHistory(items) {
@@ -3518,6 +3673,7 @@ function rerunHistoryAttempt(x, number) {
       ${o ? refDelta(r.total_cost_usd, o.total_cost_usd, { against: "original" }) : ""}
       <a href="#/compare?a=${encodeURIComponent(x.prompt_id)}&b=${encodeURIComponent(r.id)}">Compare with original →</a>`
       : `<span class="muted">${x.cost_usd != null ? fmtCost(x.cost_usd) : "Cost pending"}</span><span class="muted">${x.status === "running" ? "Running in background" : "No imported transcript"}</span>`}
+      ${["running", "interactive"].includes(x.status) ? `<a href="#/rerun/${encodeURIComponent(x.session_id)}">Check process and logs →</a>` : ""}
       ${judgeBadge(x.rating)}${x.rating?.summary ? `<span class="rerun-needs">${esc(x.rating.summary)}</span>` : ""}
     </div></article>`;
 }
@@ -3530,6 +3686,24 @@ function rerunHistoryHtml(items) {
       <span class="rh-totals">${plural(items.length, "attempt")} · ${plural(groups.length, "prompt")}<small>${imported} imported</small></span><span class="rh-chevron" aria-hidden="true">⌄</span></summary>
     <div class="rh-groups"><div id="history-toolbar"></div><div id="history-results">${rerunHistoryGroupsHtml(items)}</div></div>
   </details>`;
+}
+
+function judgeHistoryHtml(groups) {
+  const count = groups.reduce((total, group) => total + group.ratings.length, 0);
+  return `<details class="rh-section judge-history" id="judge-history" ${rerunState.judgeHistoryOpen ? "open" : ""}>
+    <summary class="rh-section-heading"><span class="rh-section-icon" aria-hidden="true">✦</span><span><span class="rh-eyebrow">Output reviews</span><strong>Judge run history</strong><span class="muted">Requested judgments, organized by prompt pair</span></span>
+      <span class="rh-totals">${plural(count, "judge run")} · ${plural(groups.length, "pair")}</span><span class="rh-chevron" aria-hidden="true">⌄</span></summary>
+    <div class="rh-groups">${groups.length ? groups.map((group, index) => {
+      const key = JSON.stringify([group.base, group.other]);
+      const open = rerunState.judgeHistoryGroups.get(key) || false;
+      return `<details class="rh-group judge-history-group" data-judge-history-group="${esc(key)}" ${open ? "open" : ""}>
+        <summary><span class="rh-group-number" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span><span class="rh-group-title"><strong>${esc(promptPreview(group.base_text))}</strong>
+          <span class="muted">Compared with: ${esc(promptPreview(group.other_text))}</span></span><span class="rh-group-count">${plural(group.ratings.length, "judge run")}</span><span class="rh-chevron" aria-hidden="true">⌄</span></summary>
+        <div class="rh-group-content"><a class="rh-compare-all" href="${esc(judgeComparisonUrl(group.base, group.other))}"><span class="rh-compare-icon" aria-hidden="true">✦</span><span class="rh-compare-copy"><span class="rh-compare-kicker">The same two prompts</span><strong>Compare all judge runs</strong><span>See their scores, verdicts and your human rating together.</span></span><span class="rh-compare-arrow" aria-hidden="true">→</span></a>
+          ${group.human_feedback ? `<p class="judge-human-score">✎ Your rating <strong>${group.human_feedback.human_score} / 100</strong></p>` : ""}
+          <div class="judge-history-runs">${group.ratings.map((rating) => `<article class="judge-history-run"><div><strong>${esc(rating.model || "Default model")}</strong><span class="muted">${esc(fmtDate(rating.rated_at))}</span></div><div>${judgeBadge(rating)}<p>${esc(rating.summary || "No summary recorded.")}</p></div></article>`).join("")}</div>
+        </div></details>`;
+    }).join("") : '<p class="muted rh-empty">No completed judge runs yet. Open a prompt comparison to judge its outputs.</p>'}</div></details>`;
 }
 
 function rerunHistoryGroupsHtml(items, sort = "recent") {
@@ -3549,7 +3723,7 @@ function rerunHistoryGroupsHtml(items, sort = "recent") {
         <summary><span class="rh-group-number" aria-hidden="true">${String(index + 1).padStart(2, "0")}</span><span class="rh-group-title"><strong>${esc(o?.text || "Original prompt unavailable")}</strong>
           <span class="muted">${esc(o?.project || "Unknown project")} · Latest ${esc(fmtAgo(group.runs[0].launched_at))}</span></span>
           <span class="rh-group-count">${plural(group.runs.length, "attempt")}</span><span class="rh-chevron" aria-hidden="true">⌄</span></summary>
-        <div class="rh-group-content">${o ? `<p class="rh-compare-all"><a class="btn" href="#/rerun-comparison/${encodeURIComponent(o.id)}">Compare all reruns →</a></p>` : ""}${o ? `<div class="rh-original"><span class="rh-eyebrow">Starting point</span><a href="#/prompt/${encodeURIComponent(o.id)}">Original prompt →</a><strong>${fmtCost(o.total_cost_usd)}</strong>
+        <div class="rh-group-content">${o ? `<a class="rh-compare-all" href="#/rerun-comparison/${encodeURIComponent(o.id)}"><span class="rh-compare-icon" aria-hidden="true">↗</span><span class="rh-compare-copy"><span class="rh-compare-kicker">Your experiment, together</span><strong>Compare all reruns</strong><span>See every attempt side by side and choose a reference run.</span></span><span class="rh-compare-arrow" aria-hidden="true">→</span></a>` : ""}${o ? `<div class="rh-original"><span class="rh-eyebrow">Starting point</span><a href="#/prompt/${encodeURIComponent(o.id)}">Original prompt →</a><strong>${fmtCost(o.total_cost_usd)}</strong>
           <span class="muted">${esc([o.harness, o.requested_model, o.effort ? `${o.effort} effort` : "", o.harness_version ? `CLI ${o.harness_version}` : ""].filter(Boolean).join(" · "))}</span></div>` : '<p class="muted">The original prompt is outside the current history. Launch details are still available.</p>'}
           <div class="rh-attempts">${group.runs.map((x, i) => rerunHistoryAttempt(x, group.runs.length - i)).join("")}</div>
         </div></details>`;
@@ -3585,10 +3759,16 @@ function historyFilterQuery() {
 function bindHistoryFilters(page, history) {
   const toolbar = page.querySelector("#history-toolbar"), results = page.querySelector("#history-results");
   let generation = 0, timer;
+  historyFilterState.tagCounts = null;
   const renderResults = async () => {
     const current = ++generation;
     const url = historyPageUrl();
     if (location.hash !== url) window.history.replaceState(null, "", url);
+    api(`/api/tag-counts?${tagCountsQuery(historyFilterState, "reruns")}`).then((tagCounts) => {
+      if (current !== generation || !toolbar.isConnected) return;
+      historyFilterState.tagCounts = tagCounts;
+      showTagCounts(toolbar, historyFilterState);
+    }).catch(() => { /* keep the last counts: the results report any failure */ });
     const filters = historyFilterQuery();
     const filtering = [...filters.keys()].some((k) => k !== "limit");
     let filtered = history;
@@ -3658,14 +3838,16 @@ async function viewRerunComparison(promptId) {
     const canJudge = p && !isReference && referenceData.answers[referenceId] && referenceData.answers[p.id];
     return `<tr class="${isReference ? "rc-base" : ""}"><td>${run ? `<a href="#/rerun/${encodeURIComponent(run.session_id)}"><strong>${label}</strong></a>` : `<strong>Original</strong>`}
       <br><span class="muted">${esc(fmtDate(run?.launched_at || original.started_at))}</span>${run ? `<br>${rerunStatusHtml(run, {details:false})}` : ""}
-      ${isReference ? '<br><span class="rc-reference">★ Reference</span>' : p ? `<br><button type="button" class="link-btn" data-set-rerun-reference="${esc(p.id)}">Set as reference</button>` : ""}</td>
+      ${isReference ? '<br><span class="rc-reference">★ Reference run</span>' : p ? `<br><button type="button" class="rc-set-reference" data-set-rerun-reference="${esc(p.id)}">☆ Set as reference</button>` : ""}
+      ${p ? `<details class="rc-prompt"><summary>Full initial prompt</summary><pre>${esc(p.text)}</pre><a href="#/prompt/${encodeURIComponent(p.id)}">Open prompt →</a></details>` : ""}</td>
       <td>${esc(settingsLabel)}${run ? `<br><details class="rc-settings"><summary>All settings</summary><div class="rr-settings">${rerunSettings({...run, original})}</div></details>` : ""}</td>
       <td>${metric(cost, fmtCost)}${!isReference && p ? delta(cost, baseline.total_cost_usd) : ""}</td>
       <td>${p ? metric(p.total_tokens, fmtTokens) : "—"}</td><td>${metric(time, fmtMs)}${!isReference && p ? delta(time, duration(baseline)) : ""}</td>
       <td>${isReference ? '<span class="muted">Reference output</span>' : p ? `${judgeBadge(rating)}${rating?.summary ? `<div class="muted">${esc(rating.summary)}</div>` : !rating ? '<span class="muted">Not judged against this reference</span>' : ""}
         ${rating?.status === "failed" ? `<div class="status-warn">${esc(rating.error || "Judge failed")}</div>` : ""}
-        <p><a href="#/compare?a=${encodeURIComponent(referenceId)}&b=${encodeURIComponent(p.id)}">Compare outputs →</a></p>
+        <p><a href="#/compare?${new URLSearchParams({a: referenceId, b: p.id, rerun_comparison: promptId})}">Compare outputs →</a></p>
         <button type="button" class="btn rc-judge" data-judge-run="${esc(p.id)}" ${!canJudge || rating?.status === "rating" || EXAMPLES ? "disabled" : ""}>${rating && rating.status !== "failed" ? "Judge again" : "Judge output"}</button>
+        ${canJudge ? `<div class="rc-judge-impact" data-judge-impact="${esc(p.id)}" aria-live="polite">Estimating judge usage…</div>` : ""}
         ${!canJudge ? '<div class="muted">Both runs need a final answer to judge.</div>' : ""}` : '<span class="muted">No imported transcript</span>'}</td></tr>`;
   }).join("");
   const modelOptions = [...new Set(models.map((m) => m.id).filter(Boolean))];
@@ -3678,7 +3860,9 @@ async function viewRerunComparison(promptId) {
   ];
   destroyCharts();
   app.innerHTML = `<div class="prompts-page rerun-comparison-page"><p><a href="${esc(historyPageUrl())}">← Rerun history</a></p>
-    <header class="home-hero page-hero"><div class="hero-copy"><h1><span class="hero-name">Rerun comparison</span>One prompt. <em>Every attempt.</em></h1><p>${esc(original.text)}</p></div></header>
+    <header class="home-hero page-hero"><div class="hero-copy"><h1><span class="hero-name">Rerun comparison</span>One prompt. <em>Every attempt.</em></h1><p>${esc(promptPreview(original.text))}</p>
+      <details class="rc-original-prompt"><summary>Read the full original prompt</summary><pre>${esc(original.text)}</pre></details></div></header>
+    <section class="card rc-reference-feature" aria-label="Selected reference run"><span class="rc-reference-star" aria-hidden="true">★</span><div><span class="rc-reference-kicker">Your comparison baseline</span><h2>Reference run · ${esc(reference.label)}</h2><p>Cost, time and output verdicts are measured against this run.</p><a href="#/prompt/${encodeURIComponent(baseline.id)}">Open reference prompt →</a></div><div class="rc-reference-metrics"><span><small>Cost</small><strong>${metric(baseline.total_cost_usd, fmtCost)}</strong></span><span><small>Tokens</small><strong>${metric(baseline.total_tokens, fmtTokens)}</strong></span><span><small>Time</small><strong>${metric(duration(baseline), fmtMs)}</strong></span></div></section>
     <section class="rc-trends" aria-labelledby="rc-trends-title"><h2 id="rc-trends-title">Cost and usage over time</h2>
       <p class="muted">Original and imported reruns, in time order. ◆ marks ${esc(reference.label)}, the selected reference. Select a point to open its prompt; runs without imported usage are shown in the table.</p>
       <div class="charts">${chartSpecs.map(([id, title]) => `<div class="card"><div class="chart-title">${esc(title)}</div><div class="chart-box"><canvas id="rerun-chart-${id}" role="img" aria-label="${esc(title)} over time; values are also listed in the table below"></canvas></div></div>`).join("")}</div>
@@ -3693,6 +3877,20 @@ async function viewRerunComparison(promptId) {
     [{label: "Run", color: "--series-1", points: chartPoints}], null, value, format, chartReference));
   const modelSelect = page.querySelector("#rc-judge-model");
   bindModelAccess(modelSelect, settings.judge_model || "");
+  let judgeEstimateGeneration = 0;
+  const updateJudgeEstimates = () => {
+    const generation = ++judgeEstimateGeneration;
+    page.querySelectorAll("[data-judge-impact]").forEach(async (box) => {
+      box.textContent = "Estimating judge usage…";
+      try {
+        const data = await api(`/api/ratings/estimate?${new URLSearchParams({base: referenceId, other: box.dataset.judgeImpact, model: modelSelect.value})}`);
+        if (!box.isConnected || generation !== judgeEstimateGeneration) return;
+        box.innerHTML = `<strong>Judge: ≈ ${fmtTokens(data.input_tokens + data.output_tokens)} tokens</strong>${quotaForecast(data.forecast)}<small>Rough input estimate + 512 output tokens; actual usage varies.</small>`;
+      } catch (error) { if (!(error instanceof StaleNavigation) && box.isConnected && generation === judgeEstimateGeneration) box.textContent = "Judge usage estimate unavailable."; }
+    });
+  };
+  modelSelect.addEventListener("change", updateJudgeEstimates);
+  updateJudgeEstimates();
   const showError = (error) => { if (!(error instanceof StaleNavigation) && page.isConnected) { const box = page.querySelector("#rc-error"); box.textContent = error.message; box.hidden = false; } };
   page.querySelectorAll("[data-set-rerun-reference]").forEach((button) => button.onclick = async () => {
     button.disabled = true;
@@ -3727,6 +3925,7 @@ function rerunBudgetWarning(q) {
 }
 
 function rerunEstimateTotal(items) {
+  items = items.filter((q) => q.kind !== "judge");
   const estimates = items.map((q) => q.estimate).filter(Boolean);
   const priced = estimates.filter((e) => e.cost_usd != null);
   const durations = estimates.map((e) => e.duration_ms).filter((ms) => ms != null);
@@ -3744,10 +3943,22 @@ function rerunEstimateCost(total) {
 }
 
 function rerunEstimateSummary(title, total) {
-  return `<div class="rr-estimate-summary"><strong>${title} · ${total.count} run${total.count === 1 ? "" : "s"}</strong>
-    <span class="rr-estimate-cost">${rerunEstimateCost(total)}</span>
-    <span>≈ ${fmtTokens(total.tokens)} tokens${total.missing ? ` + ${total.missing} unknown` : ""}</span>
-    <span class="muted">Concurrent duration baseline: ${fmtMs(total.parallel_ms)}${total.missing_time ? ` · ${total.missing_time} unknown` : ""} · combined run time: ${fmtMs(total.work_ms)}</span></div>`;
+  const tokens = total.missing === total.count ? "Unavailable" : `≈ ${fmtTokens(total.tokens)}`;
+  return `<section class="rr-estimate-summary" aria-label="${title} consumption estimate">
+    <div class="rr-estimate-header"><div><span class="rr-estimate-kicker">Consumption estimate</span><h3>${title}</h3></div><span class="rr-estimate-count">${total.count} run${total.count === 1 ? "" : "s"}</span></div>
+    <div class="rr-estimate-metrics">
+      <div class="rr-estimate-metric"><span class="rr-metric-icon" aria-hidden="true">◈</span><span class="rr-metric-label">Tokens</span><strong>${tokens}</strong><span class="rr-metric-detail">${total.missing ? `${total.missing} run${total.missing === 1 ? "" : "s"} unknown` : "Estimated total"}</span></div>
+      <div class="rr-estimate-metric"><span class="rr-metric-icon" aria-hidden="true">◷</span><span class="rr-metric-label">Concurrent time</span><strong>${fmtMs(total.parallel_ms)}</strong><span class="rr-metric-detail">${total.missing_time ? `${total.missing_time} unknown · ` : ""}Combined run time: ${fmtMs(total.work_ms)}</span></div>
+      <div class="rr-estimate-metric rr-metric-cost"><span class="rr-metric-icon" aria-hidden="true">↗</span><span class="rr-metric-label">Estimated API cost</span><strong>${rerunEstimateCost(total)}</strong><span class="rr-metric-detail">Based on recorded usage</span></div>
+    </div></section>`;
+}
+
+function judgeQueueSummary(title, items) {
+  const judges = items.filter((q) => q.kind === "judge");
+  if (!judges.length) return "";
+  const known = judges.filter((q) => q.estimate);
+  const tokens = known.reduce((sum, q) => sum + q.estimate.total_tokens, 0);
+  return `<section class="rr-estimate-summary judge-queue-summary"><div class="rr-estimate-header"><div><span class="rr-estimate-kicker">Judgment estimate</span><h3>${title}</h3></div><span class="rr-estimate-count">${plural(judges.length, "judgment")}</span></div><div class="judge-queue-summary-body"><span class="rr-metric-icon" aria-hidden="true">✦</span><div><span class="rr-metric-label">Approximate tokens</span><strong>${known.length ? `≈ ${fmtTokens(tokens)}` : "Unavailable"}</strong><span class="rr-metric-detail">${judges.length - known.length ? `${plural(judges.length - known.length, "judgment")} unavailable · ` : ""}Cost and time unavailable</span></div></div><p class="rr-estimate-note muted">Rough input estimate plus 512 output tokens per judgment. Actual usage, reasoning and CLI overhead can differ.</p></section>`;
 }
 
 function showQueueConfigIssues(dialog, issues, focus = true) {
@@ -3873,6 +4084,13 @@ function editQueuedRun(q, resumeIds = null) {
 }
 
 function rerunQueueCard(q, index) {
+  if (q.kind === "judge") return `<article class="rr-row rq-card judge-queue-card ${rerunState.picked.has(q.id) ? "selected" : ""}" data-rr="${q.id}">
+    <header class="rq-head"><label class="rq-select"><input type="checkbox" class="psel" data-rr-pick="${q.id}" ${rerunState.picked.has(q.id) ? "checked" : ""} aria-label="Select judge run ${index + 1}"><span class="rq-index">${String(index + 1).padStart(2, "0")}</span></label>
+      <span class="run-kind run-kind-judge">✦ Judge run</span><span class="rq-status">Ready to run</span><time class="muted rr-added">queued ${esc(fmtAgo(q.added_at))}</time>
+      <button type="button" class="rr-remove" data-rr-remove="${q.id}" aria-label="Take it out of the queue">✕</button></header>
+    <div class="judge-queue-body"><div><span class="judge-label">Reference prompt</span><p>${esc(q.prompt?.text || "Prompt unavailable")}</p><span class="judge-label">Compared prompt</span><p>${esc(q.other_prompt?.text || "Prompt unavailable")}</p></div>
+      <div><span class="rq-label">Judge model</span><strong>${esc(q.model || "Default judge at launch")}</strong><p class="muted">${q.estimate ? `≈ ${fmtTokens(q.estimate.total_tokens)} tokens · cost and time unavailable` : "Usage estimate unavailable"}</p><div data-quota-run="${q.id}">${quotaForecast(q.forecast)}</div></div></div>
+    <footer class="rq-footer"><a href="#/compare?${new URLSearchParams({a:q.prompt_id,b:q.other_prompt_id})}">Open comparison →</a><button type="button" class="btn primary" data-rr-launch-one="${q.id}">✦ Run judgment</button></footer></article>`;
   const p = q.prompt, e = q.estimate;
   const selected = rerunState.picked.has(q.id);
   const agent = q.agent || (q.model?.startsWith("codex:") ? "Codex" : p?.harness) || "Original agent";
@@ -3880,7 +4098,7 @@ function rerunQueueCard(q, index) {
   const effort = q.effort || p?.effort || "Original";
   return `<article class="rr-row rq-card ${q.needs_input ? "rr-needs-input" : ""} ${selected ? "selected" : ""}" data-rr="${q.id}">
     <header class="rq-head"><label class="rq-select"><input type="checkbox" class="psel" data-rr-pick="${q.id}" ${selected ? "checked" : ""} aria-label="Select rerun ${index + 1}"><span class="rq-index">${String(index + 1).padStart(2, "0")}</span></label>
-      <span class="rq-project">${esc(p?.project || "Original project")}</span>
+      <span class="run-kind run-kind-prompt">↻ Prompt run</span><span class="rq-project">${esc(p?.project || "Original project")}</span>
       <span class="rq-status ${q.needs_input ? "rq-status-needs" : ""}">${q.needs_input ? "Needs input" : "Ready to run"}</span>
       <time class="muted rr-added" title="${esc(fmtDate(q.added_at))}">queued ${esc(fmtAgo(q.added_at))}</time>
       <button type="button" class="rr-remove" data-rr-remove="${q.id}" title="Take it out of the queue" aria-label="Take it out of the queue">✕</button>
@@ -3916,15 +4134,14 @@ function modelAvailabilitySummaryHtml(data) {
   const information = !data ? 'Model availability information is unavailable.'
     : listed.length ? `${plural(listed.length, "model")} listed by your agents.`
     : 'No model information available yet.';
-  return `<div class="card model-availability-summary"><div class="model-availability-copy"><h2>Model availability</h2>
-      <p>${information}${data?.scan.status === "running" ? ' Refresh in progress.' : ""}</p>
+  return `<div class="card model-availability-summary"><div class="model-availability-top"><details class="model-availability-details"><summary><span class="model-availability-icon" aria-hidden="true">✦</span><span><strong>Model availability</strong><span class="model-availability-description">${information}${data?.scan.status === "running" ? ' Refresh in progress.' : ""}</span></span></summary>
       ${agents.length ? `<ul>${agents.map((agent) => {
         const rows = results.filter((r) => r.agent === agent);
         const count = rows.filter((r) => r.status === "listed" && r.model).length;
         const checked = rows.map((r) => r.checked_at).filter(Boolean).sort().at(-1);
         return `<li><strong>${esc(agentNames[agent] || agent)}</strong> · ${count ? plural(count, "model") + ' listed' : 'No catalog information'}${checked ? ` · ${count ? "Updated" : "Last attempted"} ${date(checked)}` : ""}</li>`;
       }).join("")}</ul>` : data?.scan.finished_at ? `<p class="muted">Last attempted ${date(data.scan.finished_at)}</p>` : ""}
-    </div><a class="btn" href="${link}">Recompute or schedule in Setup →</a></div>`;
+    </details><a class="btn" href="${link}">Recompute or schedule in Setup →</a></div></div>`;
 }
 
 function modelChecksHtml(data) {
@@ -4029,17 +4246,18 @@ function bindModelChecks(container, initial) {
 }
 
 async function viewReruns(query = null) {
+  if (query?.get("judge_history") === "1") rerunState.judgeHistoryOpen = true;
   if (query) Object.assign(historyFilterState, {
     q: query.get("q") || "", range: RANGES[query.get("range")] ? query.get("range") : "all",
     sort: PROMPT_SORTS[query.get("sort")] ? query.get("sort") : "recent", categoryTags: categoryTagsFromQuery(query),
   });
   clearTimeout(rerunState.limitsTimer);
-  const [data, limits, checks, , historyTags] = await Promise.all([
+  const [data, checks, , historyTags, judgeHistory] = await Promise.all([
     api("/api/reruns"),
-    api("/api/limits").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; }),
     api("/api/model-checks").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; }),
     loadModelCatalog(),
     api("/api/tags"),
+    api("/api/ratings/history"),
   ]);
   historyFilterState.tags = historyTags;
   rerunState.picked = new Set([...rerunState.picked].filter((id) => data.queue.some((q) => q.id === id)));
@@ -4061,21 +4279,14 @@ async function viewReruns(query = null) {
         </div>
       </header>
 
+      <div class="run-histories" aria-label="Run histories"><button type="button" class="btn" data-prompt-history>↻ Prompt run history</button><button type="button" class="btn" data-judge-history>✦ Judge run history</button></div>
       <section id="model-check-tools" aria-label="Rerun tools">${modelAvailabilitySummaryHtml(checks)}</section>
-
-      <section class="card rerun-limits" aria-labelledby="rerun-limits-title">
-        <div class="rerun-limits-head"><h2 id="rerun-limits-title">Current account status</h2>
-          <button type="button" class="btn" data-refresh-limits>Refresh status</button></div>
-        <p class="muted">Latest reported usage and reset times. Updates every minute while this page is open.</p>
-        <div class="rerun-limits-agents" id="rerun-limits-status" aria-live="polite">${limits === null ? '<p class="muted">Could not load usage limits. Try refreshing the status.</p>' : limits.length ? homeLimits(limits) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>'}</div>
-        <p class="muted" id="rerun-limits-error" role="status" hidden></p>
-      </section>
 
       <h2 class="page-sec">Queue <span class="muted">${data.queue.length}</span>${data.queue.some((q) => q.needs_input) ? ` <span class="status-warn">· ${data.queue.filter((q) => q.needs_input).length} need input</span>` : ""}</h2>
       ${data.queue.length ? `
-        <div class="rr-estimate-grid">${rerunEstimateSummary("Entire queue", fullEstimate)}${picked.length ? rerunEstimateSummary("Selected", estimate) : ""}</div>
-        <section class="card" aria-label="Estimated queue limit impact"><h3>Estimated queue limit impact</h3><div id="queue-quota-forecast">${queueQuotaForecast(data.queue)}</div>${picked.length ? `<h3>Selected runs</h3><div id="selected-quota-forecast">${queueQuotaForecast(picked)}</div>` : ""}</section>
-        <p class="muted rr-estimate-note">Estimates reuse the original token volume at the chosen model's current configured prices, preserving recorded cache usage and subagent models. Unchanged models use recorded costs as the baseline; changed models are repriced from aggregate tokens with standard 5-minute cache writes. Duration uses original run times; concurrent duration assumes all runs start together. Actual usage can vary with model, effort, tools and caching. Judge calls are extra. API estimates are not subscription charges. Model-specific limit forecasts learn from local observations; external activity can affect them.</p>
+        <div class="rr-estimate-grid">${fullEstimate.count ? rerunEstimateSummary("Prompt runs in queue", fullEstimate) : ""}${judgeQueueSummary("Judgments in queue", data.queue)}${estimate.count && picked.length ? rerunEstimateSummary("Selected prompt runs", estimate) : ""}${picked.length ? judgeQueueSummary("Selected judgments", picked) : ""}</div>
+        <section class="card queue-impact" aria-label="Estimated queue limit impact"><div class="queue-impact-heading"><span class="queue-impact-icon" aria-hidden="true">↗</span><div><span class="queue-impact-kicker">Before you run</span><h3>Estimated queue limit impact</h3><p>How this queue could affect your reported usage limits.</p></div></div><div id="queue-quota-forecast">${queueQuotaForecast(data.queue)}</div>${picked.length ? `<h3 class="queue-impact-selected">Selected runs</h3><div id="selected-quota-forecast">${queueQuotaForecast(picked)}</div>` : ""}</section>
+        <p class="muted rr-estimate-note">Rerun estimates reuse original token volume at the chosen model's configured prices, preserving recorded cache usage and subagent models. Duration uses original run times; concurrent duration assumes all runs start together. Queued judgments use a rough token estimate; automatic judgments after reruns are extra. API estimates are not subscription charges. Limit forecasts learn from local observations; actual usage and external activity can differ.</p>
         <div class="select-bar rerun-bar">
           <strong>${picked.length} selected</strong>
           <button type="button" class="btn" data-rr-all ${picked.length === data.queue.length ? "disabled" : ""}>Select all ${data.queue.length}</button>
@@ -4093,24 +4304,24 @@ async function viewReruns(query = null) {
       ${active.length ? `<section class="rh-active" aria-label="Active reruns"><h2 class="page-sec">In progress <span class="muted">${active.length}</span></h2>
         <div class="rh-attempts">${active.map((x, i) => rerunHistoryAttempt(x, active.length - i)).join("")}</div></section>` : ""}
       ${rerunHistoryHtml(history)}
+      ${judgeHistoryHtml(judgeHistory)}
     </div>`;
 
   const page = app.querySelector(".reruns-page");
   page.querySelector("#rerun-history").addEventListener("toggle", (event) => {
     rerunState.historyOpen = event.currentTarget.open;
   });
+  page.querySelector("#judge-history").addEventListener("toggle", (event) => { rerunState.judgeHistoryOpen = event.currentTarget.open; });
+  page.querySelectorAll("[data-judge-history-group]").forEach((group) => group.addEventListener("toggle", () => {
+    rerunState.judgeHistoryGroups.set(group.dataset.judgeHistoryGroup, group.open);
+  }));
   bindHistoryFilters(page, history);
-  const limitStatus = page.querySelector("#rerun-limits-status");
   const refreshLimits = async () => {
-    if (!limitStatus.isConnected) return;
+    if (!page.isConnected) return;
     clearTimeout(rerunState.limitsTimer);
-    const button = page.querySelector("[data-refresh-limits]");
-    const errorBox = page.querySelector("#rerun-limits-error");
-    button.disabled = true;
     try {
-      const [latest, updated, modelInfo] = await Promise.all([api("/api/limits"), api("/api/reruns"), api("/api/model-checks").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; })]);
-      if (!limitStatus.isConnected) return;
-      limitStatus.innerHTML = latest.length ? homeLimits(latest) : '<p class="muted">No agent connected. Connect one in <a href="#/setup">Setup</a> to see its limits.</p>';
+      const [, updated, modelInfo] = await Promise.all([refreshUsagePanel(), api("/api/reruns"), api("/api/model-checks").catch((error) => { if (error instanceof StaleNavigation) throw error; return null; })]);
+      if (!page.isConnected) return;
       page.querySelector("#model-check-tools").innerHTML = modelAvailabilitySummaryHtml(modelInfo);
       const byId = new Map(updated.queue.map((q) => [q.id, q]));
       data.queue.forEach((q) => { if (byId.has(q.id)) Object.assign(q, byId.get(q.id)); });
@@ -4122,19 +4333,15 @@ async function viewReruns(query = null) {
         const q = byId.get(Number(el.dataset.quotaRun));
         if (q) el.innerHTML = quotaForecast(q.forecast);
       });
-      errorBox.hidden = true;
     } catch (error) {
-      if (error instanceof StaleNavigation || !limitStatus.isConnected) return;
-      errorBox.textContent = "Could not refresh reset status. Displayed figures are from the last successful check.";
-      errorBox.hidden = false;
+      if (error instanceof StaleNavigation || !page.isConnected) return;
+      // Keep the last successful forecasts until the next refresh.
     } finally {
-      if (limitStatus.isConnected) {
-        button.disabled = false;
+      if (page.isConnected) {
         rerunState.limitsTimer = setTimeout(refreshLimits, 60000);
       }
     }
   };
-  page.querySelector("[data-refresh-limits]").onclick = refreshLimits;
   rerunState.limitsTimer = setTimeout(refreshLimits, 60000);
   // while reruns run, check again every few seconds (only while this page is shown)
   clearTimeout(rerunState.timer);
@@ -4152,6 +4359,10 @@ async function viewReruns(query = null) {
     rerunState.timer = setTimeout(poll, 5000);
   }
   page.onclick = async (e) => {
+    if (e.target.closest("[data-prompt-history], [data-judge-history]")) {
+      const history = page.querySelector(e.target.closest("[data-judge-history]") ? "#judge-history" : "#rerun-history");
+      history.open = true; history.scrollIntoView({behavior:"smooth"}); return;
+    }
     const pick = e.target.closest("[data-rr-pick]"), row = e.target.closest("article.rr-row:not(.launched)");
     if (e.target.closest("[data-rr-remove]")) {
       await api(`/api/reruns/queue/${e.target.closest("[data-rr-remove]").dataset.rrRemove}`, { method: "DELETE" });
@@ -4188,10 +4399,11 @@ async function launchPicked(picked, estimate) {
     if (incomplete) editQueuedRun(incomplete, ids);
     return;
   }
-  const budgetWarnings = picked.map(rerunBudgetWarning).filter(Boolean);
+  const budgetWarnings = picked.filter((q) => q.kind !== "judge").map(rerunBudgetWarning).filter(Boolean);
   const terminals = picked.filter((q) => q.mode === "terminal").length;
-  if (!n || !confirm(`Launch ${n} rerun${n === 1 ? "" : "s"} together?\n\n${n - terminals} in the background · ${terminals} in terminal windows.\n` +
-      `Estimated consumption: ${rerunEstimateCost(estimate)}, ≈ ${fmtTokens(estimate.tokens)} tokens${estimate.missing ? ` + ${estimate.missing} unknown` : ""}.\nConcurrent duration baseline: ${fmtMs(estimate.parallel_ms)}${estimate.missing_time ? ` (${estimate.missing_time} unknown)` : ""}.\nActual consumption may differ; judge calls are extra.${budgetWarnings.length ? "\n\nBudget warnings:\n" + budgetWarnings.join("\n") : ""}`)) return;
+  const queuedJudges = picked.filter((q) => q.kind === "judge"), knownJudges = queuedJudges.filter((q) => q.estimate);
+  if (!confirm(`Launch ${plural(n, "item")} together?\n\n${n - terminals} in the background · ${terminals} in terminal windows.\n` +
+      `${estimate.count ? `Reruns: ${rerunEstimateCost(estimate)}, ≈ ${fmtTokens(estimate.tokens)} tokens${estimate.missing ? ` + ${estimate.missing} unknown` : ""}.\nConcurrent duration baseline: ${fmtMs(estimate.parallel_ms)}${estimate.missing_time ? ` (${estimate.missing_time} unknown)` : ""}.\n` : ""}${queuedJudges.length ? `Judgments: ${knownJudges.length ? `≈ ${fmtTokens(knownJudges.reduce((sum, q) => sum + q.estimate.total_tokens, 0))} tokens` : "estimate unavailable"}${knownJudges.length < queuedJudges.length ? " · some estimates unavailable" : ""}; cost and time unavailable.\n` : ""}Actual consumption may differ; automatic judgments after reruns are extra.${budgetWarnings.length ? "\n\nBudget warnings:\n" + budgetWarnings.join("\n") : ""}`)) return;
   const response = await api("/api/reruns/launch", { method: "POST", body: {ids} });
   if (response.needs_input?.length) {
     const latest = await api("/api/reruns");
@@ -4202,12 +4414,14 @@ async function launchPicked(picked, estimate) {
   const {results} = response;
   rerunState.picked.clear();
   await viewReruns();
-  const opened = results.filter((r) => r.terminal), running = results.filter((r) => r.mode === "background" && !r.error),
+  const judges = results.filter((r) => r.kind === "judge" && !r.error);
+  const opened = results.filter((r) => r.terminal), running = results.filter((r) => r.kind !== "judge" && r.mode === "background" && !r.error),
     manual = results.filter((r) => r.mode !== "background" && !r.terminal && !r.error), failed = results.filter((r) => r.error);
   const status = document.getElementById("rr-status") || document.getElementById("rr-status-empty");
   status.innerHTML = [
     opened.length ? `${plural(opened.length, "terminal window")} opened.` : "",
-    running.length ? `${plural(running.length, "rerun")} started in the background.` : "",
+    running.length ? `${plural(running.length, "prompt run")} started in the background.` : "",
+    judges.length ? `${plural(judges.length, "judge run")} started in the background.` : "",
     manual.length ? `No terminal window could be opened for ${manual.length}: run ${manual.length === 1 ? "this" : "these"} yourself (they are linked once imported):
       <pre><code>${esc(manual.map((r) => r.command).join("\n"))}</code></pre>` : "",
     failed.length ? `${plural(failed.length, "rerun")} could not start and stayed queued: ${failed.map((r) => esc(r.error)).join("; ")}.` : "",
@@ -4215,21 +4429,106 @@ async function launchPicked(picked, estimate) {
   status.hidden = false;
 }
 
+function judgeComparisonUrl(base, other) {
+  return `#/judge-comparison?${new URLSearchParams({a: base, b: other})}`;
+}
+
+async function viewJudgeComparisons() {
+  const groups = await api("/api/ratings/history");
+  app.innerHTML = `<div class="prompts-page judge-comparisons"><p><a href="#/reruns">← Reruns</a></p>
+    <header class="home-hero page-hero"><div class="hero-copy"><h1><span class="hero-name">Judge comparisons</span>One comparison. <em>Different perspectives.</em></h1>
+    <p>Choose a pair to see all its judge runs together. Judge the pair again to add another perspective.</p></div></header>
+    ${groups.length ? `<div class="judge-pair-list">${groups.map((group) => `<a class="card judge-pair" href="${esc(judgeComparisonUrl(group.base, group.other))}">
+      <span class="judge-label">Compared prompts</span><div class="judge-pair-prompts"><p><strong>Reference</strong> ${esc(group.base_text)}</p><p><strong>Compared</strong> ${esc(group.other_text)}</p></div>
+      <div class="judge-pair-footer"><span>${plural(group.ratings.length, "judge run")}${group.human_feedback ? ` · Your score ${group.human_feedback.human_score}/100` : ""}</span><strong>Compare judge runs →</strong></div></a>`).join("")}</div>` : '<div class="card muted">No completed judge runs yet. Open a comparison and choose Judge them to get started.</div>'}</div>`;
+}
+
+function judgeMetricChart(ratings, title, key, format) {
+  const values = ratings.map((rating) => Number.isFinite(rating[key]) && rating[key] >= 0 ? rating[key] : null);
+  const maximum = Math.max(0, ...values.filter((value) => value !== null));
+  return `<section class="card judge-metric-chart"><h3>${esc(title)}</h3><div class="judge-metric-rows">${ratings.map((rating, i) => {
+    const value = values[i], width = value == null || maximum === 0 ? 0 : (value / maximum) * 100;
+    return `<div class="judge-metric-row"><span class="judge-metric-name" title="${esc(rating.model || "Default model")}">${esc(rating.model || "Default model")} <small>· run ${i + 1}</small></span><span class="judge-metric-track" aria-hidden="true"><span style="width:${width}%"></span></span><strong>${value == null ? "Unavailable" : esc(format(value))}</strong></div>`;
+  }).join("")}</div></section>`;
+}
+
+function judgeOutputComparison(ratings) {
+  if (ratings.length < 2) return `<section class="card judge-output-comparison"><h2>Compare judge outputs</h2><p class="muted">Run another judge to compare two outputs side by side.</p></section>`;
+  const options = ratings.map((rating, i) => `<option value="${i}">${esc(rating.model || "Default model")} · run ${i + 1} · ${esc(fmtDate(rating.rated_at))}</option>`).join("");
+  return `<section class="card judge-output-comparison" aria-labelledby="judge-output-title"><h2 id="judge-output-title">Compare judge outputs</h2><p class="muted">Choose two judge runs to compare their conclusions and observations.</p>
+    <div class="judge-output-grid">${[0, 1].map((i) => `<div class="judge-output-column"><label for="judge-output-select-${i}">Judge ${i + 1}</label><select id="judge-output-select-${i}">${options}</select><div id="judge-output-result-${i}"></div></div>`).join("")}</div></section>`;
+}
+
+function bindJudgeOutputComparison(ratings) {
+  if (ratings.length < 2) return;
+  [0, 1].forEach((i) => {
+    const select = document.getElementById(`judge-output-select-${i}`);
+    const result = document.getElementById(`judge-output-result-${i}`);
+    select.value = String(i);
+    const render = () => {
+      const rating = ratings[Number(select.value)];
+      result.innerHTML = `<p><strong>${esc(rating.score)} / 100</strong> ${judgeBadge(rating)}</p><span class="judge-label">Conclusion</span><p>${esc(rating.summary || "No summary recorded.")}</p><span class="judge-label">Observations</span>${rating.differences.length ? `<ul>${rating.differences.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : '<p class="muted">No observations recorded.</p>'}`;
+    };
+    select.addEventListener("change", render);
+    render();
+  });
+}
+
+async function viewJudgeComparison(query) {
+  const a = query.get("a"), b = query.get("b");
+  if (!a || !b) { app.innerHTML = '<div class="card status-warn">Choose a pair from judge comparisons.</div>'; return; }
+  const [groups, comparison, settings, catalog] = await Promise.all([api("/api/ratings/history"), api(`/api/compare?${new URLSearchParams({a, b})}`), api("/api/settings"), loadModelCatalog()]);
+  const group = groups.find((item) => item.base === a && item.other === b);
+  if (!group) { app.innerHTML = `<div class="card status-warn">No completed judge runs for this pair. <a href="#/reruns?judge_history=1">← Judge run history</a></div>`; return; }
+  const scores = group.ratings.map((rating) => rating.score).filter((score) => Number.isFinite(score));
+  const average = scores.length ? Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : null;
+  const human = group.human_feedback;
+  const verdictCount = (verdict) => group.ratings.filter((rating) => rating.verdict === verdict).length;
+  const compareUrl = `#/compare?${new URLSearchParams({a, b})}`;
+  app.innerHTML = `<div class="prompts-page judge-comparison-page"><p><a href="#/reruns?judge_history=1">← Judge run history</a></p>
+    <header class="home-hero page-hero"><div class="hero-copy"><h1><span class="hero-name">Judge comparison</span>Two prompts. <em>Every judge run.</em></h1>
+      <p>See how judges rated the same pair, and compare their scores with your own assessment.</p></div></header>
+    ${judgeOutputComparison(group.ratings)}
+    <section class="card judge-pair-detail"><span class="judge-label">The prompts being judged</span><div class="judge-pair-prompts"><p><strong>Reference</strong> ${esc(group.base_text)}</p><p><strong>Compared</strong> ${esc(group.other_text)}</p></div>
+      <a class="btn" href="${esc(compareUrl)}">Open prompt comparison →</a></section>
+    <section class="card judge-comparison-action" aria-label="Run another judgment">${judgeActionHtml(comparison.rating, catalog.map((m) => m.id), settings.judge_model)}</section>
+    <section aria-labelledby="judge-summary-title"><h2 class="page-sec" id="judge-summary-title">At a glance</h2><div class="judge-summary-grid">
+      <div class="card"><span>Judge runs</span><strong>${group.ratings.length}</strong><small>${plural(new Set(group.ratings.map((r) => r.model || "Default model")).size, "model configuration")}</small></div>
+      <div class="card"><span>Average score</span><strong>${average ?? "—"}<small> / 100</small></strong><small>Arithmetic mean of judge scores</small></div>
+      <div class="card"><span>Score range</span><strong>${scores.length ? `${Math.min(...scores)}–${Math.max(...scores)}` : "—"}</strong><small>Lowest to highest</small></div>
+      <div class="card"><span>Your score</span><strong>${human ? human.human_score : "—"}<small> / 100</small></strong><small>${human ? "Human assessment" : "Add it in the prompt comparison"}</small></div>
+    </div><p class="muted judge-verdict-counts">Verdicts: ${verdictCount("equivalent")} equivalent · ${verdictCount("minor")} minor · ${verdictCount("major")} major</p>
+    ${human?.note ? `<p class="judge-human-score">Your note: ${esc(human.note)}</p>` : ""}</section>
+    <section aria-labelledby="judge-metrics-title"><h2 class="page-sec" id="judge-metrics-title">Judge usage comparison</h2>
+      <p class="muted judge-metric-note">Each row is a judge run, in the same order as the table below. Time is elapsed wall time; tokens and costs are reported by the agent. Older runs or agents may not provide every value.</p>
+      <div class="judge-metric-grid">${judgeMetricChart(group.ratings, "Time", "duration_ms", fmtMs)}${judgeMetricChart(group.ratings, "Tokens", "total_tokens", fmtTokens)}${judgeMetricChart(group.ratings, "Cost", "cost_usd", fmtCost)}</div></section>
+    <section aria-labelledby="judge-runs-title"><h2 class="page-sec" id="judge-runs-title">All judge runs <span class="muted">${group.ratings.length}</span></h2>
+    <div class="table-wrap card judge-runs-table"><table><thead><tr><th>Judge</th><th>Score</th><th>Verdict</th><th>Conclusion</th><th>Time</th><th>Tokens</th><th>Cost</th><th>Run</th></tr></thead><tbody>${group.ratings.map((rating) => `<tr class="judge-comparison-run"><td><strong>${esc(rating.model || "Default model")}</strong></td><td><strong>${esc(rating.score)} / 100</strong>${human ? `<br><span class="muted">${rating.score - human.human_score > 0 ? "+" : ""}${rating.score - human.human_score} vs yours</span>` : ""}</td>
+      <td>${judgeBadge(rating)}</td><td>${esc(rating.summary || "No summary recorded.")}${rating.differences.length ? `<details><summary>Observations</summary><ul>${rating.differences.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></details>` : ""}</td>
+      <td>${rating.duration_ms == null ? "—" : fmtMs(rating.duration_ms)}</td><td>${rating.total_tokens == null ? "—" : fmtTokens(rating.total_tokens)}</td><td>${rating.cost_usd == null ? "—" : fmtCost(rating.cost_usd)}</td>
+      <td>${esc(fmtDate(rating.rated_at))}</td></tr>`).join("")}</tbody></table></div></section></div>`;
+  bindJudgeOutputComparison(group.ratings);
+  bindCompare(a, b, () => viewJudgeComparison(query));
+  pollJudge(comparison.rating, () => viewJudgeComparison(query));
+}
+
 // ---- Compare page: any two runs of a prompt, and the LLM judge's call ------------------------
 
 async function viewCompare(query) {
   const a = query.get("a"), b = query.get("b");
+  const comparisonContext = query.get("rerun_comparison");
   if (!a || !b) { app.innerHTML = '<div class="card status-warn">Pick two runs to compare: open a rerun, then Compare.</div>'; return; }
   const [data, tags, settings] = await Promise.all([api(`/api/compare?${new URLSearchParams({ a, b })}`), api("/api/tags"), api("/api/settings")]);
+  const rerunComparison = comparisonContext || data.a.rerun_of?.prompt_id || data.b.rerun_of?.prompt_id;
   const models = (await loadModelCatalog()).map((m) => m.id);
   const kindLabel = { original: "Original", rerun: "Rerun", reference: "Reference run" };
-  const label = (pid) => kindLabel[data.candidates.find((x) => x.id === pid)?.kind] || "Run";
+  const label = (pid) => { const candidate = data.candidates.find((x) => x.id === pid); return kindLabel[candidate?.kind] || "Run"; };
   const picker = (id, current) => `<select id="${id}">${data.candidates.map((x) => `<option value="${esc(x.id)}" ${x.id === current ? "selected" : ""}>
-    ${esc(kindLabel[x.kind])} · ${esc(fmtDate(x.started_at))} · ${fmtCost(x.total_cost_usd)}</option>`).join("")}</select>`;
-  const labels = [label(a), label(b)];
-  if (labels[0] === labels[1]) labels.splice(0, 2, `${labels[0]} 1`, `${labels[1]} 2`);
+    ${x.is_reference ? "★ Reference · " : ""}${esc(kindLabel[x.kind])} · ${esc(fmtDate(x.started_at))} · ${fmtCost(x.total_cost_usd)} · ${esc((x.text || "").slice(0, 80))}</option>`).join("")}</select>`;
+  const labels = [`Reference · ${label(a)}`, `Compared run · ${label(b)}`];
   app.innerHTML = `
     <div class="prompts-page compare-page">
+      ${rerunComparison ? `<p><a href="#/rerun-comparison/${encodeURIComponent(rerunComparison)}">← All reruns comparison</a></p>` : ""}
       <header class="home-hero page-hero">
         <div class="hero-copy">
           <h1><span class="hero-name">Compare</span>Two runs of one prompt. <em>Read the differences, or trust it.</em></h1>
@@ -4237,18 +4536,19 @@ async function viewCompare(query) {
         </div>
       </header>
       <div class="compare-pick card">
-        <label>First ${picker("pick-a", a)}</label>
-        <button type="button" class="btn" id="swap" title="Swap the two runs">⇄</button>
-        <label>Second ${picker("pick-b", b)}</label>
-        <span class="muted">The original, each rerun of it, and its tags' reference runs.</span>
+        <label class="compare-role compare-role-reference"><span class="compare-role-kicker">01 · Baseline</span><strong>Reference run</strong><span>The starting point for changes and the judge.</span>${picker("pick-a", a)}</label>
+        <button type="button" class="btn compare-swap" id="swap" title="Swap the two runs" aria-label="Swap reference and compared run">⇄</button>
+        <label class="compare-role compare-role-other"><span class="compare-role-kicker">02 · Comparison</span><strong>Compared run</strong><span>Measured against the reference run.</span>${picker("pick-b", b)}</label>
+        <span class="muted compare-pick-note">Choose either run. ★ marks a saved reference; changing these selections does not change it.</span>
       </div>
       <div class="card compare-original">
-        ${judgeCardHtml(data.rating, models, settings.judge_model)}
+        <p><a class="btn" href="${esc(judgeComparisonUrl(a, b))}">Compare all judge runs →</a></p>
+        ${judgeCardHtml(data.rating, models, settings.judge_model, a, b)}
         ${compareRunsHtml(data.a, data.b, labels)}
       </div>
-      <p class="muted group-note"><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(a)}">Open the first run</a> · <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(b)}">Open the second run</a></p>
+      <p class="muted group-note"><a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(a)}">Open reference run</a> · <a target="_blank" rel="noopener noreferrer" href="#/prompt/${encodeURIComponent(b)}">Open compared run</a></p>
     </div>`;
-  const go = (x, y) => { location.hash = `#/compare?${new URLSearchParams({ a: x, b: y })}`; };
+  const go = (x, y) => { const params = new URLSearchParams({ a: x, b: y }); if (rerunComparison) params.set("rerun_comparison", rerunComparison); location.hash = `#/compare?${params}`; };
   document.getElementById("pick-a").onchange = (e) => go(e.target.value, b);
   document.getElementById("pick-b").onchange = (e) => go(a, e.target.value);
   document.getElementById("swap").onclick = () => go(b, a);
@@ -4256,11 +4556,85 @@ async function viewCompare(query) {
   pollJudge(data.rating, () => viewCompare(query));
 }
 
+// Keep the floating panel's visibility and position across reloads and navigation.
+const usagePanel = document.getElementById("usage-panel");
+const usageReopen = document.getElementById("usage-reopen");
+const usageDrag = document.getElementById("usage-drag");
+let usageAvailable = false;
+let usagePrefs = {};
+try { usagePrefs = JSON.parse(localStorage.getItem("usage-panel-prefs") || "{}"); } catch { /* Storage is optional. */ }
+if (!usagePrefs || typeof usagePrefs !== "object") usagePrefs = {};
+function saveUsagePrefs() {
+  try { localStorage.setItem("usage-panel-prefs", JSON.stringify(usagePrefs)); } catch { /* Storage is optional. */ }
+}
+function showUsagePanel() {
+  usagePanel.hidden = !usageAvailable || !!usagePrefs.closed;
+  usageReopen.hidden = !usageAvailable || !usagePrefs.closed;
+  if (!usagePanel.hidden && Number.isFinite(usagePrefs.x) && Number.isFinite(usagePrefs.y)) positionUsagePanel(usagePrefs.x, usagePrefs.y);
+}
+function positionUsagePanel(x, y) {
+  const rect = usagePanel.getBoundingClientRect();
+  x = Math.max(0, Math.min(x, innerWidth - rect.width));
+  y = Math.max(0, Math.min(y, innerHeight - rect.height));
+  usagePanel.style.left = `${x}px`;
+  usagePanel.style.top = `${y}px`;
+  usagePanel.style.right = "auto";
+  usagePanel.style.bottom = "auto";
+  usagePrefs.x = x; usagePrefs.y = y;
+}
+document.getElementById("usage-close").onclick = () => { usagePrefs.closed = true; saveUsagePrefs(); showUsagePanel(); };
+usageReopen.onclick = () => { usagePrefs.closed = false; saveUsagePrefs(); showUsagePanel(); };
+usageDrag.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  const rect = usagePanel.getBoundingClientRect();
+  const offsetX = event.clientX - rect.left, offsetY = event.clientY - rect.top;
+  usageDrag.setPointerCapture(event.pointerId);
+  const move = (e) => positionUsagePanel(e.clientX - offsetX, e.clientY - offsetY);
+  const end = () => {
+    usageDrag.removeEventListener("pointermove", move);
+    usageDrag.removeEventListener("pointerup", end);
+    usageDrag.removeEventListener("pointercancel", end);
+    saveUsagePrefs();
+  };
+  usageDrag.addEventListener("pointermove", move);
+  usageDrag.addEventListener("pointerup", end, { once: true });
+  usageDrag.addEventListener("pointercancel", end, { once: true });
+});
+usageDrag.addEventListener("keydown", (event) => {
+  const direction = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  const rect = usagePanel.getBoundingClientRect(), step = event.shiftKey ? 50 : 10;
+  positionUsagePanel(rect.left + direction[0] * step, rect.top + direction[1] * step);
+  saveUsagePrefs();
+});
+addEventListener("resize", () => {
+  if (!usagePanel.hidden && Number.isFinite(usagePrefs.x) && Number.isFinite(usagePrefs.y)) {
+    positionUsagePanel(usagePrefs.x, usagePrefs.y); saveUsagePrefs();
+  }
+});
+
+// The panel lives outside the routed page so its expanded state survives navigation.
+let usagePanelRequest = 0;
+async function refreshUsagePanel() {
+  const request = ++usagePanelRequest;
+  try {
+    const response = await fetch(BASE + "/api/limits");
+    if (!response.ok) return;
+    const limits = await response.json();
+    if (request !== usagePanelRequest) return;
+    usageAvailable = limits.length > 0;
+    usagePanel.querySelector(".hero-limits-content").innerHTML = homeLimits(limits);
+    showUsagePanel();
+  } catch { /* Keep the last known usage when temporarily offline. */ }
+}
+
 // ---- router ----------------------------------------------------------------
 
 async function route() {
   navigation++;
   refreshQueueCount();
+  refreshUsagePanel();
   destroyCharts();
   const [hash, queryString] = (location.hash.slice(1) || "/").split("?");
   const query = new URLSearchParams(queryString || "");
@@ -4268,7 +4642,7 @@ async function route() {
   // links from before the home page put the prompt filters on #/
   if (!view && ["q", "tag", "project", "sort", "order"].some((k) => query.has(k))) view = "prompts";
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active",
-    a.dataset.nav === ({ tag: "tags", session: "sessions", prompt: "prompts", compare: "reruns", rerun: "reruns", "rerun-comparison": "reruns" }[view] || view || "home")));
+    a.dataset.nav === ({ tag: "tags", session: "sessions", prompt: "prompts", compare: "reruns", rerun: "reruns", "rerun-comparison": "reruns", "judge-comparisons": "reruns", "judge-comparison": "reruns" }[view] || view || "home")));
   try {
     if (view === "prompts") await viewPrompts(query);
     else if (view === "prompt") await viewPrompt(decodeURIComponent(arg), { scope: query.get("compare"), tag: query.get("tag"), exclude_reruns: query.get("exclude_reruns") });
@@ -4278,6 +4652,8 @@ async function route() {
     else if (view === "tag") await viewTag(decodeURIComponent(hash.slice("/tag/".length)), query);
     else if (view === "setup" && !EXAMPLES) await viewSetup();
     else if (view === "reruns") await viewReruns(query);
+    else if (view === "judge-comparisons") await viewJudgeComparisons();
+    else if (view === "judge-comparison") await viewJudgeComparison(query);
     else if (view === "rerun") await viewRerun(decodeURIComponent(arg));
     else if (view === "rerun-comparison") await viewRerunComparison(decodeURIComponent(arg));
     else if (view === "compare") await viewCompare(query);

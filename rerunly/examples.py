@@ -66,11 +66,11 @@ def add_examples(conn):
 
     def rate(base, other, *, score=95, quality="same"):
         """An illustrative judge verdict on `other` against `base`: any two runs can be compared."""
-        conn.execute("INSERT INTO run_ratings(base_id,other_id,status,score,verdict,quality,look,summary,differences,model,rated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO run_ratings(base_id,other_id,status,score,verdict,quality,look,summary,differences,model,rated_at,origin,duration_ms,total_tokens,cost_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (base.id, other.id, "done", score, "equivalent" if score >= 85 else "major", quality, int(score < 85),
                  "Illustrative verdict: equivalent coverage of the required cases with less work." if score >= 85 else "Illustrative verdict: cheaper, but omits division-by-zero verification.",
                  json.dumps([] if score >= 85 else ["The rerun omitted the division-by-zero check."]),
-                 "Illustrative rating (no LLM call)", created))
+                 "Illustrative rating (no LLM call)", created, "explicit", 4200, 2380, 0.012))
 
     def rerun(base, other=None, *, blocked="", score=95, quality="same"):
         """`other` ran `base`'s own prompt again, as reruns do: never another text."""
@@ -125,6 +125,8 @@ def remove_examples(conn):
                 conn.execute(f"DELETE FROM {table} WHERE prompt_id=?", (pid,))
             conn.execute("DELETE FROM replays WHERE prompt_id=?", (pid,))
             conn.execute("DELETE FROM run_ratings WHERE base_id=? OR other_id=?", (pid, pid))
+            conn.execute("DELETE FROM judge_rating_history WHERE base_id=? OR other_id=?", (pid, pid))
+            conn.execute("DELETE FROM judge_feedback WHERE base_id=? OR other_id=?", (pid, pid))
             conn.execute("DELETE FROM tag_reference WHERE prompt_id=?", (pid,))
         conn.execute("DELETE FROM prompts WHERE source=?", (SOURCE,))
         conn.execute("DELETE FROM sessions WHERE source=?", (SOURCE,))

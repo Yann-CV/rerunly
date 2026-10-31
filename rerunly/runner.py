@@ -155,6 +155,29 @@ def alive(pid: int | None) -> bool:
         return True
 
 
+def terminal_process(session_id: str) -> bool | None:
+    """Find this user's terminal wrapper; None means process inspection is unavailable."""
+    proc = Path('/proc')
+    if not proc.is_dir():
+        return None
+    uncertain = False
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            args = (entry / 'cmdline').read_bytes().split(b'\0')
+            if session_id.encode() in args and any(arg.endswith(b'/rerunly/terminal.py') for arg in args):
+                if alive(int(entry.name)):
+                    return True
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            uncertain = True
+    return None if uncertain else False
+
+
 def start(cwd: str, argv: list[str], log: Path, on_exit, timeout: float | None = None) -> int:
     """Run `argv` in the background, its output to `log`; `on_exit()` once it ends. Returns its pid."""
     log.parent.mkdir(parents=True, exist_ok=True)

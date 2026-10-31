@@ -117,6 +117,14 @@ def test_rerun_reference_is_persistent_scoped_and_reprices_ratings(tmp_path):
         assert client.put(url, json={"reference_id": better}).status_code == 200
         data = client.get(url).json()
         assert data["reference_id"] == better
+        comparison = client.get("/api/compare", params={"a": weak, "b": better}).json()
+        choices = {item["id"]: item for item in comparison["candidates"]}
+        assert choices[better]["is_reference"]
+        assert not choices[original]["is_reference"]
+        assert choices[better]["text"]
+        # Swapping the runs keeps the whole group available in both selectors.
+        swapped = client.get("/api/compare", params={"a": better, "b": weak}).json()
+        assert {item["id"] for item in swapped["candidates"]} == set(choices)
         assert data["ratings"][weak] is None
         assert data["ratings"][original] is None
         assert client.put(url, json={"reference_id": original}).status_code == 200
@@ -157,3 +165,41 @@ def test_judge_compares_against_selected_rerun_reference(tmp_path, monkeypatch):
         assert "delegated edge-case" in calls[0][0]
         assert "Division by zero was not checked" in calls[0][1]
         assert calls[0][2] == "codex:gpt-6.1-sol"
+
+
+def test_human_judge_feedback_and_removal(tmp_path):
+    from rerunly import judge
+
+    path = tmp_path / "calibration.db"
+    with TestClient(create_app(path, background=False)) as client:
+        c = db.connect(path)
+        add_examples(c)
+        ids = ["rerunly-example:review-skill-v1", "rerunly-example:review-skill-v2",
+               "rerunly-example:cheap-but-incomplete", "rerunly-example:broad-prompt"]
+        pairs = [(ids[0], ids[1]), (ids[0], ids[2]), (ids[1], ids[2])]
+        with c:
+            for base, other in pairs:
+                rows = {r["id"]: dict(r) for r in c.execute(
+                    "SELECT id, text, answer, files FROM prompts WHERE id IN (?, ?)", (base, other))}
+                c.execute("INSERT OR REPLACE INTO run_ratings(base_id,other_id,status,score,model,input_hash) VALUES (?,?,?,?,?,?)",
+                          (base, other, "done", 70, "test-model", judge.input_hash(rows)))
+        c.close()
+        endpoint = "/api/ratings/feedback"
+        assert client.put(endpoint, json={"base": ids[0], "other": ids[3], "score": 90}).status_code == 400
+        assert client.put(endpoint, json={"base": ids[0], "other": ids[1], "score": 101}).status_code == 400
+        for base, other in pairs:
+            response = client.put(endpoint, json={"base": base, "other": other, "score": 90, "note": "More alike"})
+            assert response.status_code == 200
+            rating = response.json()
+            assert rating["score"] == 70 and "calibrated_score" not in rating
+        rating = client.get("/api/compare", params={"a": ids[0], "b": ids[1]}).json()["rating"]
+        assert rating["human_feedback"] == {"human_score": 90, "note": "More alike"}
+        c = db.connect(path)
+        with c:
+            c.execute("UPDATE prompts SET answer = answer || ' changed' WHERE id=?", (ids[2],))
+        c.close()
+        rating = client.get("/api/compare", params={"a": ids[0], "b": ids[1]}).json()["rating"]
+        assert rating["human_feedback"] == {"human_score": 90, "note": "More alike"}
+        assert client.request("DELETE", endpoint, json={"base": ids[0], "other": ids[1]}).status_code == 200
+        rating = client.get("/api/compare", params={"a": ids[0], "b": ids[1]}).json()["rating"]
+        assert rating["human_feedback"] is None and rating["score"] == 70

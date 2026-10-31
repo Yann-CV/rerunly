@@ -144,7 +144,7 @@ That's it. Go do some work, then come back and see what it cost.
 <tr>
 <td width="50%" valign="top">
 <a href="docs/screenshots/home.png"><img src="docs/screenshots/home.png" alt="Home dashboard with cost totals, expensive runs and tag highlights"></a>
-<p><b>Home at a glance</b>: Total spend, tokens and agent time, plus the most expensive and most repeated prompts. Category highlights help you find where the work goes.</p>
+<p><b>Home at a glance</b>: Total spend, tokens and agent time, plus the most expensive and most repeated prompts. Category highlights help you find where the work goes, and rerun history links each original prompt to its comparisons.</p>
 </td>
 <td width="50%" valign="top">
 <a href="docs/screenshots/prompts.png"><img src="docs/screenshots/prompts.png" alt="Prompt history with search, filters and daily cost totals"></a>
@@ -184,11 +184,11 @@ That's it. Go do some work, then come back and see what it cost.
 <tr>
 <td width="50%" valign="top">
 <a href="docs/screenshots/reruns.png"><img src="docs/screenshots/reruns.png" alt="Reruns page with a queue needing configuration, completed runs and judge verdicts"></a>
-<p><b>Reruns and their status</b>: Queue runs with model, effort, release and permission choices, then launch them together. Review consumption estimates and usage limits, complete missing queue configuration, and expand the history to explore attempts grouped by original prompt.</p>
+<p><b>Reruns and their status</b>: Queue runs with model, effort, release and permission choices, then launch them together. Review estimated tokens, concurrent time and API cost, complete missing queue configuration, and expand the history to explore attempts grouped by original prompt. Open **Compare all reruns** to select a reference run.</p>
 </td>
 <td width="50%" valign="top">
 <a href="docs/screenshots/compare.png"><img src="docs/screenshots/compare.png" alt="Comparison with cost savings, a worse judge verdict and both final answers"></a>
-<p><b>Savings and output quality</b>: Compare cost, tokens, time, tool calls, edited files and final answers. The LLM judge flags substantive differences: this illustrative cheaper rerun misses a required check.</p>
+<p><b>Savings and output quality</b>: Choose either run in the comparison, with saved references marked in the selectors. Compare cost, tokens, time, tool calls, edited files and final answers; use the review panel to choose a model and judge again. The LLM judge presents a substance score, conclusion and observations: this illustrative cheaper rerun misses a required check.</p>
 </td>
 </tr>
 <tr>
@@ -219,8 +219,12 @@ The detail available depends on what each agent records; see [Supported agents](
 - Find the most expensive single run, the most expensive prompt across repeated runs, and
   the prompt you use most. Open the underlying runs to investigate.
 - See the most used and most expensive tags across your tasks, projects, models and skills.
-- View connected agents' reported usage windows, observation times and reset times where
-  available. These account limits are separate from API-price cost estimates.
+- Browse rerun history by original prompt and open its comparison of all attempts.
+- Use the descriptive page links to explore prompts, sessions, tags, reruns and setup.
+- Keep connected agents' reported usage windows, observation times and reset times in view
+  across pages while scrolling with the floating usage panel. Drag its handle to move it,
+  or close it and use **Show usage** to reopen it. You can also move it with the arrow keys
+  while its handle is focused. These account limits are separate from API-price cost estimates.
 </details>
 
 <details>
@@ -230,12 +234,15 @@ The detail available depends on what each agent records; see [Supported agents](
   tag prefixes (such as **Task** for `task:`). Select several values in each dropdown:
   any selected value within a category matches; all selected categories must match.
   **Tag** lists only tags without a prefix.
+  The number beside each value is how many results selecting it would leave, given the search,
+  period and selections in the other menus; values with none are dimmed.
   The period filter sits on the left. Use **Tag → rerun** to find reruns.
   In **By tag**, reruns appear under the automatic **rerun** tag.
   Search sits above the filters; layout, sorting and selection controls sit on the final row.
   Sessions, the Tags gallery and tag prompt lists use the same toolbar layout. Sort by newest, cost, duration or tokens.
   Sessions offer the same tag menus and keep conversations containing a prompt that matches
-  all selected tags; their totals still include the whole conversation.
+  all selected tags; their totals still include the whole conversation. There, the menu numbers
+  count sessions; in **Rerun history**, attempts.
   Totals follow the filters, and filters live in the URL for bookmarking.
 - **List** groups prompts by day, with daily totals and each run's cost, tokens, time and
   subagent count. Click a tag on a prompt to filter by it.
@@ -271,6 +278,8 @@ The detail available depends on what each agent records; see [Supported agents](
   sorting, cost trends and charts that open in place.
 - Each tag has its own history, summary and comparison charts. Set a **reference run** to
   measure other runs against it and reuse its model, effort and agent release for reruns.
+- On a tag page, use **Rename** to change a tag you created. Its prompt assignments, rules,
+  exclusions and reference run follow the new name; automatically derived tags keep their recorded names.
 - Build rules with **Include keywords**, **Exclude keywords**, **Include tag** and
   **Exclude tag**, scoped to a prompt or session. Rules apply to existing and future history;
   exclusions take priority over inclusions.
@@ -287,8 +296,8 @@ The detail available depends on what each agent records; see [Supported agents](
   reasoning effort and CLI release, or copy a tag's
   reference settings. Launch immediately or **Add to queue**; queue selections from the
   Prompts page or a tag's page too.
-- **Reruns → Model availability** shows whether model information is available, model
-  counts and the time it was refreshed for each agent. **Recompute or schedule in Setup**
+- **Reruns → Model availability** summarizes whether model information is available; expand
+  it for model counts and the time each agent was refreshed. **Recompute or schedule in Setup**
   opens **Setup → Model availability**, where all check controls live.
   See the [availability summary](docs/screenshots/model-availability-summary.png).
 - In **Setup → Model availability**, choose agents and use **Check now**, or enable periodic
@@ -368,13 +377,17 @@ The detail available depends on what each agent records; see [Supported agents](
   **Attempt** for launch details, the prompt link for its imported output, or
   **Compare with original** for the comparison. **Compare all reruns** opens a table of every
   attempt alongside the original, including settings, status, cost, tokens, time and verdicts.
+  The selected reference is highlighted above the charts, with its cost, tokens and time.
+  Expand **Read the full original prompt** or **Full initial prompt** on a run to read its complete text.
   Charts show cost, duration and tokens over time for the original and imported reruns;
   a diamond marks the selected reference, and a point opens its prompt. Runs without imported
   usage remain in the table. The original is the initial reference; choose **Set as reference** on any imported run to
   save a new baseline for this prompt. Cost and time changes and judge verdicts then refer to
   that run. Choose a judge model and use **Judge output** or **Judge again** for each run;
-  both runs need final answers. Judge calls add usage and cost. Each imported attempt links
-  to its detailed output comparison. The example app never runs judges. See the
+  both runs need final answers. Each judge action shows a rough token estimate and any available
+  account-limit forecast. Judge calls add usage and cost. Each imported attempt links
+  to its detailed output comparison. Use **All reruns comparison** there to return to the
+  original table, including when the comparison was opened directly from rerun history. The example app never runs judges. See the
   [all-reruns comparison example](docs/screenshots/rerun-comparison.png). Expand **All launch settings** for permissions,
   restored skills and other options. Expansion choices stay in place during page updates.
   Runs still in progress appear above the history.
@@ -382,7 +395,11 @@ The detail available depends on what each agent records; see [Supported agents](
   imported results with the original. Imported rerun prompts get the `rerun` tag and are
   studied separately from the original's tags.
   An attempt's link opens its rerun details, including the full error or result,
-  launch settings and restored skills, even when no transcript was imported. From there,
+  launch settings and restored skills, even when no transcript was imported. **Check process
+  and logs** refreshes the process state and shows the last 16 KB of a background log;
+  terminal output stays in the terminal and agent transcript. Terminal reruns record completion;
+  on Linux, older terminal runs with no matching process after two minutes are marked failed.
+  When process inspection is unavailable their state remains unknown. From there,
   open the imported rerun when available, or use **Initial prompt →** to open the original.
   See the [rerun details example](docs/screenshots/rerun-detail.png).
 - Permission modes, skill restoration, budget caps and timeouts vary by
@@ -393,16 +410,34 @@ The detail available depends on what each agent records; see [Supported agents](
 <summary><b>Comparisons and LLM judging</b>: check whether savings kept the useful output</summary>
 
 - Compare two runs side by side, including the original, reruns and tag reference runs.
-  Inspect cost, tokens, time, tool calls, edited files and answer differences.
+  **Reference run** is the baseline and **Compared run** is measured against it. Swapping
+  or changing these selections does not change the saved reference.
+  Inspect both prompts, cost, tokens, time, tool calls, edited files and answer differences. The judge compares the selected pair, including changes to their requests.
 - After a rerun is imported, an LLM judge compares its output with the original's substance:
   similarity from 0–100, better/same/worse/unclear, a short explanation and key differences.
 - Verdicts flag **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it** and appear
   wherever rated reruns are listed. They help direct review; they are not a test of correctness.
+- From a two-run comparison, choose a judge model and **Add judgment to queue**. The
+  shared Reruns queue labels **Judge run** and **Prompt run** separately; select, remove,
+  or launch either type. Judge runs use the selected model (or the default at launch),
+  and show a separate rough token estimate. The queue shows limit impact for the entire queue
+  and the current selection, combining judgments and prompt runs by agent. Judgment cost and
+  duration are unavailable; automatic judgments after prompt runs are extra. If the same pair is already
+  being judged, another queued judgment stays in the queue until you launch it later.
+  On Reruns, expand **Rerun history** for prompt attempts and **Judge run history** for separately requested judgments. Automatic judgments attached to reruns stay with those reruns. Older judgments whose origin was not recorded remain on their comparisons but are omitted from judge history. Expand a judge's prompt pair to see its runs and open their comparison. The history buttons jump to these sections.
+- In **Reruns → Judge run history**, expand a prompt pair and choose **Compare all judge runs**. Its comparison page lets you select two judge runs to compare their scores, conclusions and observations side by side. It also summarizes the score range, average, verdict counts and your human score, then lists every completed judge run. Choose a model there to judge the pair again or add the judgment to the queue, with a usage estimate before launching. Earlier completed results are retained from this version onward. Open a pair to review it or add a human rating. See the [illustrative judge comparison](docs/screenshots/judge-comparison.png).
+- On a judged comparison, use **Add your judgment** to save your own 0–100 substance score
+  and an optional reason. The next AI judgment of those same prompts and answers receives
+  your assessment as context. Existing scores and verdicts remain unchanged. Edit or remove
+  your rating at any time; feedback is stored locally and tied to the compared inputs.
 - Choose a judge model per rerun or comparison. Set the default model and its effort in
   **Setup** (initially `claude-haiku-5-5`, at the model’s default effort). An explicit model
-  choice uses that model’s default effort. Judging runs through an installed, authenticated
+  choice uses that model’s default effort. The comparison's judge panel estimates token usage
+  from the two requests and answers and shows estimated limit impact when local calibration
+  is available. It uses a rough input approximation and assumes 512 output tokens; actual
+  usage, reasoning and CLI overhead can differ. Judging runs through an installed, authenticated
   agent in an empty scratch folder; it adds usage, with caps and timeouts depending on the agent.
-- The judge receives the request, final answers and edited file names, rather than file
+- The judge receives both requests, final answers and edited file names, rather than file
   contents or a repository diff. Long text is truncated to 30,000 characters per field.
 </details>
 
