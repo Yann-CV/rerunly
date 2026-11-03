@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -161,7 +160,7 @@ def test_codex_judge_stream(tmp_path, monkeypatch):
         events = [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(rating)}}, {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": 20}}]
         return type("Result", (), {"returncode": 0, "stdout": "\n".join(json.dumps(e) for e in events), "stderr": ""})()
 
-    monkeypatch.setattr(judge.subprocess, "run", run)
+    monkeypatch.setattr(judge.processes, "run", run)
     result = judge.rate("Fix", {"answer": "Fixed"}, {"answer": "Fixed"}, "codex:gpt-6-luna", tmp_path)
     assert result["score"] == 95 and result["cost_usd"] is None and result["total_tokens"] == 120
     argv, opts = calls[0]
@@ -243,7 +242,7 @@ def test_judge_runs_at_the_chosen_effort(tmp_path, monkeypatch):
             return type("Result", (), {"returncode": 0, "stdout": "\n".join(json.dumps(e) for e in events), "stderr": ""})()
         return type("Result", (), {"returncode": 0, "stdout": json.dumps({"result": json.dumps(rating), "total_cost_usd": 0.01}), "stderr": ""})()
 
-    monkeypatch.setattr(judge.subprocess, "run", run)
+    monkeypatch.setattr(judge.processes, "run", run)
     judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "codex:gpt-6-luna", tmp_path, effort="high")
     judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "claude-haiku-5-5", tmp_path, effort="max")
     judge.rate("Fix", {"answer": "A"}, {"answer": "A"}, "claude-haiku-5-5", tmp_path, effort="bogus; rm -rf /")

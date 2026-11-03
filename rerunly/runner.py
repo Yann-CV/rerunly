@@ -7,6 +7,7 @@ log; its final `result` line gives the answer, the cost and the denied actions, 
 """
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -45,16 +46,21 @@ def unattended_note(skills: list[dict]) -> str:
 
 
 def _skill_name(skill: str) -> str:
-    return skill.split(":")[-1]
+    name = skill.split(":")[-1]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in (".", ".."):
+        raise ValueError(f"Cannot restore skill with an unsafe name: {skill!r}")
+    return name
 
 
 def build_skills_plugin(folder: Path, versions: list[dict]) -> list[dict]:
     """A plugin in `folder` with each skill version: all its files from its git commit, or its SKILL.md
     snapshot otherwise. Returns, per skill, its pinned name and where it was restored from."""
+    names = [_skill_name(v["skill"]) for v in versions]
+    if len(names) != len(set(names)):
+        raise ValueError("Cannot restore multiple skills with the same name")
     restored = []
     skills_dir = folder / "skills"
-    for v in versions:
-        name = _skill_name(v["skill"])
+    for v, name in zip(versions, names, strict=True):
         target = skills_dir / name
         target.mkdir(parents=True, exist_ok=True)
         source = "snapshot"
@@ -97,7 +103,7 @@ def background_argv(prompt: str, session_id: str, model: str, effort: str, versi
         argv += ["--max-budget-usd", f"{budget:.2f}"]
     if plugin_dir:
         argv += ["--plugin-dir", str(plugin_dir)]
-    return [*argv, prompt]
+    return [*argv, "--", prompt]
 
 
 def outcome(log: Path) -> dict | None:
@@ -182,23 +188,35 @@ def start(cwd: str, argv: list[str], log: Path, on_exit, timeout: float | None =
     """Run `argv` in the background, its output to `log`; `on_exit()` once it ends. Returns its pid."""
     log.parent.mkdir(parents=True, exist_ok=True)
     out = log.open("w")
-    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    except BaseException:
+        out.close()
+        raise
 
     def wait():
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Stop the process group, including commands the agent spawned.
-            import signal
-            os.killpg(proc.pid, signal.SIGTERM)
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-            out.write(json.dumps({"type": "error", "message": "Rerun exceeded its time limit."}) + "\n")
-        out.close()
-        on_exit()
+                # A process can exit between wait() timing out and signalling its group.
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+                out.write(json.dumps({"type": "error", "message": "Rerun exceeded its time limit."}) + "\n")
+        finally:
+            out.close()
+            on_exit()
 
     threading.Thread(target=wait, daemon=True).start()
     return proc.pid

@@ -1,3 +1,5 @@
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportOperatorIssue=false
+# Transcripts are untyped JSON written by other programs: a missing field is handled where it matters.
 """Import Codex CLI/IDE rollout files; never read authentication or current skill files."""
 
 import json
@@ -70,7 +72,7 @@ class CodexSource:
         # Metadata is the first rollout record; avoid reading whole child transcripts for discovery.
         try:
             with path.open(encoding="utf-8") as f:
-                for _, raw in zip(range(10), f):
+                for _, raw in zip(range(10), f, strict=False):
                     try:
                         d = json.loads(raw)
                     except ValueError:

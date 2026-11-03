@@ -13,7 +13,13 @@ dependencies = [
 rerunly = "rerunly.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "playwright>=1.64.1",
+    "ruff>=0.17.3",
+    "pyright>=1.1.414",
+]
 # status bar icon (`rerunly tray`); Qt talks to the desktop's StatusNotifier tray over D-Bus
 tray = ["PySide6-Essentials>=6.7"]
 
@@ -27,3 +33,32 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rerunly"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]  # such as an unclosed database
+
+[tool.ruff]
+target-version = "py311"
+line-length = 160
+
+[tool.ruff.lint]
+select = ["F", "E7", "E9", "B", "ASYNC", "S"]
+ignore = [
+    "B008",  # FastAPI's Body(...) and Depends(...) defaults
+    "E501",  # long lines are a separate, cosmetic clean-up
+    "E731",
+    "S101",
+    "S603",  # agents are launched from argument lists, never through a shell
+    "S607",  # the agent CLIs are found on the user's PATH by design
+    "S608",  # queries interpolate only constants and placeholders; values are bound (db._sql_list is the one exception)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B", "E7", "F841"]
+"docs/*" = ["S", "B"]
+
+[tool.pyright]
+include = ["rerunly"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

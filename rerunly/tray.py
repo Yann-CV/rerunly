@@ -16,7 +16,7 @@ REFRESH_MS = 60_000
 
 def _get(url: str, method: str = "GET", timeout: float = 2) -> dict | None:
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=timeout) as r:  # noqa: S310 - its own local server
             return json.loads(r.read())
     except (OSError, ValueError):
         return None
@@ -106,7 +106,7 @@ def run_tray(db_path: Path, port: int, host: str = "127.0.0.1") -> None:
 
     autostart.toggled.connect(toggle_autostart)
     quit_action.triggered.connect(quit_app)
-    tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and webbrowser.open(f"{base}/"))
+    tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and webbrowser.open(f"{base}/"))  # pyright: ignore[reportAttributeAccessIssue]
     tray.setContextMenu(menu)
     tray.show()
 

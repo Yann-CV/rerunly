@@ -12,3 +12,11 @@ def isolate_codex_history(monkeypatch, tmp_path):
     from rerunly import live_limits
     monkeypatch.setattr(live_limits, "claude_code", lambda: None)
     monkeypatch.setattr(live_limits, "codex", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def close_test_connections():
+    """Connections a test opens itself; the app closes its own, and a leak now fails the run."""
+    from rerunly import db
+    with db.connection_scope():
+        yield

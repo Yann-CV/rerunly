@@ -17,7 +17,7 @@
   <img alt="OpenAI Codex" src="https://img.shields.io/badge/works%20with-OpenAI%20Codex-222222">
   <img alt="Claude Code" src="https://img.shields.io/badge/works%20with-Claude%20Code-6250d6">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-2a78d6">
-  <img alt="Local first" src="https://img.shields.io/badge/data-stays%20on%20your%20machine-1baf7a">
+  <img alt="Local first" src="https://img.shields.io/badge/history-stored%20on%20your%20machine-1baf7a">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-9a9993">
 </p>
 
@@ -101,9 +101,10 @@ up automatically from official provider pages, with your overrides taking preced
 
 ### 🔒 Your history stays local
 **No Rerunly account or cloud upload.** Imported history lives in a local SQLite file and a
-local dashboard. Reruns, optional model checks and LLM judging use your installed, authenticated agents; automatic
-price lookups send no prompts and can be disabled. [Account usage checks](#account-usage-and-reset-limits)
-can contact providers using your agents’ existing logins.
+local dashboard. The chart library is bundled, so displaying charts does not contact a CDN. Reruns, optional model checks and LLM judging use your installed, authenticated agents;
+**reruns and judging send prompts and answers to the selected agent's model provider**
+([details](#before-you-rerun-or-judge)). Automatic price lookups send no prompts and can be disabled.
+[Account usage checks](#account-usage-and-reset-limits) can contact providers using your agents’ existing logins.
 
 </td>
 </tr>
@@ -128,10 +129,16 @@ Open <http://127.0.0.1:8765> and go to **Setup**:
 2. **Import now**: load your available history from supported agents.
 3. **Start at login** *(optional)*: keep the dashboard running automatically.
 
-For a foreground dashboard without the tray, use `uv run rerunly`. History import needs
-no installed agent or API key when transcript files are already available. Running tasks or
+For a foreground dashboard without the tray, use `uv run rerunly`. The dashboard is local by
+default and has no login. On Linux, other users on the machine are refused. If you bind it to a
+non-loopback interface with `serve --host`, network connections must use the access link printed
+at startup (or the token in `access-token`, next to the database, as a bearer token). That
+traffic is unencrypted HTTP and the token controls your history and reruns, so use it on trusted networks
+or behind an encrypted tunnel. macOS has no per-user check, so other accounts there can still reach the local port.
+History import needs no installed agent or API key when transcript files are already available. Running tasks or
 judges requires an installed, authenticated Claude Code or Codex CLI; selecting a pinned
-CLI release also requires Node.js and `npx`.
+CLI release also requires Node.js and `npx`. Reruns can change your files and use your agent
+quota: read [Before you rerun or judge](#before-you-rerun-or-judge) first.
 
 New history is imported automatically. For integration-specific setup, including hooks
 and reported costs, see [Supported agents](#-supported-agents).
@@ -183,24 +190,35 @@ That's it. Go do some work, then come back and see what it cost.
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/screenshots/reruns.png"><img src="docs/screenshots/reruns.png" alt="Reruns page with a queue needing configuration, completed runs and judge verdicts"></a>
-<p><b>Reruns and their status</b>: Queue runs with model, effort, release and permission choices, then launch them together. Review estimated tokens, concurrent time and API cost, complete missing queue configuration, and expand the history to explore attempts grouped by original prompt. Open **Compare all reruns** to select a reference run.</p>
+<a href="docs/screenshots/reruns.png"><img src="docs/screenshots/reruns.png" alt="Completed CSV validation reruns with recorded costs, settings and judge verdicts"></a>
+<p><b>Completed reruns</b>: Three finished attempts at the same CSV validation task, with recorded usage, settings and output verdicts. Open <b>Compare all reruns</b> to explore their charts and choose a reference.</p>
 </td>
 <td width="50%" valign="top">
-<a href="docs/screenshots/compare.png"><img src="docs/screenshots/compare.png" alt="Comparison with cost savings, a worse judge verdict and both final answers"></a>
-<p><b>Savings and output quality</b>: Choose either run in the comparison, with saved references marked in the selectors. Compare cost, tokens, time, tool calls, edited files and final answers; use the review panel to choose a model and judge again. The LLM judge presents a substance score, conclusion and observations: this illustrative cheaper rerun misses a required check.</p>
+<a href="docs/screenshots/compare.png"><img src="docs/screenshots/compare.png" alt="Recorded cost, tokens, time, edited files and final answers for two completed CSV validation runs"></a>
+<p><b>Usage and final answers</b>: Compare the original and a compact rerun with recorded cost, tokens, time, calls, edited files and both final answers. This illustrative pair preserves all required CSV validation cases.</p>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/screenshots/tag-dark.png"><img src="docs/screenshots/tag-dark.png" alt="The same tag detail page in dark mode"></a>
-<p><b>Light and dark</b>: The dashboard follows your system theme. Tag prefixes and chip shapes distinguish categories alongside their colors in both modes.</p>
+<a href="docs/screenshots/rerun-comparison.png"><img src="docs/screenshots/rerun-comparison.png" alt="Rerun comparison charts with four populated points for cost, duration and tokens, and a selected reference"></a>
+<p><b>One prompt, four completed runs</b>: Follow cost, duration and tokens across an original and three completed reruns. The reference diamond identifies the baseline; select any chart point to inspect its prompt.</p>
+</td>
+<td width="50%" valign="top">
+<a href="docs/screenshots/judge-comparison.png"><img src="docs/screenshots/judge-comparison.png" alt="Two selected judge runs with populated scores, verdicts, conclusions and observations"></a>
+<p><b>Compare the judges</b>: Select two saved judge runs and read their scores, conclusions and observations side by side. The example app includes three perspectives on the same completed pair.</p>
+</td>
+</tr>
+<tr>
+<td colspan="2" valign="top">
+<a href="docs/screenshots/judge-usage-comparison.png"><img src="docs/screenshots/judge-usage-comparison.png" alt="Three judge runs with scores, a human assessment, and populated time, token and cost charts"></a>
+<p><b>Quality and judge usage together</b>: Compare the score range and average with a saved human assessment, then inspect time, tokens and cost for all three illustrative judges.</p>
 </td>
 </tr>
 </table>
 
 Screenshots use the isolated example app: costs, timings, outputs and judge verdicts are
-illustrative, not measured improvements. Always use the example app for documentation
+illustrative, not measured improvements. The illustrations show populated results from completed
+examples; the example app also retains a blocked-run scenario for exploration. Always use the example app for documentation
 illustrations. Click any image for the full-size view.
 
 To refresh these images from the current UI, see [the screenshot capture script](docs/capture_screenshots.py).
@@ -248,8 +266,8 @@ The detail available depends on what each agent records; see [Supported agents](
   subagent count. Click a tag on a prompt to filter by it.
 - **By tag** groups cards by tag family, with median cost, trend, sparkline, totals and the
   latest run. Expand a card for earlier runs; order tags by usage, recency, cost, time or tokens.
-- Select prompts to tag them together or queue reruns in bulk. The selection action bar
-  [Selection actions](docs/screenshots/prompt-selection.png) stay visible while you scroll
+- Select prompts to tag them together or queue reruns in bulk. The
+  selection action bar stays visible while you scroll
   through prompts, including on tag pages.
 </details>
 
@@ -265,8 +283,13 @@ The detail available depends on what each agent records; see [Supported agents](
   agent and execution settings, then estimated additional usage and limit impact.
   Recorded configuration and skills have their own disclosure inside the panel.
   Hover, focus or tap a section’s ⓘ icon for an explanation; press Escape to dismiss it.
-  See the [expanded rerun panel](docs/screenshots/prompt-rerun.png).
+- Inside that disclosure, **The same run, from a terminal** shows a command based on the recorded
+  configuration, with **Copy**. Review it before running it: its skill restoration commands
+  may replace local files.
 - Use tag pages and the Reruns page to compare runs and review results.
+- **Delete prompt** removes the prompt from Rerunly's history, with its subagents, tags, ratings
+  and queued reruns. The transcript stays on disk and later imports skip it. Its reruns remain,
+  without their original. To hide work reversibly, use exclusions instead.
 </details>
 
 <details>
@@ -280,8 +303,10 @@ The detail available depends on what each agent records; see [Supported agents](
   measure other runs against it and reuse its model, effort and agent release for reruns.
 - On a tag page, use **Rename** to change a tag you created. Its prompt assignments, rules,
   exclusions and reference run follow the new name; automatically derived tags keep their recorded names.
+  Use **Add a description** to note what a tag you created is for.
 - Build rules with **Include keywords**, **Exclude keywords**, **Include tag** and
-  **Exclude tag**, scoped to a prompt or session. Rules apply to existing and future history;
+  **Exclude tag**, scoped to a prompt or session. Keyword and skill rules preview how many
+  prompts or sessions they match before you save. Rules apply to existing and future history;
   exclusions take priority over inclusions.
 - Curate your tags by excluding individual or selected prompts without deleting history.
   Review relevance warnings based on excluded examples, restore membership, or stop using an
@@ -299,11 +324,9 @@ The detail available depends on what each agent records; see [Supported agents](
 - **Reruns → Model availability** summarizes whether model information is available; expand
   it for model counts and the time each agent was refreshed. **Recompute or schedule in Setup**
   opens **Setup → Model availability**, where all check controls live.
-  See the [availability summary](docs/screenshots/model-availability-summary.png).
 - In **Setup → Model availability**, choose agents and use **Check now**, or enable periodic
   checks every **6 hours**, **daily** or **weekly**, then **Save schedule**. Periodic checks
   are off by default and run only while Rerunly is running. Cancel an active check there.
-  See the [model availability settings](docs/screenshots/model-checks.png).
 - Each check refreshes the machine-readable catalog behind `/model` through your installed
   agents and deduplicates model aliases. **No test prompts are sent, and checks use no
   inference tokens or API credits.** Agents can contact their providers to retrieve model
@@ -341,15 +364,14 @@ The detail available depends on what each agent records; see [Supported agents](
   when explicit permissions are required in a highlighted warning and marks invalid fields.
   **Save settings** and **Save and continue** stay disabled while settings are incomplete,
   invalid, being checked or being saved. Validation preserves your edits.
-  See the [settings warning example](docs/screenshots/queue-settings.png). **Configure** edits other runs too.
+  **Configure** edits other runs too.
 - The rerun form separates **Current account status** (reported usage and reset times) from
   **Rerun estimate** (additional tokens, API cost, duration baseline and learned limit impact).
   The prompt panel supports manual refresh and refreshes usage every minute.
 - The **Reruns** navigation link shows a badge with the number of queued runs (hidden when
   empty). The **Reruns** page presents queued runs as cards with the agent, model, effort, execution
   mode, with a compact estimate row that includes the original cost. Expand **Settings & usage details** for
-  permissions, release, working directory and usage forecasts. See the
-  [queue card example](docs/screenshots/rerun-queue.png). Launch one,
+  permissions, release, working directory and usage forecasts. Launch one,
   selected runs, or all together; review combined cost/tokens, summed run time and the
   longest-run duration baseline before launching. If any selected run needs input, launching
   opens its configuration form before any run starts. Save each incomplete configuration,
@@ -401,7 +423,6 @@ The detail available depends on what each agent records; see [Supported agents](
   on Linux, older terminal runs with no matching process after two minutes are marked failed.
   When process inspection is unavailable their state remains unknown. From there,
   open the imported rerun when available, or use **Initial prompt →** to open the original.
-  See the [rerun details example](docs/screenshots/rerun-detail.png).
 - Permission modes, skill restoration, budget caps and timeouts vary by
   [agent](#-supported-agents).
 </details>
@@ -413,10 +434,14 @@ The detail available depends on what each agent records; see [Supported agents](
   **Reference run** is the baseline and **Compared run** is measured against it. Swapping
   or changing these selections does not change the saved reference.
   Inspect both prompts, cost, tokens, time, tool calls, edited files and answer differences. The judge compares the selected pair, including changes to their requests.
-- After a rerun is imported, an LLM judge compares its output with the original's substance:
+- Automatic judging is **on by default** for each rerun; untick it in the rerun form to opt out.
+  When on, importing the rerun's answer starts an LLM judgment against the original:
   similarity from 0–100, better/same/worse/unclear, a short explanation and key differences.
 - Verdicts flag **✓ Good enough**, **◐ Minor differences** or **⚠ Look at it** and appear
-  wherever rated reruns are listed. They help direct review; they are not a test of correctness.
+  wherever rated reruns are listed. **Look at it** means the judge set `look` or the verdict
+  `major`; **Minor differences** means the verdict `minor`; anything else is **Good enough**.
+  The badge ignores `quality`, so a `worse` or `unclear` call can still show **Good enough**:
+  read the conclusion too. Badges help direct review; they are not a test of correctness.
 - From a two-run comparison, choose a judge model and **Add judgment to queue**. The
   shared Reruns queue labels **Judge run** and **Prompt run** separately; select, remove,
   or launch either type. Judge runs use the selected model (or the default at launch),
@@ -425,7 +450,7 @@ The detail available depends on what each agent records; see [Supported agents](
   duration are unavailable; automatic judgments after prompt runs are extra. If the same pair is already
   being judged, another queued judgment stays in the queue until you launch it later.
   On Reruns, expand **Rerun history** for prompt attempts and **Judge run history** for separately requested judgments. Automatic judgments attached to reruns stay with those reruns. Older judgments whose origin was not recorded remain on their comparisons but are omitted from judge history. Expand a judge's prompt pair to see its runs and open their comparison. The history buttons jump to these sections.
-- In **Reruns → Judge run history**, expand a prompt pair and choose **Compare all judge runs**. Its comparison page lets you select two judge runs to compare their scores, conclusions and observations side by side. It also summarizes the score range, average, verdict counts and your human score, then lists every completed judge run. Choose a model there to judge the pair again or add the judgment to the queue, with a usage estimate before launching. Earlier completed results are retained from this version onward. Open a pair to review it or add a human rating. See the [illustrative judge comparison](docs/screenshots/judge-comparison.png).
+- In **Reruns → Judge run history**, expand a prompt pair and choose **Compare all judge runs**. Its comparison page lets you select two judge runs to compare their scores, conclusions and observations side by side. It also summarizes the score range, average, verdict counts and your human score, charts each judge run's time, tokens and cost under **Judge usage comparison** (older runs or agents may not report every value), then lists every completed judge run. Choose a model there to judge the pair again or add the judgment to the queue, with a usage estimate before launching. Earlier completed results are retained from this version onward. Open a pair to review it or add a human rating. See the [illustrative judge comparison](docs/screenshots/judge-comparison.png).
 - On a judged comparison, use **Add your judgment** to save your own 0–100 substance score
   and an optional reason. The next AI judgment of those same prompts and answers receives
   your assessment as context. Existing scores and verdicts remain unchanged. Edit or remove
@@ -492,7 +517,11 @@ uv run rerunly stop
 uv run rerunly autostart on   # start at every login, without any action (off to undo)
 uv run rerunly ingest         # import once and exit (--force to re-parse everything)
 uv run rerunly --reload       # while hacking on it: restarts on Python changes
+uv run rerunly serve --port 9000   # another port (also on start, tray and autostart)
 ```
+
+- Claude Code telemetry records the dashboard's port when enabled. After changing port,
+  enable telemetry again from Setup.
 
 - **Start at login** writes a standard desktop entry to `~/.config/autostart`, run by GNOME,
   KDE and other desktops. You can also switch it from the icon's menu or the Setup page.
@@ -504,8 +533,9 @@ uv run rerunly --reload       # while hacking on it: restarts on Python changes
   it instead of starting a second server.
 - Page files are never cached and `--reload` restarts the server on code changes, so a page
   refresh always shows the latest version.
-- The database lives in `~/.local/share/rerunly/dashboard.db`. Change it with `--db` or
-  `RERUNLY_DB`. Coming from the tool's former name, Agent Task Dashboard? Your data moves
+- The database lives in `~/.local/share/rerunly/dashboard.db`. Rerunly makes that folder private
+  to your user at startup. Change the location with `--db` or `RERUNLY_DB`; a database elsewhere
+  keeps the permissions you gave it. Coming from the tool's former name, Agent Task Dashboard? Your data moves
   over by itself the first time you run `rerunly`.
 
 ## 🔗 How prompts are linked
@@ -542,8 +572,8 @@ it is only common words (such as "do it"), which leaves nothing to compare.
     keyword), a **skill** the agent used, or another **tag** to include or exclude. Keyword
     rules can exclude matches too. A rule applies **in a prompt** (that prompt matches) or
     **in a session** (a matching title, prompt or tag affects every prompt in the session).
-    Inclusion rules add eligible prompts; exclusion rules, explicit exclusions and tag
-    priorities can keep them out. See [Curate prompts within a tag](#curate-prompts-within-a-tag).
+    Inclusion rules add eligible prompts; exclusion rules and explicit exclusions
+    can keep them out. See [Curate prompts within a tag](#curate-prompts-within-a-tag).
 
   Deleting a tag only removes the tag and its rules: the prompts stay.
 
@@ -568,6 +598,147 @@ API price estimates measure token usage, not subscription charges or credit cons
 Wall time runs from a prompt to its last recorded event. Similar prompts use word overlap
 (Jaccard) at the configured threshold, as described in [How prompts are linked](#-how-prompts-are-linked).
 Skill snapshots, agent versions, model and effort are captured where the transcript supplies them.
+
+## Before you rerun or judge
+
+Rerunly drives real coding agents. Reading transcripts needs no agent, but launching a rerun or
+a judge starts one, and imports start automatic judgments for reruns that have them on.
+
+**Reruns act on your real files**
+
+- **There is no isolation.** A rerun works directly in the recorded directory (or the one you
+  choose), with no worktree or copy. It can change your current files, including uncommitted
+  work, and repeat side effects the prompt asks for, such as commits, pushes or messages.
+  Commit or stash first, and use a disposable checkout for anything you would not want repeated.
+- **Queued runs start together.** Launching a selection starts every run at once, and runs
+  for the same directory share it. They can overwrite each other's edits and skew each
+  other's results. Give them separate checkouts when comparing runs that edit files.
+- **Same as original can mean full access.** If the original ran with Claude's
+  `bypassPermissions` or `dontAsk`, or Codex's `danger-full-access` with approvals off, the
+  rerun gets those permissions too, and they are accepted for unattended background runs.
+  Check the recorded permissions, or choose explicit ones.
+- **Only the prompt and captured skills come back.** The rerun uses your current repository,
+  instructions (such as `CLAUDE.md` or `AGENTS.md`), MCP servers, hooks and login, so a difference
+  in results may not come from the setting you changed. Background runs also get an added
+  instruction to stop when blocked and report a status, which terminal runs do not.
+- **Limits differ by agent.** Claude background runs have no time limit, and their only stop is
+  the dollar budget: the rerun form pre-fills it from the original cost, and an empty budget
+  means no cap. Terminal runs do not enforce a budget. Codex background runs stop after one
+  hour and have no dollar cap.
+- **Prompts appear in process arguments.** Rerun prompts are passed on the agent's command line,
+  as are Codex judge prompts, so other users on a shared machine may see them in `ps`.
+
+**What leaves your machine**
+
+- **Reruns** send the prompt and whatever the agent reads to the selected agent's provider.
+  Switching a recorded Claude Code prompt to Codex, or the reverse, sends it to the other provider.
+- **Judges** send both requests, both final answers and the edited file names, up to 30,000
+  characters per request and answer, to the judge's provider. The default judge is a Claude
+  model whichever agent ran the task, so judging a Codex rerun sends its content to Anthropic
+  unless you pick a `codex:` judge. Without Claude Code installed, default judgments fail.
+- **Usage checks** read `~/.claude/.credentials.json` or `~/.codex/auth.json` (under
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` when set) and call `api.anthropic.com/api/oauth/usage` or
+  `chatgpt.com/backend-api/wham/usage` when local readings are missing or have all reset.
+  [See what they send](#account-usage-and-reset-limits). They have no separate off switch:
+  they also run after imports, including the hourly pass when the import interval is 0.
+  Only removing the agent's connection stops them.
+
+Each provider's own terms apply to what it receives.
+
+**How far to trust a judge**
+
+- **Judging spends usage without asking.** It is on by default for reruns, and it does not count
+  towards prompt history totals because judge sessions are not imported. See its cost on the comparison pages.
+- **Past reruns can be judged again automatically.** A stored result is tied to the inputs and judge
+  instructions. If a re-import changes an answer, or a Rerunly update changes the instructions,
+  the next import judges every affected rerun that had automatic judging on, all at once.
+- **The scratch folder is not a security boundary.** "Treat as data" is only an instruction to
+  the model, so text in a transcript can still try to steer it. The judge keeps the agent's tools:
+  Codex's read-only sandbox can run commands and read files outside the folder, and Claude can
+  do whatever your settings allow without a prompt.
+- **Your own agent setup applies.** Judges do not disable your user-level instructions, hooks or
+  MCP servers, which can add tokens and influence the verdict.
+- **Scores vary.** The same pair can score differently between runs and models, and the judge
+  never sees file contents or test results. Use **Compare all judge runs** to see the spread.
+
+## Inside the rerun and judging loop
+
+1. **Choose and launch.** Select a recorded prompt, agent, model, effort, CLI release,
+   permissions and terminal or background mode. Captured skills are restored and automatic
+   judging is on unless you turn them off. Queue entries retain their settings; the launch preflight
+   checks the selected entries before starting any of them. The original prompt is sent
+   to a fresh agent session in the recorded working directory, with a new session ID.
+   Codex also receives a replay marker so its independently assigned thread can be linked
+   when imported. The workspace is its current state, not a snapshot of the original run.
+2. **Restore and run.** When available, a skill captured from a committed Git state is
+   restored from that commit; otherwise its recorded instruction snapshot is used. Claude
+   loads restored skills through a temporary plugin; Codex receives paths to the restored
+   instructions. Background agents receive an instruction to stop and report what is needed
+   if a decision or denied action blocks them, and to end with a `RERUN STATUS` line.
+   Background output is logged; an agent error is marked failed, while a reported block or
+   permission denial is marked **needs you**. Terminal runs are interactive and tracked
+   separately. Skill restoration does not recreate the original conversation or repository.
+3. **Import and compare.** Normal ingestion links the new transcript to the launch and
+   imports its recorded answer, usage and files. Unless automatic judging was turned off for
+   that rerun, once both answers exist ingestion starts a background judgment against the
+   original prompt. You can also judge an ordered pair explicitly, judge again with
+   another model, or queue a judgment. Selecting a different comparison reference does not
+   retroactively change the automatic judgment against the original.
+4. **Review and iterate.** Compare usage and answers, inspect the judge's explanation, and
+   optionally record your own score and reason. Change the prompt, skills or settings and
+   rerun again; Rerunly measures and displays the results but does not automatically edit
+   prompts or choose the next configuration. Each new explicit judgment retains the previous
+   completed result in history. A failed judgment reports an error and can be retried.
+
+### What the judge is asked to do
+
+The current instructions and prompt builder are in [rerunly/judge.py](rerunly/judge.py).
+For each judgment Rerunly constructs a prompt containing:
+
+- Instructions to compare the **reference request** and **rerun request**, evaluate each
+  answer against its own requirements, and explain differences caused by changed scope.
+  The judge is asked to treat requests and outputs as data, not instructions.
+- Each request, its final answer, and the recorded names of edited files. Each request and
+  answer is clipped separately at 30,000 characters, with a cut marker. The judge does not
+  receive file contents, a repository diff, or proof that a reported artifact exists.
+- When matching human feedback exists, a **HUMAN ASSESSMENT OF THIS PAIR** section
+  containing a JSON object with the human `score` and `reason`.
+
+The instructions separate *substance similarity* from *task quality*: the reference is not
+assumed correct, and different valid choices for an open-ended task can be dissimilar without
+being worse. The judge is told to use `unclear` when correctness, repository membership or
+artifacts cannot be verified from the supplied evidence, and to explain missing evidence and
+truncation. It is asked whether a human should inspect the differences before relying on the
+rerun. Its requested JSON contains `score` (0–100), `verdict` (`equivalent`, `minor` or
+`major`), `quality` (`better`, `same`, `worse` or `unclear`), `look` (a boolean), a
+one-sentence `summary`, and up to five `differences`. The parser clamps the score to 0–100;
+if the verdict is missing or invalid, it falls back to equivalent at 85 or higher, minor at
+60–84, and major below 60. These fallback thresholds do not force a valid model-provided
+verdict to agree with the score.
+
+Judging uses the selected installed CLI in a scratch directory. Claude runs without session
+persistence, permission prompts or slash commands, with a fixed $0.50 budget cap;
+Codex runs ephemerally in a read-only sandbox with approvals disabled and no dollar cap.
+Both have a ten-minute timeout. A model's answer is an assessment of the supplied evidence,
+not a correctness test or a substitute for reviewing files and running tests. See
+[How far to trust a judge](#before-you-rerun-or-judge) for what this setup does not isolate.
+
+### How human feedback enters a later judgment
+
+After a completed judgment, **Add your judgment** saves an integer substance score and an
+optional reason of up to 2,000 characters. For a later judgment of the same ordered pair,
+Rerunly appends that score and reason to the constructed prompt. It asks the judge to
+consider the assessment, especially the reason, while making its own judgment from the
+supplied evidence; the feedback is explicitly treated as data. For example, a score of 40
+and reason “Missed a test” become `{"score": 40, "reason": "Missed a test"}` in that section.
+
+This is pair-specific context, not a library of examples selected from other comparisons or
+model training. The stored feedback is matched to the ordered prompt IDs and a fingerprint of
+both recorded requests, answers and file lists plus the current judge instructions. Swapping
+the pair, changing those inputs, or changing the instructions prevents the old assessment
+from being supplied as matching context. Editing or removing feedback affects future calls;
+it does not rewrite completed judgments or launch one automatically. Judgment results use
+the same input fingerprint, so a result for an older answer is not presented as current.
 
 ## 🤖 Supported agents
 
@@ -597,7 +768,9 @@ restores it when removed; agent settings changes keep a `.bak` copy.
 Claude reruns restore recorded skills into a temporary plugin. You can use the installed
 CLI or select a release, model and effort. Unattended runs deny actions that would ask for
 approval and can enforce a dollar budget cap; terminal runs let you approve actions.
-Recorded permission modes can be reused through **Same as original**.
+Recorded permission modes can be reused through **Same as original**. Background runs have no
+time limit, so set a budget. A rerun does not restore the conversation, repository state,
+authentication, MCP servers or the full harness configuration.
 
 The transcript and telemetry details below explain Claude-specific attribution and pricing.
 
@@ -727,6 +900,47 @@ calibrations separate, but the readings do not identify the account itself. Mode
 calibration prevent a complete limit forecast; judge usage is extra. API token estimates do
 not measure subscription charges. Reset times remain provider-reported, not predicted.
 
+### Estimate and forecast calculations
+
+A prompt-run estimate starts with the original main agent and linked subagents. Input is
+recorded uncached input plus cache reads and writes; output and recorded web searches are
+also carried forward. The selected model replaces the main-agent model for repricing, while
+subagents keep their recorded single model where identifiable. If a model is unchanged and
+its recorded cost is complete and priced, that cost is reused to retain details lost in the
+aggregates, such as cache-write duration and fast mode. Otherwise the recorded token mix is
+priced using the selected model's price and the standard five-minute cache-write rate. A
+fully covered Claude-reported total can be reused for an unchanged main model. Unknown
+models or prices make the complete cost unavailable. Duration is the original active time,
+or wall time if active time is unavailable; it is a baseline, not a prediction of the new
+model's speed. Token volume is carried over unchanged: changing the effort, model or agent does
+not change the estimated tokens, and effort does not change the estimated cost.
+
+For a judge, Rerunly builds the actual judging prompt, including matching human feedback,
+and approximates input tokens as `ceil(UTF-8 bytes / 4)`, then adds 512 output tokens. It
+does not estimate judge cost or duration. The queue sums known prompt-run tokens and costs,
+reports missing estimates, and shows both summed duration and a concurrent baseline equal to
+the longest known run, assuming they start together. Explicitly queued judges contribute
+their approximate tokens separately; automatic judgments after prompt runs are additional.
+
+For each agent, reported plan and reading source, model and quota window, the limit forecast
+learns from eligible pairs of consecutive readings and the recorded token changes between
+them. For each model, the central rate is total observed percentage-point increase divided
+by total observed tokens. Multiplying this rate by estimated tokens gives the additional
+percentage points; contributions from all estimated models are added. The lower and upper
+rates use the minimum and maximum per-sample rates after subtracting or adding one percentage
+point respectively (with the lower rate floored at zero), to allow for rounded provider
+readings. The resulting bounds are summed across models. A recent, still-active window lets
+Rerunly add the estimated change to current reported usage; it also warns when the original
+duration baseline could cross the reset. Queue forecasts group the selected or full queue by agent and add the individual
+run forecasts for each window; a complete combined forecast requires every included run
+to have an estimate for that window.
+
+These are empirical planning aids: samples may include other account activity, provider quota
+rules are not known, and different work, cache behavior, tools or reasoning can change actual
+consumption. Forecast readiness, sample exclusions and the 30-day retention described above
+apply to both prompt runs and explicit judgments. No available calibration means **learning**
+rather than a fabricated quota estimate.
+
 ## Automatic model prices
 
 During import, Rerunly checks newly recorded models (including subagents), locally
@@ -768,7 +982,7 @@ The **Excluded as irrelevant** list lets you restore a prompt to the tag the way
 it had it: a prompt you tagged by hand is tagged by hand again, and one tagged
 by a rule comes back only if a rule still matches it. Older exclusions whose
 original assignment was not recorded fall back to manual membership on restore.
-Tag priorities still apply to restored prompts. An excluded prompt can also stop serving
+**Exclude tag** rules still apply to restored prompts. An excluded prompt can also stop serving
 as an example while staying excluded: excluded examples that resemble another one
 are identified so you can stop using them individually or together.
 
@@ -780,7 +994,7 @@ session). Exclude keeps those prompts out, including manually assigned ones.
 Exclusions take priority over inclusion. Add one rule per selected tag.
 
 These rules work for existing and future prompts and when creating tags,
-including from a prompt selection. Existing skill and priority rules remain
+including from a prompt selection. Existing skill and **Exclude tag** rules remain
 editable through the same picker. Removing a rule recomputes eligible membership;
 explicit prompt exclusions still apply. Rules follow the final memberships of
 the tags they depend on, and circular dependencies are rejected.
@@ -795,7 +1009,7 @@ rule restores eligible membership. Explicit prompt exclusions still apply.
 ## Explore with examples
 
 **Setup → Examples → Open the example app** opens a separate example app, at
-`/examples/`, holding only eight illustrative records. Your own history never
+`/examples/`, holding twelve illustrative records. Your own history never
 shows them, and the example app never shows your history: it cannot import
 transcripts or change your agents' settings. Its records are tagged
 `rerunly-examples`, with smaller tags for each scenario:
@@ -804,6 +1018,8 @@ transcripts or change your agents' settings. Its records are tagged
 - `example:cache`: the same task with cold and warm input caches.
 - `example:skills` and `example:subagents`: two skill snapshots and a delegated edge-case review, including persona and subagent cost.
 - `example:quality`: a cheaper review that omits division-by-zero verification and receives an illustrative worse verdict.
+- `example:rerun-comparison`: an original CSV validation task and three completed reruns across two agents and different models, with populated cost, token and time charts.
+- `example:judges`: three saved judgments of the same pair, including conclusions, observations, time, tokens, cost and a human assessment.
 - `example:blocked`: an unattended rerun needing a release-version decision.
 
 All tokens, timings, outputs and ratings in this set are illustrative; no agents
@@ -819,7 +1035,12 @@ are removed from it.
 ```bash
 uv sync
 uv run rerunly --reload   # edit, refresh the page, repeat
+uv run playwright install chromium   # once, for the browser tests
 uv run pytest
+uv run ruff check .
+uv run pyright
 ```
+
+CI runs these checks on every pull request.
 
 <p align="center"><sub>Built for people who tune their agents like they tune their code.</sub></p>

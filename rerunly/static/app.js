@@ -1240,6 +1240,9 @@ function usageRow(name, r, extra = "") {
 // ---- run it again: what ran a prompt, and the command repeating it ----------------------
 
 const shellQuote = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
+// Transcript values reach a command the user pastes: quote them unless plainly harmless, and keep comments on one line.
+const shellWord = (v) => (/^[\w.+-]+$/.test(String(v)) ? String(v) : shellQuote(v));
+const shellComment = (v) => String(v).replace(/[\r\n]+/g, " ");
 
 /** Where a skill version comes from, in words. */
 function skillOrigin(k) {
@@ -1263,18 +1266,18 @@ function rerunCommand(p) {
   const undo = [];
   for (const k of r.skills) {
     if (k.origin === "git" && k.git_state === "committed") {
-      lines.push(`# ${k.skill} as it ran (commit ${k.git_commit.slice(0, 7)}): this replaces the skill's files, commit or stash your changes first`,
-        `git -C ${shellQuote(k.git_repo)} checkout ${k.git_commit} -- ${shellQuote(k.git_path)}`);
+      lines.push(`# ${shellComment(k.skill)} as it ran (commit ${shellComment(k.git_commit.slice(0, 7))}): this replaces the skill's files, commit or stash your changes first`,
+        `git -C ${shellQuote(k.git_repo)} checkout ${shellWord(k.git_commit)} -- ${shellQuote(k.git_path)}`);
       undo.push(`git -C ${shellQuote(k.git_repo)} checkout HEAD -- ${shellQuote(k.git_path)}`);
     } else if (k.origin === "bundled") {
-      lines.push(`# ${k.skill}: built into Claude Code ${k.bundled_version}, comes with the release below`);
+      lines.push(`# ${shellComment(k.skill)}: built into Claude Code ${shellComment(k.bundled_version)}, comes with the release below`);
     } else {
-      lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
+      lines.push(`# ${shellComment(k.skill)}: put the downloaded SKILL.md (as it ran) back in ${shellComment(k.base_dir)}`);
     }
   }
-  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${r.harness_version}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
+  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${shellWord(r.harness_version)}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${shellWord(r.harness_version)}` : "claude");
   const permissions = (r.permission_args || []).map(shellQuote).join(" ");
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""}${permissions ? ` ${permissions}` : ""} ${shellQuote(p.text)}`);
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${shellWord(r.effort)}`) : ""}${permissions ? ` ${permissions}` : ""}${String(p.text).startsWith("-") ? " --" : ""} ${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }

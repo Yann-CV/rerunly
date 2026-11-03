@@ -312,13 +312,13 @@ def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
     if discover_prices(conn, models, settings):
         settings = get_settings(conn)
         # Reparse old sessions too: aggregate DB rows cannot reconstruct all cache TTL usage.
-        for source, key, signature in candidates:
+        for source, key, _signature in candidates:
             if key not in loaded:
                 session = source.load(key)
                 if session is not None:
                     loaded[key] = session
     updated = 0
-    for source, key, signature in candidates:
+    for _source, key, signature in candidates:
         session = loaded.get(key)
         if session is None:
             continue

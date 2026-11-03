@@ -8,21 +8,21 @@ from rerunly.server import create_app
 
 def test_examples_are_tagged_idempotent_and_removable(tmp_path):
     c = db.connect(tmp_path / "examples.db")
-    assert add_examples(c) == {"added": 8, "prompts": 8}
-    assert add_examples(c) == {"added": 0, "prompts": 8}
-    assert c.execute("SELECT COUNT(*) FROM tags WHERE tag=?", (SOURCE,)).fetchone()[0] == 8
+    assert add_examples(c) == {"added": 12, "prompts": 12}
+    assert add_examples(c) == {"added": 0, "prompts": 12}
+    assert c.execute("SELECT COUNT(*) FROM tags WHERE tag=?", (SOURCE,)).fetchone()[0] == 12
     assert c.execute("SELECT COUNT(DISTINCT harness) FROM prompts").fetchone()[0] == 2
     assert c.execute("SELECT COUNT(*) FROM skill_versions").fetchone()[0] == 2
     assert c.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 1
-    assert c.execute("SELECT COUNT(*) FROM run_ratings").fetchone()[0] == 3
+    assert c.execute("SELECT COUNT(*) FROM run_ratings").fetchone()[0] == 6
     assert c.execute("SELECT COUNT(*) FROM replays WHERE status='needs_you'").fetchone()[0] == 1
     c.execute("INSERT INTO tag_meta VALUES('keep-me','2026-10-26','User data')")
     c.execute("INSERT INTO tag_exclusions(prompt_id, tag) VALUES('rerunly-example:cache-warm','example:cache')")
     c.execute("INSERT INTO tag_suppressed VALUES('rerunly-example:cache-cold','example:cache',0)")
     c.execute("INSERT INTO tag_priorities VALUES('example:quality','example:skills')")
     c.commit()
-    assert remove_examples(c) == {"removed": 8, "prompts": 0}
-    for table in ("prompts", "sessions", "tags", "agents", "skill_versions", "prompt_skill_runs", "tag_reference", "run_ratings", "replays",
+    assert remove_examples(c) == {"removed": 12, "prompts": 0}
+    for table in ("prompts", "sessions", "tags", "agents", "skill_versions", "prompt_skill_runs", "tag_reference", "run_ratings", "judge_rating_history", "judge_feedback", "replays",
                   "tag_exclusions", "tag_suppressed", "tag_priorities"):
         assert c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     assert c.execute("SELECT tag FROM tag_meta").fetchone()[0] == "keep-me"
@@ -37,7 +37,7 @@ def test_example_app_is_apart_from_the_history(tmp_path, monkeypatch):
         assert client.get("/api/prompts").json()["total"] == 0
         assert client.post("/api/examples").status_code in (404, 405)
         data = client.get("/examples/api/prompts", params={"tag": SOURCE}).json()
-        assert data["total"] == 8
+        assert data["total"] == 12
         assert client.get("/examples/").status_code == 200
         for p in data["items"]:
             detail = client.get(f"/examples/api/prompts/{p['id']}")
@@ -61,14 +61,14 @@ def test_example_app_is_apart_from_the_history(tmp_path, monkeypatch):
         # every rerun leads to its original, which is itself among the examples, with the settings it ran with
         ids = {p["id"] for p in data["items"]}
         reruns = [d for d in (client.get(f"/examples/api/prompts/{i}").json() for i in ids) if d["replay_of"]]
-        assert {d["id"] for d in reruns} == {"rerunly-example:review-skill-v2", "rerunly-example:cheap-but-incomplete"}
+        assert {d["id"] for d in reruns} == {"rerunly-example:review-skill-v2", "rerunly-example:cheap-but-incomplete", "rerunly-example:csv-rerun-balanced", "rerunly-example:csv-rerun-compact", "rerunly-example:csv-rerun-alternative"}
         for d in reruns:
             o = d["replay_of"]
             assert o["id"] in ids and o["text"] == d["text"]
             assert (o["original_harness"], o["original_model"], o["original_effort"]) == ("Codex", "gpt-6.1-sol", "medium")
-            assert [k["skill"] for k in o["original_skills"]] == ["example-review"]
+            assert [k["skill"] for k in o["original_skills"]] == ([] if "csv-rerun" in d["id"] else ["example-review"])
         launched = client.get("/examples/api/reruns").json()["launched"]
-        assert len(launched) == 3
+        assert len(launched) == 6
         assert all(x["replay"] is None or x["replay"]["text"] == x["original"]["text"] for x in launched)
         assert max(p["started_at"] for p in data["items"]) < datetime.now(timezone.utc).isoformat()
         # nothing imported, no agent set up, no subscription
@@ -83,7 +83,7 @@ def test_example_app_is_apart_from_the_history(tmp_path, monkeypatch):
         assert client.get("/api/settings").json()["excluded_tags"] == []
     # the example app starts afresh
     with TestClient(create_app(tmp_path / "dashboard.db", background=False)) as client:
-        assert client.get("/examples/api/prompts").json()["total"] == 8
+        assert client.get("/examples/api/prompts").json()["total"] == 12
 
 
 def test_rerun_history_and_original_include_more_than_200_attempts(tmp_path):
@@ -203,3 +203,24 @@ def test_human_judge_feedback_and_removal(tmp_path):
         assert client.request("DELETE", endpoint, json={"base": ids[0], "other": ids[1]}).status_code == 200
         rating = client.get("/api/compare", params={"a": ids[0], "b": ids[1]}).json()["rating"]
         assert rating["human_feedback"] is None and rating["score"] == 70
+
+
+def test_completed_comparison_examples_have_usage_ratings_and_feedback(tmp_path):
+    with TestClient(create_app(tmp_path / "examples.db", background=False, examples=True)) as client:
+        original = "rerunly-example:csv-original"
+        prompt = client.get(f"/api/prompts/{original}").json()
+        assert len(prompt["replays"]) == 3
+        for run in prompt["replays"]:
+            assert run["status"] == "done"
+            detail = client.get(f"/api/prompts/{run['prompt']['id']}").json()
+            assert detail["answer"] and detail["text"] == prompt["text"]
+            assert run["prompt"]["total_cost_usd"] > 0
+            assert run["prompt"]["total_tokens"] > 0
+            assert run["rating"]["score"] >= 85
+        pair = next(group for group in client.get("/api/ratings/history").json()
+                    if group["base"] == original and group["other"] == "rerunly-example:csv-rerun-compact")
+        assert len(pair["ratings"]) == 3
+        assert pair["human_feedback"]["human_score"] == 95
+        for rating in pair["ratings"]:
+            assert rating["duration_ms"] > 0 and rating["total_tokens"] > 0 and rating["cost_usd"] > 0
+            assert rating["summary"] and rating["differences"]

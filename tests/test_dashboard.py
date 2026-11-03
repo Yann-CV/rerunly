@@ -304,6 +304,7 @@ def test_legacy_exclusions_restore_manually_after_migration(client, tmp_path):
     c = db.connect(tmp_path / "d.db")
     # The old schema stored no assignment type. Both rows must survive migration.
     with c:
+        c.execute("PRAGMA user_version = 0")  # as a database from before schema versions
         c.execute("DROP TABLE tag_exclusions")
         c.execute("CREATE TABLE tag_exclusions (prompt_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(prompt_id, tag))")
         c.executemany("INSERT INTO tag_exclusions VALUES (?,?)", [("prompt-1", "legacy"), ("prompt-4", "legacy")])
@@ -960,11 +961,12 @@ def test_replay(client, monkeypatch):
     assert cwd == CWD and out["terminal"] == "gnome-terminal"
     assert Path(argv[1]).name == "terminal.py"
     assert argv[3:6] == [out["session_id"], "false", "false"]
-    assert argv[6:] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
-                    "--model", "claude-haiku-5-5", "--effort", "high", "--permission-mode", "default", "write the release notes"]
+    assert argv[6] == "--status-file" and Path(argv[7]).name == "terminal-status.json"
+    assert argv[8:] == ["npx", "-y", "@anthropic-ai/claude-code@2.1.0", "--session-id", out["session_id"],
+                    "--model", "claude-haiku-5-5", "--effort", "high", "--permission-mode", "default", "--", "write the release notes"]
     # the installed Claude Code unless asked otherwise, and the prompt's own settings by default
     client.post("/api/prompts/prompt-4/replay", json={"mode": "terminal"})
-    assert launched[1][1][6:8] == ["claude", "--session-id"] and launched[1][1][-1] == "write the release notes"
+    assert launched[1][1][8:10] == ["claude", "--session-id"] and launched[1][1][-1] == "write the release notes"
     # only from the dashboard, with sane values
     assert client.post("/api/prompts/prompt-4/replay", content="{}", headers={"content-type": "text/plain"}).status_code == 415
     assert client.post("/api/prompts/prompt-4/replay", json={}, headers={"origin": "https://evil.example"}).status_code == 403

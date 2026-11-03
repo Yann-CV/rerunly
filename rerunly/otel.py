@@ -50,7 +50,7 @@ def api_requests(payload: dict) -> list[tuple]:
                 if cost is None and attrs.get("cost_usd_micros") is not None:
                     cost = _int(attrs["cost_usd_micros"]) / 1_000_000
                 request_id = attrs.get("request_id") or attrs.get("client_request_id") or hashlib.sha1(
-                    json.dumps(record, sort_keys=True).encode()
+                    json.dumps(record, sort_keys=True).encode(), usedforsecurity=False
                 ).hexdigest()
                 rows.append((
                     request_id,

@@ -6,6 +6,9 @@ history or a normal dashboard, including an empty normal dashboard.
 Run from the repository root:
     uv run --with playwright python docs/capture_screenshots.py
 
+Use --readme-only (also the default) for the populated README illustrations.
+Use --comparisons-only to refresh just the completed rerun and judge comparisons.
+
 Refresh only the prompt page and its expanded rerun panel with --prompt-only.
 Use --model-checks-only for the Reruns page and illustrative availability results.
 Use --compare-only for the comparison page and judge result.
@@ -73,7 +76,7 @@ def main():
                     page.locator("#app h1, #app .page-kicker").first.wait_for()
                     page.evaluate("document.fonts.ready")
                     # Wait for Chart.js animations before capturing, and fail on missing charts.
-                    page.wait_for_function("typeof Chart !== 'undefined'")
+                    page.wait_for_function("() => typeof Chart !== 'undefined'")
                     page.wait_for_timeout(1200)
                     if focus:
                         page.locator(focus).first.evaluate(
@@ -126,6 +129,64 @@ def main():
                     page.evaluate("viewReruns()")
                     page.evaluate("window.scrollTo(0, 0)")
                     page.screenshot(path=str(output / "reruns.png"), full_page=True)
+
+                def capture_region(name, first, last=None):
+                    # Capture actual rendered results, without altering or filling in the UI.
+                    page.evaluate("window.scrollTo(0, 0)")
+                    start = page.locator(first).first.bounding_box()
+                    end = page.locator(last or first).first.bounding_box()
+                    page.screenshot(path=str(output / (name + ".png")), full_page=True, clip={
+                        "x": start["x"], "y": start["y"], "width": start["width"],
+                        "height": end["y"] + end["height"] - start["y"],
+                    })
+                    print(f"Captured {name}")
+
+                if not sys.argv[1:] or "--readme-only" in sys.argv or "--comparisons-only" in sys.argv:
+                    if "--comparisons-only" not in sys.argv:
+                        capture("home", "/")
+                        capture("prompts", "/prompts")
+                        page.evaluate("localStorage.setItem('prompts-prefs', JSON.stringify({layout:'grouped'}))")
+                        capture("by-tag", "/prompts")
+                        capture("sessions", "/sessions")
+                        capture("session", "/session/rerunly-example:review-skill-v2:session")
+                        capture("prompt", "/prompt/rerunly-example:review-skill-v2", focus='h2:has-text("Cost per agent")')
+                        capture("tag", "/tag/example:rerun-comparison")
+                        capture("tags", "/tags")
+                    capture("rerun-comparison", "/rerun-comparison/rerunly-example:csv-original")
+                    page.wait_for_function("() => ['cost', 'time', 'tokens'].every(id => Chart.getChart(document.getElementById('rerun-chart-' + id))?.data.datasets.find(dataset => dataset.label === 'Run')?.data.length === 4)", timeout=15000)
+                    capture_region("rerun-comparison", ".rerun-comparison-page .page-hero", ".rc-trends")
+                    # Verify changing the saved reference is functional in the example app.
+                    page.locator('[data-set-rerun-reference="rerunly-example:csv-rerun-balanced"]').click()
+                    page.get_by_role("heading", name="Reference run · Attempt 1").wait_for()
+                    page.locator('[data-set-rerun-reference="rerunly-example:csv-original"]').click()
+                    page.get_by_role("heading", name="Reference run · Original").wait_for()
+                    capture("reruns", "/reruns?q=CSV%20validation")
+                    group = page.locator("[data-history-group]").filter(has_text="CSV validation")
+                    assert group.count() == 1
+                    assert group.locator(".rh-attempt").count() == 3
+                    assert group.locator(".rh-attempt-heading .status-done").count() == 3
+                    capture_region("reruns", "[data-history-group]")
+                    capture("compare", "/compare?a=rerunly-example:csv-original&b=rerunly-example:csv-rerun-compact")
+                    capture_region("compare", ".compare-figures", ".compare-answers")
+                    # The completed verdict and answer comparison have their own results view.
+                    capture("judge-comparison", "/judge-comparison?a=rerunly-example:csv-original&b=rerunly-example:csv-rerun-compact")
+                    outputs = page.locator(".judge-output-column")
+                    assert outputs.count() == 2
+                    assert page.locator(".judge-comparison-run").count() == 3
+                    outputs.nth(0).locator("select").select_option("2")
+                    assert outputs.nth(0).locator("[id^=judge-output-result] strong").first.inner_text() == "94 / 100"
+                    outputs.nth(0).locator("select").select_option("0")
+                    assert "Unavailable" not in page.locator(".judge-metric-grid").inner_text()
+                    assert "—" not in page.locator(".judge-summary-grid").inner_text()
+                    capture_region("judge-comparison", ".judge-output-comparison")
+                    capture_region("judge-usage-comparison", 'section[aria-labelledby="judge-summary-title"]', 'section[aria-labelledby="judge-metrics-title"]')
+                    for width in (390, 768):
+                        page.set_viewport_size({"width": width, "height": 900})
+                        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Judge comparison overflows viewport"
+                    if errors:
+                        raise RuntimeError("Browser errors: " + "; ".join(errors))
+                    browser.close()
+                    return
 
                 if "--rerun-detail-only" in sys.argv:
                     capture("rerun-detail", "/rerun/rerunly-example:blocked-rerun:session")
@@ -184,7 +245,7 @@ def main():
                         page.set_viewport_size({"width": width, "height": 900})
                         assert judge.evaluate("el => el.getBoundingClientRect().right <= innerWidth + 1"), "Judge card overflows viewport"
                     page.locator("#swap").click()
-                    page.wait_for_function("document.querySelector('#pick-a')?.value === 'rerunly-example:cheap-but-incomplete'")
+                    page.wait_for_function("() => document.querySelector('#pick-a')?.value === 'rerunly-example:cheap-but-incomplete'")
                     assert page.locator("#pick-b").input_value() == "rerunly-example:review-skill-v1"
                     # Add a second illustrative judge run for this pair, without calling an agent.
                     connection = db.connect(database)
@@ -329,19 +390,19 @@ def main():
                 assert page.locator("[data-history-group]").count() == 2
                 search = page.locator("#history-search")
                 search.fill("divide(a, b)")
-                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 1")
+                page.wait_for_function("() => document.querySelectorAll('[data-history-group]').length === 1")
                 assert page.locator(".rh-attempt").count() == 2
                 assert "q=" in page.url, "History search should be bookmarkable"
                 search.fill("not-a-real-example")
                 page.get_by_text("No reruns match these filters.").wait_for()
                 page.locator("[data-history-clear]").click()
-                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 2")
+                page.wait_for_function("() => document.querySelectorAll('[data-history-group]').length === 2")
                 page.locator("#pop-category-example > summary").click()
                 page.locator('[data-category-tag="example:skills"]').click()
-                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 1")
+                page.wait_for_function("() => document.querySelectorAll('[data-history-group]').length === 1")
                 assert "tags=example%3Askills" in page.url
                 page.locator("[data-history-clear]").click()
-                page.wait_for_function("document.querySelectorAll('[data-history-group]').length === 2")
+                page.wait_for_function("() => document.querySelectorAll('[data-history-group]').length === 2")
                 review = page.locator("[data-history-group]").filter(has_text="Review divide")
                 if not review.evaluate("el => el.open"):
                     review.locator(":scope > summary").click()
@@ -405,7 +466,7 @@ def main():
                 page.locator("[data-rr-config]").first.click()
                 page.locator("#queue-config-warning").wait_for(state="visible")
                 assert page.locator("#queue-config-form .model-access-filter, #queue-config-form .model-access-note").count() == 0
-                page.wait_for_function("document.querySelector('#queue-config-form [type=submit]').disabled")
+                page.wait_for_function("() => document.querySelector('#queue-config-form [type=submit]').disabled")
                 page.screenshot(path=str(output / "queue-settings.png"))
                 print("Captured queue-settings")
                 page.locator("[data-cancel-config]").click()

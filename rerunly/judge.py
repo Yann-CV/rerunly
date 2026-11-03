@@ -9,10 +9,10 @@ budget cap; Codex judges use a read-only sandbox and a time limit.
 import hashlib
 import json
 import re
-import subprocess
 from pathlib import Path
 
-from .replay import EFFORTS
+from . import processes
+from .replay import EFFORTS, is_codex_model
 
 MAX_ANSWER = 30_000
 VERDICTS = ("equivalent", "minor", "major")
@@ -83,11 +83,7 @@ def parse_rating(text: str) -> dict:
 
 def judge_agent(model: str) -> tuple[str, str]:
     """Which CLI judges with `model` ("claude" or "codex"), and the model id to give it."""
-    if model.startswith("codex:"):
-        return "codex", model.removeprefix("codex:")
-    if model.startswith(("gpt-", "o3", "o4")) and not model.startswith("gpt-oss"):
-        return "codex", model
-    return "claude", model
+    return ("codex", model.removeprefix("codex:")) if is_codex_model(model) else ("claude", model)
 
 
 def usage_tokens(usage: dict, *, cached_separate: bool) -> int | None:
@@ -103,7 +99,7 @@ def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, 
     """Ask an LLM for the rating, at `effort` ("" = the model's default): the parsed rating, plus its cost when
     reported by the harness."""
     effort = effort if effort in EFFORTS else ""
-    workdir.mkdir(parents=True, exist_ok=True)
+    workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
     prompt = rating_prompt(request, reference, rerun, human_feedback)
     agent, model = judge_agent(model)
     if agent == "codex":
@@ -113,7 +109,7 @@ def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, 
             argv += ["--model", model]
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
-        out = subprocess.run([*argv, prompt], cwd=workdir, capture_output=True, text=True, timeout=600)
+        out = processes.run([*argv, prompt], cwd=workdir, timeout=600)
         answer = ""
         completed = False
         tokens = None
@@ -137,8 +133,7 @@ def rate(request: str, reference: dict, rerun: dict, model: str, workdir: Path, 
         argv += ["--model", model]
     if effort:
         argv += ["--effort", effort]
-    out = subprocess.run(argv, input=prompt, cwd=workdir, capture_output=True,
-                         text=True, timeout=600)
+    out = processes.run(argv, input=prompt, cwd=workdir, timeout=600)
     try:
         result = json.loads(out.stdout)
     except ValueError:

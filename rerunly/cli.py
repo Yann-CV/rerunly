@@ -4,6 +4,7 @@ from pathlib import Path
 from . import db
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT, DATA_DIR, migrate_legacy_data
 from .ingest import ingest
+from .security import access_token, is_loopback_host
 
 
 def main() -> None:
@@ -61,6 +62,8 @@ def main() -> None:
 
     host = getattr(args, "host", "127.0.0.1")
     print(f"Rerunly on http://{host}:{port}  (db: {args.db}){'  [reloading on code changes]' if args.reload else ''}")
+    if not is_loopback_host(host):
+        print(f"Reachable from the network, over unencrypted HTTP. Open it with: http://<this-machine>:{port}/?token={access_token(args.db)}")
     serve(args.db, host, port, reload=args.reload)
 
 

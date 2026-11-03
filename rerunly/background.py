@@ -67,7 +67,7 @@ def running_pid() -> int | None:
 
 
 def write_pid() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
 
@@ -80,7 +80,7 @@ def start(db_path: Path, port: int) -> int:
     """Launch the tray (and its server) detached from this terminal; returns its pid."""
     if pid := running_pid():
         return pid
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     with LOG_FILE.open("ab") as log:
         proc = subprocess.Popen(
             tray_command(db_path, port), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

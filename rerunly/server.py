@@ -9,25 +9,28 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, judge, live_limits, model_access, model_checks, otel, replay, runner, statusline, usage_forecast
-from .config import DEFAULT_DB_PATH, DEFAULT_PORT
+from . import background as bg, db, judge, live_limits, model_access, model_checks, otel, processes, replay, runner, security, statusline, usage_forecast
+from .config import DEFAULT_DB_PATH, DEFAULT_PORT, claude_home, invalid_settings
 from .estimates import estimate_rerun
 from .ingest import apply_curation, apply_rules, drop_failed_rerun, drop_prompts, ingest, session_texts
 from .pricing import DEFAULT_PRICES
 from .sources.codex import CodexSource
-from .tagging import jaccard, rule_matches, rule_scope, similarity, split_any, words
+from .tagging import jaccard, rule_matches, similarity, split_any, words
 
 STATIC = Path(__file__).parent / "static"
-CLAUDE_SETTINGS = Path.home() / ".claude/settings.json"
+CLAUDE_SETTINGS = claude_home() / "settings.json"
 HOOK_MARKER = "rerunly"
 LEGACY_HOOK_MARKERS = ("agent-dashboard",)  # hooks installed before the rename to Rerunly
 COMPARE_SCOPES = ("similar", "tag", "similar_tag", "original")
 SPARK_POINTS = 24
+MAX_RUNNING_JUDGES = 4
+MAX_RETENTION_DAYS = 36500
 
 
 class FreshStaticFiles(StaticFiles):
@@ -80,7 +83,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     if examples:
         for path in (db_path, db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")):
             path.unlink(missing_ok=True)  # rebuilt at each start: the illustrative dates stay recent
-        add_examples(db.connect(db_path))
+        with db.connection_scope():
+            add_examples(db.connect(db_path))
+    else:
+        db.tighten_permissions(db_path)
     ingest_lock = threading.Lock()
     usage_lock = threading.Lock()
     stop = threading.Event()
@@ -101,9 +107,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             db.save_settings(c, {"tag_rules": split})
             apply_rules(c, split)
 
-    split_any_rules()
-    if not examples:
-        remove_examples(conn())  # added to the history by an earlier version: they live in the example app now
+    def recover_interrupted_judgments() -> None:
+        """A judgment running when the server stopped will never finish: let the user judge that pair again."""
+        c = conn()
+        with c:
+            c.execute("UPDATE run_ratings SET status='failed', error=? WHERE status='rating'",
+                      ("The judgment was interrupted when Rerunly stopped.",))
+
+    with db.connection_scope():
+        split_any_rules()
+        if not examples:
+            remove_examples(conn())  # added to the history by an earlier version: they live in the example app now
+            recover_interrupted_judgments()
 
     def run_ingest(force: bool = False) -> dict:
         with ingest_lock:
@@ -119,6 +134,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     # ---- ratings: Claude says how much a run's output differs from another's ------------------
 
     rating_lock = threading.Lock()
+    judge_slots = threading.BoundedSemaphore(MAX_RUNNING_JUDGES)
 
     def rating_inputs(c, base_id, other_id):
         return {r["id"]: dict(r) for r in c.execute(
@@ -189,11 +205,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 c.execute("INSERT OR REPLACE INTO run_ratings(base_id, other_id, status, model, rated_at, input_hash, origin) VALUES (?,?,?,?,?,?,?)",
                           (base_id, other_id, "rating", label, runner.now(), fingerprint, origin))
 
-        def work():
+        def judge_pair():
             started = time.monotonic()
             files = lambda r: json.loads(r["files"] or "[]")
             try:
-                options = {"effort": effort}
+                options: dict[str, Any] = {"effort": effort}
                 if human_feedback:
                     options["human_feedback"] = human_feedback
                 out = judge.rate(runs[base_id]["text"], {"answer": runs[base_id]["answer"], "files": files(runs[base_id])},
@@ -209,6 +225,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                           "error=?, total_tokens=?, duration_ms=?, rated_at=? WHERE base_id=? AND other_id=? AND input_hash=?",
                           (*values, elapsed_ms, runner.now(), base_id, other_id, fingerprint))
 
+        def work():
+            with judge_slots, db.connection_scope():
+                judge_pair()
+
         threading.Thread(target=work, daemon=True).start()
         return rating_of(c, base_id, other_id)
 
@@ -222,14 +242,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     def loop():
         while not stop.is_set():
+            interval = 0
             try:
-                run_ingest()
+                with db.connection_scope():
+                    run_ingest()
+                    interval = db.get_settings(conn())["auto_ingest_interval"]
             except Exception as e:  # keep the server alive on a malformed transcript
                 print(f"[rerunly] ingestion failed: {e}")
-            c = conn()
-            interval = db.get_settings(c)["auto_ingest_interval"]
-            c.close()
-            stop.wait(interval if interval > 0 else 3600)
+            stop.wait(interval if type(interval) is int and interval > 0 else 3600)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -242,6 +262,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         checks.cancel.set()
 
     app = FastAPI(title="Rerunly examples" if examples else "Rerunly", lifespan=lifespan)
+    security.protect(app, db_path)
     app.mount("/static", FreshStaticFiles(directory=STATIC), name="static")
     if examples:
         @app.middleware("http")
@@ -254,6 +275,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             return await call_next(request)
     else:
         app.mount("/examples", LazyApp(lambda: create_app(db_path.with_name(db_path.stem + "-examples.db"), port, background=False, examples=True)))
+    app.add_middleware(db.ConnectionScope)
+    app.add_middleware(security.BodyLimit)  # outermost: an oversized body costs nothing further
 
     @app.get("/")
     def index():
@@ -272,6 +295,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.put("/api/settings")
     def put_settings(values: dict = Body(...)):
+        invalid = invalid_settings(values)
+        if invalid:
+            raise HTTPException(400, f"Invalid value for: {', '.join(invalid)}")
         c = conn()
         if "model_checks" in values:
             values["model_checks"] = check_config(values["model_checks"])
@@ -308,7 +334,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if CLAUDE_SETTINGS.exists():
             shutil.copy(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_suffix(".json.bak"))
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        CLAUDE_SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
+        processes.write_atomic(CLAUDE_SETTINGS, json.dumps(data, indent=2) + "\n")
 
     def is_ours(hook) -> bool:
         return any(m in json.dumps(hook) for m in (HOOK_MARKER, *LEGACY_HOOK_MARKERS))
@@ -560,6 +586,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.post("/api/setup/retention")
     def set_retention(days: int = Body(..., embed=True)):
+        if not 1 <= days <= MAX_RETENTION_DAYS:  # Claude Code acts on this value by deleting transcripts
+            raise HTTPException(400, f"Retention must be between 1 and {MAX_RETENTION_DAYS} days")
         cs = read_claude_settings()
         cs["cleanupPeriodDays"] = days
         write_claude_settings(cs)
@@ -658,7 +686,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             args,
         ).fetchone())
         rows = [_row(r) for r in c.execute(f"{sql} ORDER BY {PROMPT_SORTS[sort]} LIMIT ? OFFSET ?", [*args, limit, offset])]
-        tags = tags_for(c, [r["id"] for r in rows])
+        tags = tags_for(c, [r["id"] for r in rows])  # pyright: ignore[reportAssignmentType]
         for r in rows:
             r["tags"] = tags[r["id"]]
         return {"total": summary["count"], "summary": summary, "items": rows}
@@ -1474,7 +1502,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             if r is None:
                 return None
             return {**{k: r[k] for k in ("runs", "cost_usd", "avg_cost_usd", "last_at", "text")}, "id": r["latest"].split("|", 1)[1]}
-        tags = [
+        tags = [  # pyright: ignore[reportAssignmentType]
             dict(t)
             for t in c.execute(
                 "SELECT t.tag, CASE WHEN MIN(t.auto = 1) = 0 THEN 'human' ELSE 'ai' END kind, COUNT(*) prompts, "
@@ -1723,9 +1751,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         versions = [dict(v) for v in c.execute(
             "SELECT k.skill, v.* FROM prompt_skill_runs k JOIN skill_versions v ON v.hash = k.hash WHERE k.prompt_id = ? "
             "AND v.origin != 'bundled' ORDER BY k.skill", (prompt_id,))] if opts["restore_skills"] else []
+        # A session can contain transcripts, temporary skill instructions and process logs.
+        (reruns_dir / session_id).mkdir(mode=0o700, parents=True, exist_ok=True)
         plugin = reruns_dir / session_id / "plugin" if versions else None
-        skills = runner.build_skills_plugin(plugin, versions) if plugin else []
-        if codex:
+        try:
+            skills = runner.build_skills_plugin(plugin, versions) if plugin else []
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        if codex and plugin:
             for skill in skills:
                 skill["pinned"] = str(plugin / "skills" / runner._skill_name(skill["skill"]) / "SKILL.md")
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
@@ -1739,7 +1772,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             if codex:
                 argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version, note=note, original_permissions=recorded_permissions)
             elif recorded_permissions is not None:
-                argv = [*argv[:-1], *permission_args, argv[-1]]
+                argv = replay.with_options(argv, permission_args)
             settings = db.get_settings(c)
             argv = [sys.executable, str(Path(__file__).with_name("terminal.py")),
                     settings["codex_sessions_dir" if codex else "claude_projects_dir"],
@@ -1754,14 +1787,18 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version,
                                          background=True, permission=opts["permission"], note=runner.unattended_note(skills), original_permissions=recorded_permissions)
             elif recorded_permissions is not None:
-                argv = [*argv[:-1], *permission_args, argv[-1]]
+                argv = replay.with_options(argv, permission_args)
             log = reruns_dir / session_id / "stream.jsonl"
             row.update(status="running", log_path=str(log))
             # recorded before it starts: a quick end must find its row
             with c:
                 c.execute(f"INSERT INTO replays({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", list(row.values()))
             try:
-                pid = runner.start(cwd, argv, log, lambda: finish_rerun(session_id), **({"timeout": 3600} if codex else {}))
+                def on_exit():
+                    with db.connection_scope():
+                        finish_rerun(session_id)
+
+                pid = runner.start(cwd, argv, log, on_exit, **({"timeout": 3600} if codex else {}))
             except OSError as e:
                 with c:
                     c.execute("UPDATE replays SET status = 'failed', result = ?, ended_at = ? WHERE session_id = ?",
@@ -1778,17 +1815,15 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "skills": skills, "command": f"cd {shlex.quote(cwd)} && {shlex.join(argv)}"}
 
     @app.post("/api/prompts/{prompt_id}/replay")
-    async def replay_prompt(prompt_id: str, request: Request):
-        return start_replay(conn(), prompt_id, rerun_options(await dashboard_json(request)))
+    def replay_prompt(prompt_id: str, body: dict = Depends(dashboard_json)):
+        return start_replay(conn(), prompt_id, rerun_options(body))
 
     # ---- reruns: a queue, launched together from the Reruns page -----------------------------
 
-    QUEUE_KEYS = ("model", "effort", "release", "mode", "permission", "budget_usd", "restore_skills")
 
     @app.post("/api/reruns/queue")
-    async def queue_reruns(request: Request):
+    def queue_reruns(body: dict = Depends(dashboard_json)):
         """Queue prompts for a rerun with these options; a prompt already queued with them is not added twice."""
-        body = await dashboard_json(request)
         o = rerun_options(body, draft=True)
         values = {"model": o["model"], "effort": o["effort"], "release": o["release"], "mode": o["mode"], "permission": o["permission"],
                   "budget_usd": o["budget"], "restore_skills": int(o["restore_skills"]), "auto_rate": int(o["rate"]),
@@ -1811,8 +1846,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return {"added": added, "queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
 
     @app.post("/api/reruns/queue/judge")
-    async def queue_judge(request: Request):
-        body = await dashboard_json(request)
+    def queue_judge(body: dict = Depends(dashboard_json)):
         base, other, model = str(body.get("base") or ""), str(body.get("other") or ""), str(body.get("model") or "")
         if model and not replay.MODEL_RE.match(model):
             raise HTTPException(400, "unknown judge model")
@@ -1905,7 +1939,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         d = dict(x)
         d["skills"] = json.loads(d.get("skills") or "[]")
         d["denials"] = json.loads(d.get("denials") or "null")
-        d.pop("pid", None), d.pop("log_path", None)
+        d.pop("pid", None)
+        d.pop("log_path", None)
         return d
 
     @app.get("/api/reruns/launched/{session_id}")
@@ -1966,8 +2001,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return values
 
     @app.post("/api/reruns/queue/{item_id}/validate")
-    async def validate_queued_rerun(item_id: int, request: Request):
-        body = await dashboard_json(request)
+    def validate_queued_rerun(item_id: int, body: dict = Depends(dashboard_json)):
         c = conn()
         try:
             q = c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone()
@@ -1980,8 +2014,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             c.close()
 
     @app.patch("/api/reruns/queue/{item_id}")
-    async def update_queued_rerun(item_id: int, request: Request):
-        body = await dashboard_json(request)
+    def update_queued_rerun(item_id: int, body: dict = Depends(dashboard_json)):
         c = conn()
         q = c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone()
         if q is None:
@@ -1994,8 +2027,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return {"id": item_id, "needs_input": bool(issues), "issues": issues}
 
     @app.post("/api/reruns/preflight")
-    async def preflight_reruns(request: Request):
-        body = await dashboard_json(request)
+    def preflight_reruns(body: dict = Depends(dashboard_json)):
         c = conn()
         return {"needs_input": queued_inputs(c, selected_queue(c, body))}
 
@@ -2007,9 +2039,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return {"queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
 
     @app.post("/api/reruns/launch")
-    async def launch_reruns(request: Request):
+    def launch_reruns(body: dict = Depends(dashboard_json)):
         """Launch queued reruns together and take them out of the queue."""
-        body = await dashboard_json(request)
         c = conn()
         rows = selected_queue(c, body)
         needs_input = queued_inputs(c, rows)
@@ -2056,10 +2087,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "output_tokens": result["estimate"]["output_tokens"], "forecast": result["forecast"]}
 
     @app.post("/api/ratings")
-    async def rate_pair(request: Request):
+    def rate_pair(body: dict = Depends(dashboard_json)):
         """Have an LLM judge rate how much run `other`'s output differs from run `base`'s: with `model` (else the
         default judge), again with `force`."""
-        body = await dashboard_json(request)
         model = str(body.get("model") or "")
         if model and not replay.MODEL_RE.match(model):
             raise HTTPException(400, "unknown judge model")
@@ -2102,8 +2132,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return sorted(groups.values(), key=lambda group: group["ratings"][0]["rated_at"] or "", reverse=True)
 
     @app.put("/api/ratings/feedback")
-    async def save_rating_feedback(request: Request):
-        body = await dashboard_json(request)
+    def save_rating_feedback(body: dict = Depends(dashboard_json)):
         base, other = str(body.get("base") or ""), str(body.get("other") or "")
         score, note = body.get("score"), body.get("note", "")
         if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
@@ -2124,8 +2153,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return rating_of(c, base, other)
 
     @app.delete("/api/ratings/feedback")
-    async def delete_rating_feedback(request: Request):
-        body = await dashboard_json(request)
+    def delete_rating_feedback(body: dict = Depends(dashboard_json)):
         c = conn()
         with c:
             c.execute("DELETE FROM judge_feedback WHERE base_id=? AND other_id=?", (str(body.get("base") or ""), str(body.get("other") or "")))

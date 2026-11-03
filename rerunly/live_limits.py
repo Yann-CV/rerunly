@@ -8,6 +8,7 @@ import json
 import os
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,10 +18,23 @@ CACHE_SECONDS = 60
 _cache: dict[str, tuple[float, dict | None]] = {}
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Never send provider credentials to a different origin on redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if (old.scheme.lower(), old.hostname, old.port or 443) != (new.scheme.lower(), new.hostname, new.port or 443):
+            raise ValueError("Usage endpoint redirected to a different origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _get(url, headers):
-    req = urllib.request.Request(url, headers={"User-Agent": "rerunly", **headers})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    req = urllib.request.Request(url, headers={"User-Agent": "rerunly", **headers})  # noqa: S310 - fixed https URLs
+    with urllib.request.build_opener(_SameOriginRedirect()).open(req, timeout=5) as r:
+        raw = r.read(1_000_001)
+    if len(raw) > 1_000_000:
+        raise ValueError("Usage response exceeded size limit")
+    return json.loads(raw)
 
 
 def _cached(key, fetch):
