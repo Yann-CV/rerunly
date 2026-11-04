@@ -130,8 +130,10 @@ Open <http://127.0.0.1:8765> and go to **Setup**:
 3. **Start at login** *(optional)*: keep the dashboard running automatically.
 
 For a foreground dashboard without the tray, use `uv run rerunly`. The dashboard is local by
-default and has no login. On Linux, other users on the machine are refused. If you bind it to a
-non-loopback interface with `serve --host`, network connections must use the access link printed
+default and has no login. On Linux, other users on the machine and connections whose socket
+owner cannot be verified are refused. Forwarded headers are ignored, so they cannot change the
+identity used by this check. If you bind it to a non-loopback interface with `serve --host`,
+network connections must use the access link printed
 at startup (or the token in `access-token`, next to the database, as a bearer token). That
 traffic is unencrypted HTTP and the token controls your history and reruns, so use it on trusted networks
 or behind an encrypted tunnel. macOS has no per-user check, so other accounts there can still reach the local port.
@@ -287,8 +289,9 @@ The detail available depends on what each agent records; see [Supported agents](
   configuration, with **Copy**. Review it before running it: its skill restoration commands
   may replace local files.
 - Use tag pages and the Reruns page to compare runs and review results.
-- **Delete prompt** removes the prompt from Rerunly's history, with its subagents, tags, ratings
-  and queued reruns. The transcript stays on disk and later imports skip it. Its reruns remain,
+- **Delete prompt** removes the prompt from Rerunly's history, with its subagents, tags, current
+  and historical judge ratings, human feedback and queued runs involving it. The transcript stays
+  on disk and later imports skip it. Its launched reruns remain,
   without their original. To hide work reversibly, use exclusions instead.
 </details>
 
@@ -365,6 +368,15 @@ The detail available depends on what each agent records; see [Supported agents](
   **Save settings** and **Save and continue** stay disabled while settings are incomplete,
   invalid, being checked or being saved. Validation preserves your edits.
   **Configure** edits other runs too.
+- Explicit permissions apply in both execution modes. For Claude, **Read-only when unattended**
+  selects the default approval mode in a terminal; **Allow file edits** selects `acceptEdits`.
+  In the background, both choices use restricted mode: read-only exposes file-reading tools and
+  skill instructions by exact file path; **Allow file edits** adds editing tools. Commands,
+  subagents, MCP tools and hooks are disabled, and user/project settings are not loaded.
+  Organization-managed policies still apply.
+  These restrictions can block skill scripts and delegated work. Claude background runs require
+  CLI 2.1.259 or later, including pinned releases; unsupported releases fail rather than dropping
+  restrictions. Codex uses the selected read-only or workspace-write sandbox in either mode.
 - The rerun form separates **Current account status** (reported usage and reset times) from
   **Rerun estimate** (additional tokens, API cost, duration baseline and learned limit impact).
   The prompt panel supports manual refresh and refreshes usage every minute.
@@ -618,8 +630,10 @@ a judge starts one, and imports start automatic judgments for reruns that have t
   rerun gets those permissions too, and they are accepted for unattended background runs.
   Check the recorded permissions, or choose explicit ones.
 - **Only the prompt and captured skills come back.** The rerun uses your current repository,
-  instructions (such as `CLAUDE.md` or `AGENTS.md`), MCP servers, hooks and login, so a difference
-  in results may not come from the setting you changed. Background runs also get an added
+  instructions (such as `CLAUDE.md` or `AGENTS.md`) and login. Terminal runs and **Same as original**
+  also retain your agent's settings, MCP servers and hooks; explicit unattended Claude overrides
+  restrict them as described above. A difference in results may not come from the setting you
+  changed. Background runs also get an added
   instruction to stop when blocked and report a status, which terminal runs do not.
 - **Limits differ by agent.** Claude background runs have no time limit, and their only stop is
   the dollar budget: the rerun form pre-fills it from the original cost, and an empty budget
@@ -671,9 +685,10 @@ Each provider's own terms apply to what it receives.
    Codex also receives a replay marker so its independently assigned thread can be linked
    when imported. The workspace is its current state, not a snapshot of the original run.
 2. **Restore and run.** When available, a skill captured from a committed Git state is
-   restored from that commit; otherwise its recorded instruction snapshot is used. Claude
-   loads restored skills through a temporary plugin; Codex receives paths to the restored
-   instructions. Background agents receive an instruction to stop and report what is needed
+   restored from that commit; otherwise its recorded instruction snapshot is used. Claude terminal
+   runs and **Same as original** load restored skills through a temporary plugin. Explicit unattended
+   Claude overrides and Codex receive paths to the restored instructions. Background agents receive
+   an instruction to stop and report what is needed
    if a decision or denied action blocks them, and to end with a `RERUN STATUS` line.
    Background output is logged; an agent error is marked failed, while a reported block or
    permission denial is marked **needs you**. Terminal runs are interactive and tracked

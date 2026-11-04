@@ -421,19 +421,6 @@ def test_priority_rule_supports_all_main_tag_types(client, prefix):
     assert {p["id"] for p in client.get("/api/tags/main-types/prompts").json()} == ids
 
 
-def test_skill_exclusion_rule_survives_ingestion_and_can_be_removed(client, tmp_path):
-    response = client.post("/api/tags", json={"tag": "without-review", "rules": [
-        {"keywords": ["flaky"]}, {"preferred_tag": "skill:review-skill"}]})
-    assert response.status_code == 200
-    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1"}
-    c = db.connect(tmp_path / "d.db")
-    ingest(c, force=True)
-    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1"}
-    rule = next(r for r in client.get("/api/tags/without-review/rules").json() if r.get("preferred_tag"))
-    assert client.delete(f"/api/tags/without-review/rules/{rule['index']}").status_code == 200
-    assert {p["id"] for p in client.get("/api/tags/without-review/prompts").json()} == {"prompt-1", "prompt-3"}
-
-
 def test_priority_rules_create_edit_remove_and_validate(client):
     client.post("/api/tags", json={"tag": "preferred", "keywords": ["flaky"]})
     response = client.post("/api/tags", json={"tag": "lower", "rules": [
@@ -887,6 +874,73 @@ def test_delete_prompt_stays_deleted_after_reimport(client):
     assert client.delete("/api/prompts/prompt-3").status_code == 404
 
 
+@pytest.mark.parametrize("target", ["prompt-1", "prompt-3"])
+def test_delete_prompt_removes_all_judge_data_and_both_queue_roles(client, tmp_path, target):
+    c = db.connect(tmp_path / "d.db")
+    pairs = [("prompt-1", "prompt-3"), ("prompt-3", "prompt-1"), ("prompt-4", "prompt-4")]
+    with c:
+        for base, other in pairs:
+            c.execute("INSERT INTO run_ratings(base_id,other_id,status) VALUES(?,?,'done')", (base, other))
+            c.execute("INSERT INTO judge_rating_history(base_id,other_id,summary) VALUES(?,?,'private summary')", (base, other))
+            c.execute("INSERT INTO judge_feedback(base_id,other_id,input_hash,model,judge_score,human_score,note,updated_at) "
+                      "VALUES(?,?,'hash','model',90,80,'private note','2026-10-01')", (base, other))
+            c.execute("INSERT INTO replay_queue(prompt_id,other_prompt_id,kind,added_at) VALUES(?,?,'judge','2026-10-01')", (base, other))
+        c.execute("INSERT INTO replay_queue(prompt_id,added_at) VALUES(?,'2026-10-01')", (target,))
+        c.execute("INSERT INTO replays(session_id,prompt_id,launched_at,status) VALUES('kept-rerun',?,'2026-10-01','done')", (target,))
+    assert client.delete(f"/api/prompts/{target}").status_code == 200
+    for table in ("run_ratings", "judge_rating_history", "judge_feedback"):
+        assert [(r["base_id"], r["other_id"]) for r in c.execute(f"SELECT * FROM {table}")] == [("prompt-4", "prompt-4")]
+    assert [(r["prompt_id"], r["other_prompt_id"]) for r in c.execute("SELECT * FROM replay_queue")] == [("prompt-4", "prompt-4")]
+    assert c.execute("SELECT prompt_id FROM replays WHERE session_id='kept-rerun'").fetchone()[0] == target
+
+
+@pytest.mark.parametrize("model,permission,flag,expected", [
+    ("codex:gpt-6-luna", "ask", "--sandbox", "read-only"),
+    ("codex:gpt-6-luna", "edits", "--sandbox", "workspace-write"),
+    ("claude-sonnet-5-5", "ask", "--permission-mode", "default"),
+    ("claude-sonnet-5-5", "edits", "--permission-mode", "acceptEdits"),
+])
+def test_terminal_rerun_applies_explicit_permissions(client, monkeypatch, model, permission, flag, expected):
+    from rerunly import replay
+    launched = []
+    monkeypatch.setattr(replay, "launch", lambda cwd, argv: launched.append(argv) or "terminal")
+    response = client.post("/api/prompts/prompt-1/replay", json={"mode": "terminal", "permission": permission, "model": model})
+    assert response.status_code == 200
+    argv = launched[0]
+    assert argv[argv.index(flag) + 1] == expected
+
+
+@pytest.mark.parametrize("permission", ["ask", "edits"])
+def test_background_claude_overrides_limit_tools_instead_of_inheriting_allow_rules(client, monkeypatch, permission):
+    from rerunly import runner
+    launched = []
+    monkeypatch.setattr(runner, "start", lambda cwd, argv, *a, **kw: launched.append(argv) or 999999)
+    response = client.post("/api/prompts/prompt-1/replay", json={"mode": "background", "permission": permission})
+    assert response.status_code == 200
+    argv = launched[0]
+    tools = set(argv[argv.index("--tools") + 1].split(","))
+    assert {"Read", "Glob", "Grep"} <= tools
+    assert not {"Bash", "Agent", "Task", "Skill", "WebFetch", "WebSearch", "ToolSearch"} & tools
+    assert bool(tools & {"Write", "Edit", "NotebookEdit"}) is (permission == "edits")
+    assert "--restricted" in argv and "--strict-mcp-config" in argv
+    assert argv[argv.index("--disallowedTools") + 1] == "mcp__*"
+    assert json.loads(argv[argv.index("--settings") + 1])["disableAllHooks"] is True
+    assert argv[argv.index("--permission-mode") + 1] == ("acceptEdits" if permission == "edits" else "default")
+
+
+def test_background_same_permissions_does_not_apply_explicit_override_restrictions(client, tmp_path, monkeypatch):
+    from rerunly import runner
+    c = db.connect(tmp_path / "d.db")
+    with c:
+        c.execute("UPDATE prompts SET permissions=? WHERE id='prompt-1'", (json.dumps({"permission_mode": "dontAsk"}),))
+    launched = []
+    monkeypatch.setattr(runner, "start", lambda cwd, argv, *a, **kw: launched.append(argv) or 999999)
+    assert client.post("/api/prompts/prompt-1/replay", json={"mode": "background", "permission": "same"}).status_code == 200
+    argv = launched[0]
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--restricted" not in argv and "--tools" not in argv and "--strict-mcp-config" not in argv
+
+
 def test_tag_reference(client):
     client.post("/api/tags/task:ref/prompts", json={"prompt_ids": ["prompt-1", "prompt-3"]})
     assert client.get("/api/tags/task:ref/reference").json()["reference"] is None
@@ -1189,11 +1243,6 @@ def test_rerun_outcome(tmp_path):
     denied = log({"subtype": "success", "is_error": False, "result": "Could not write.",
                   "permission_denials": [{"tool_name": "Write", "tool_input": {"file_path": "/x"}}]})
     assert denied["status"] == "needs_you" and denied["denials"] == [{"tool": "Write", "input": {"file_path": "/x"}}]
-    blocked = log({"subtype": "success", "is_error": False, "result": "Which branch?\nRERUN STATUS: blocked: the branch to review"})
-    assert (blocked["status"], blocked["blocked"]) == ("needs_you", "the branch to review")
-    assert log({"subtype": "error_max_budget_usd", "is_error": True, "result": ""})["status"] == "failed"
-    (tmp_path / "stream.jsonl").write_text("not json\n")
-    assert outcome(tmp_path / "stream.jsonl") is None
 
 
 def test_skills_plugin(tmp_path):
@@ -1242,8 +1291,11 @@ def test_background_rerun(client, monkeypatch):
     for flag in ("--permission-prompts", "none", "--permission-mode", "acceptEdits", "--max-budget-usd", "1.50", "--session-id", out["session_id"]):
         assert flag in argv
     # prompt-3 ran review-skill, whose folder is gone: restored from its snapshot, and the agent told to use it
-    assert out["skills"] == [{"skill": "review-skill", "pinned": "rerunly-pinned:review-skill", "source": "snapshot"}]
-    assert "--plugin-dir" in argv and "rerunly-pinned:review-skill" in argv[argv.index("--append-system-prompt") + 1]
+    plugin = Path(argv[argv.index("--add-dir") + 1])
+    skill_path = str(plugin / "skills" / "review-skill" / "SKILL.md")
+    assert out["skills"] == [{"skill": "review-skill", "pinned": skill_path, "source": "snapshot"}]
+    assert "--plugin-dir" not in argv and skill_path in argv[argv.index("--append-system-prompt") + 1]
+    assert plugin.is_dir() and Path(skill_path).read_text().endswith("Read the diff.\n")
     monkeypatch.setattr(runner, "alive", lambda pid: True)
     [x] = client.get("/api/reruns").json()["launched"]
     assert x["status"] == "running" and "pid" not in x

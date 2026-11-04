@@ -36,8 +36,9 @@ DEFAULT_SETTINGS = {
     "price_lookup_missing": [],
     # Two prompts are "similar" when the Jaccard similarity of their word sets reaches this.
     "similarity_threshold": 0.6,
-    # User rules adding human tags automatically, either
-    #   {"tag": "name", "keywords": ["word", ...], "match": "all" | "any"}  (case-insensitive)
+    # User rules adding human tags automatically (see `make_rules` in server.py), such as
+    #   {"tag": "name", "keywords": ["word", ...], "match": "all" | "any", "scope": "session"}  (case-insensitive)
+    #   {"tag": "name", "skill": "skill-name"} or {"tag": "name", "include_tag": "other-tag"}
     #   {"tag": "name", "pattern": "regex"}
     "tag_rules": [],
     # Seconds between automatic re-ingestions while the server runs (0 disables).

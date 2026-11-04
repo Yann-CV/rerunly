@@ -27,7 +27,7 @@ def _start_server(db_path: Path, host: str, port: int):
 
     from .server import create_app
 
-    server = uvicorn.Server(uvicorn.Config(create_app(db_path, port), host=host, port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(create_app(db_path, port), host=host, port=port, log_level="warning", proxy_headers=False))
     threading.Thread(target=server.run, name="dashboard-server", daemon=True).start()
     return server
 

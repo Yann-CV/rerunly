@@ -134,8 +134,6 @@ function tagLegend(active) {
     : `<span class="chip cat-${cat}" title="${esc(help)}"><a>${label}</a></span>`).join("")}</div>`;
 }
 
-// ---- keyword rules -----------------------------------------------------------
-
 // ---- keyword rule editor: one row per rule, each with its own color ------------------
 
 const RULE_COLORS = 6; // --rule-0 … --rule-5 in style.css, light and dark
@@ -1258,7 +1256,7 @@ function skillOrigin(k) {
   }
 }
 
-/** Shell lines repeating the run with Claude Code: the same folder, skill versions, release and model. */
+/** Shell lines repeating the run with its agent (Claude Code or Codex): the same folder, skill versions, release, model, effort and permissions. */
 function rerunCommand(p) {
   const r = p.rerun, model = r.requested_model || Object.keys(p.models || {})[0] || "";
   const lines = [];
@@ -1390,7 +1388,7 @@ function bindSectionHelp(root) {
   document.addEventListener('pointerdown', (event) => { if (!event.target.closest('.section-help')) hide(); }, {signal: sectionHelpEvents.signal});
 }
 
-/** Plan a fresh run with current usage and a separate consumption forecast. */
+/** The rerun form of a prompt page: model, effort, release, mode and permissions, with the estimated usage and its forecast. */
 function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
   const isExample = p.source === "rerunly-examples";
@@ -2034,7 +2032,6 @@ function fmtAgo(iso) {
   return fmtDate(iso);
 }
 
-/** Cost of the latest runs against the earlier ones: arrow + words, never color alone. */
 /** Median cost of the last runs (up to 3) against the ones before, in percent; null under 4 runs. */
 function trendPct(spark) {
   if (spark.length < 4) return null;
@@ -2044,6 +2041,7 @@ function trendPct(spark) {
   return before ? Math.round(((recent - before) / before) * 100) : null;
 }
 
+/** Cost of the latest runs against the earlier ones: arrow + words, never color alone. */
 function trendBadge(spark) {
   const pct = trendPct(spark);
   if (pct == null) return "";
@@ -3375,7 +3373,6 @@ function homeHighlights(o) {
       ru && `${fmtCost(ru.avg_cost_usd)} per run · ${fmtCost(ru.cost_usd)} total · last ${esc(fmtAgo(ru.last_at))}`);
 }
 
-/** The most used tag of each category, with its two runners-up. */
 /** The top tags of each category, by number of prompts or, with `by: "cost"`, by total cost (shown first, in large). */
 function homeTopTags(o, { by = "prompts" } = {}) {
   const byCost = by === "cost";

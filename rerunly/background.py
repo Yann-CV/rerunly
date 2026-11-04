@@ -16,7 +16,8 @@ ICON = Path(__file__).parent / "static" / "icon.svg"
 
 
 def tray_command(db_path: Path, port: int) -> list[str]:
-    """Absolute paths only: the login session has neither this shell's PATH nor its working directory."""
+    """The command starting the tray, with absolute paths only: the login session has neither this shell's PATH
+    nor its working directory."""
     return [sys.executable, "-m", "rerunly", "--db", str(Path(db_path).resolve()), "tray", "--port", str(port)]
 
 

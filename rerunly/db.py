@@ -297,6 +297,7 @@ def tighten_permissions(db_path: Path) -> None:
     placed elsewhere with `--db` keeps the permissions it was given."""
     if db_path.resolve().parent != DATA_DIR.resolve():
         return
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     for path in (DATA_DIR, *DATA_DIR.iterdir()):
         if path.is_symlink():
             continue

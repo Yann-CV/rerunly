@@ -6,7 +6,8 @@ from .pricing import Usage, cost_usd, find_price
 
 
 def estimate_rerun(prompt, agents, model, prices):
-    """Reuse original token volume; preserve recorded cache usage and subagent models.
+    """Tokens, cost and duration of rerunning `prompt` with `model`, from the original's usage: its token
+    volume, its recorded cache usage and its subagents' models.
 
     This is an API-price estimate, not a subscription charge or a quota forecast.
     Effort, tools, cache behavior and the work itself may change on the rerun.

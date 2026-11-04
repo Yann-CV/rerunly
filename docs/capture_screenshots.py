@@ -6,14 +6,14 @@ history or a normal dashboard, including an empty normal dashboard.
 Run from the repository root:
     uv run --with playwright python docs/capture_screenshots.py
 
-Use --readme-only (also the default) for the populated README illustrations.
-Use --comparisons-only to refresh just the completed rerun and judge comparisons.
-
-Refresh only the prompt page and its expanded rerun panel with --prompt-only.
-Use --model-checks-only for the Reruns page and illustrative availability results.
-Use --compare-only for the comparison page and judge result.
-Use --rerun-comparison-only for the all-reruns comparison.
-Use --rerun-detail-only for the rerun details page.
+Options (each refreshes only some screenshots):
+    --readme-only            the populated README illustrations (also the default)
+    --comparisons-only       the completed rerun and judge comparisons
+    --prompt-only            the prompt page and its expanded rerun panel
+    --model-checks-only      the Reruns page and illustrative availability results
+    --compare-only           the comparison page and judge result
+    --rerun-comparison-only  the all-reruns comparison
+    --rerun-detail-only      the rerun details page
 
 Requires Chrome, Chromium, or `uv run --with playwright playwright install chromium`.
 No transcripts are imported, agents launched, or agent settings changed.

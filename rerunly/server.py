@@ -119,6 +119,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if not examples:
             remove_examples(conn())  # added to the history by an earlier version: they live in the example app now
             recover_interrupted_judgments()
+            # Older deletions left judge history and feedback behind. Honor their deletion markers too.
+            c = conn()
+            with c:
+                drop_prompts(c, [row[0] for row in c.execute("SELECT prompt_id FROM deleted_prompts")])
 
     def run_ingest(force: bool = False) -> dict:
         with ingest_lock:
@@ -182,7 +186,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     def start_rating(base_id: str, other_id: str, force: bool = False, model: str = "", origin: str = "explicit") -> dict | None:
         """Have an LLM judge rate `other_id`'s output against `base_id`'s, in the background, with `model` (else the
-        default judge of the Setup page); None when one has no answer."""
+        default judge of the Setup page); None when either run is missing or has no answer."""
         c = conn()
         runs = rating_inputs(c, base_id, other_id)
         if base_id == other_id or len(runs) != 2 or not runs[base_id]["answer"] or not runs[other_id]["answer"]:
@@ -190,6 +194,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         fingerprint = judge.input_hash(runs)
         human_feedback = rating_feedback(c, base_id, other_id, runs)
         with rating_lock:
+            if len(rating_inputs(c, base_id, other_id)) != 2:
+                return None  # deletion may have completed while this judgment waited for the lock
             current = rating_of(c, base_id, other_id)
             if current and (current["status"] == "rating" or (current["status"] == "done" and not force)):
                 return current
@@ -233,7 +239,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return rating_of(c, base_id, other_id)
 
     def rate_pending(c) -> None:
-        """Reruns imported with an answer, to rate against their original, and not rated yet."""
+        """Start rating every imported rerun with an answer against its original, unless it is rated already or
+        was queued without rating."""
         for x in c.execute(
             "SELECT x.prompt_id base, x.judge_model, (SELECT id FROM prompts WHERE session_id = x.session_id ORDER BY started_at LIMIT 1) other "
             "FROM replays x WHERE COALESCE(x.auto_rate, 1) = 1").fetchall():
@@ -693,8 +700,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.get("/api/prompts/{prompt_id}")
     def get_prompt(prompt_id: str, compare: str = "", tag: str = "", exclude_reruns: bool = False):
-        """`compare` picks the prompts shown next to this one:
-        similar = similar text; tag = every prompt with `tag`; similar_tag = similar and with `tag`."""
+        """A prompt with everything its page shows. `compare` picks the prompts shown next to it: similar = similar
+        text; tag = every prompt with `tag`; similar_tag = similar and with `tag`; original = the run it reruns."""
         if compare and compare not in COMPARE_SCOPES:
             raise HTTPException(400, f"compare must be one of {COMPARE_SCOPES}")
         if compare in ("tag", "similar_tag") and not tag:
@@ -792,9 +799,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     def make_rules(
         tag: str, keywords: list[str], match: str = "all", scope: str = "prompt", skill: str = "", preferred_tag: str = "", include_tag: str = "", exclude: bool = False,
     ) -> list[dict]:
-        """Rule tagging, past and future, with the human tag `tag` every prompt (or every prompt of a session)
-        containing the keywords, or where the agent used `skill`: one rule, one per keyword with "any", none
-        without keywords or skill."""
+        """Rules giving the human tag `tag`, past and future, to every prompt (or every prompt of a session)
+        containing the keywords, where the agent used `skill`, or carrying `include_tag`; with `exclude`, keeping
+        it off the prompts containing the keywords; with `preferred_tag`, holding it back where that tag is.
+        One rule, one per keyword with "any", none without keywords, skill or tag."""
         keywords = sorted({k.strip() for k in keywords if k.strip()}, key=str.lower)
         skill = skill.strip().removeprefix("skill:")
         preferred_tag = preferred_tag.strip()
@@ -922,7 +930,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         scope: str = Body("prompt", embed=True),
         rules: list[dict] = Body([], embed=True),
     ):
-        """A new human tag, before any prompt carries it. Each of `rules` ({keywords, match, scope}, or the
+        """A new human tag, before any prompt carries it. Each of `rules` (the arguments of `make_rules`, or the
         single `keywords`/`match`/`scope`) tags the prompts or sessions it matches."""
         tag = tag.strip()
         if not tag:
@@ -1078,7 +1086,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         row = c.execute("SELECT session_id FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
         if row is None:
             raise HTTPException(404)
-        with c:
+        with rating_lock, c:
             c.execute("INSERT OR REPLACE INTO deleted_prompts(prompt_id, deleted_at) VALUES (?, ?)",
                       (prompt_id, datetime.now(timezone.utc).isoformat(timespec="seconds")))
             drop_prompts(c, [prompt_id])
@@ -1233,7 +1241,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.post("/api/tags/{tag:path}/exclusions/restore")
     def restore_excluded(tag: str, prompt_ids: list[str] = Body(..., embed=True)):
-        """Restore the original assignment; unknown legacy assignments fall back to manual membership."""
+        """Put `tag` back on these excluded prompts the way they had it; one excluded before that was recorded
+        gets it by hand."""
         c = conn()
         require_human_tag(c, tag)
         excluded = exclusions(c, tag, prompt_ids)
@@ -1435,7 +1444,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         """Subscription usage of every connected agent, as last seen: Claude Code through its statusline (`capture`:
         whether that is set up), Codex in its rollouts; asked from the provider with the agent's login (`live`) when
         nothing usable was seen locally. No `windows` when neither has any; a window whose reset time has passed
-        since is back to 0%."""
+        since is back to 0%. Each reading is also recorded for the usage forecasts."""
         if examples:
             return []  # the illustrative records have no subscription
         settings = db.get_settings(conn())
@@ -1555,9 +1564,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return await request.json()
 
     def rerun_options(body: dict, *, draft: bool = False) -> dict:
-        """How to rerun: model, effort, Claude Code release ("" installed, "same" the prompt's own, or a
-        version such as a reference run's), mode ("background": unattended, or "terminal": interactive),
-        what it may do without asking (background), a budget cap in USD, and whether to restore the skills."""
+        """How to rerun: model, effort, agent release ("" installed, "same" the prompt's own, or a version such
+        as a reference run's), mode ("background": unattended, or "terminal": interactive), what it may do without
+        asking, a budget cap in USD, whether to keep the terminal open and to restore the skills, and whether
+        (and with which judge model) to rate the rerun. A `draft` (a queued rerun) may leave the permission open."""
         model, effort = str(body.get("model") or ""), str(body.get("effort") or "")
         if model and not replay.MODEL_RE.match(model):
             raise HTTPException(400, "unknown model")
@@ -1714,7 +1724,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         return [q for item_id in ids if (q := c.execute("SELECT * FROM replay_queue WHERE id=?", (item_id,)).fetchone())]
 
     def start_replay(c, prompt_id: str, opts: dict) -> dict:
-        """Rerun a prompt with Claude Code: the same folder and prompt, the skills as they ran, the model,
+        """Rerun a prompt with Claude Code or Codex: the same folder and prompt, the skills as they ran, the model,
         effort and release asked for; in the background (unattended) or in a terminal window."""
         r = replayable(c, prompt_id)
         issues = configuration_issues(c, prompt_id, opts)
@@ -1758,7 +1768,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             skills = runner.build_skills_plugin(plugin, versions) if plugin else []
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
-        if codex and plugin:
+        if plugin and (codex or (opts["mode"] == "background" and recorded_permissions is None)):
             for skill in skills:
                 skill["pinned"] = str(plugin / "skills" / runner._skill_name(skill["skill"]) / "SKILL.md")
         row = {"session_id": session_id, "prompt_id": prompt_id, "model": opts["model"], "effort": opts["effort"],
@@ -1770,9 +1780,12 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                               for k in skills)
             argv = replay.claude_argv(r["text"], session_id, opts["model"], opts["effort"], version, str(plugin or ""), note)
             if codex:
-                argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version, note=note, original_permissions=recorded_permissions)
+                argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version, permission=opts["permission"],
+                                         note=note, original_permissions=recorded_permissions)
             elif recorded_permissions is not None:
                 argv = replay.with_options(argv, permission_args)
+            else:
+                argv = replay.with_options(argv, replay.claude_permission_args(opts["permission"]))
             settings = db.get_settings(c)
             argv = [sys.executable, str(Path(__file__).with_name("terminal.py")),
                     settings["codex_sessions_dir" if codex else "claude_projects_dir"],
@@ -1781,7 +1794,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             launched = replay.launch(cwd, argv)
             row.update(status="interactive")
         else:
-            argv = runner.background_argv(r["text"], session_id, opts["model"], opts["effort"], version, "ask" if recorded_permissions is not None else opts["permission"],
+            argv = runner.background_argv(r["text"], session_id, opts["model"], opts["effort"], version, "same" if recorded_permissions is not None else opts["permission"],
                                           opts["budget"], plugin, skills)
             if codex:
                 argv = replay.codex_argv(r["text"], session_id, opts["model"], opts["effort"], version,
@@ -1982,7 +1995,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.get("/api/reruns/queue/count")
     def rerun_queue_count():
-        """Navigation count without fetching rerun details or account usage."""
+        """The number of queued reruns, for the navigation: without rerun details or account usage."""
         c = conn()
         try:
             return {"queued": c.execute("SELECT COUNT(*) FROM replay_queue").fetchone()[0]}
@@ -2040,7 +2053,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.post("/api/reruns/launch")
     def launch_reruns(body: dict = Depends(dashboard_json)):
-        """Launch queued reruns together and take them out of the queue."""
+        """Launch queued reruns together, taking those that start out of the queue; nothing starts while one
+        still needs input."""
         c = conn()
         rows = selected_queue(c, body)
         needs_input = queued_inputs(c, rows)
@@ -2161,8 +2175,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
 
     @app.get("/api/compare")
     def compare_runs(a: str, b: str):
-        """Two runs side by side: their figures, files and answers, their rating, and the runs related to the
-        first (its original, every rerun of it, and its tags' reference runs) to pick from."""
+        """Two runs side by side: their figures, files and answers, their rating, and the runs related to either
+        (its original, every rerun of it, and its tags' reference runs) to pick from."""
         c = conn()
         refresh_reruns(c)
         cols = (f"{LIST_COLS}, p.answer, p.files, p.session_id")
@@ -2225,11 +2239,12 @@ def serve(db_path: Path, host: str, port: int, reload: bool = False) -> None:
     import uvicorn
 
     if not reload:
-        uvicorn.run(create_app(db_path, port), host=host, port=port, log_level="warning")
+        uvicorn.run(create_app(db_path, port), host=host, port=port, log_level="warning", proxy_headers=False)
         return
     # restart on Python changes; static files are sent with no-cache, so a page refresh shows UI changes
     os.environ.update(RERUNLY_DB=str(db_path), RERUNLY_PORT=str(port))
     uvicorn.run(
         "rerunly.server:reload_app", factory=True, host=host, port=port, log_level="warning",
+        proxy_headers=False,
         reload=True, reload_dirs=[str(Path(__file__).parent)],
     )

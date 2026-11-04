@@ -17,14 +17,14 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .replay import claude_permission_args
+
 # the plugin carrying the skills as they ran: skill `x` is loaded as `rerunly-pinned:x`
 PINNED_PLUGIN = "rerunly-pinned"
 STATUS_LINE = "RERUN STATUS:"
 PERMISSIONS = {
-    # anything beyond reading is denied, and reported
-    "ask": [],
-    # file edits are allowed; commands and the rest are denied, and reported
-    "edits": ["--permission-mode", "acceptEdits"],
+    "ask": claude_permission_args("ask", background=True),
+    "edits": claude_permission_args("edits", background=True),
 }
 
 
@@ -41,7 +41,10 @@ def unattended_note(skills: list[dict]) -> str:
         f"or `{STATUS_LINE} blocked: <what you needed>` otherwise.",
     ]
     for k in skills:
-        lines.append(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with.")
+        if Path(k["pinned"]).is_absolute():
+            lines.append(f"For skill `{k['skill']}`, read the instructions at `{k['pinned']}` with a file-reading tool: it is the version this task ran with.")
+        else:
+            lines.append(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with.")
     return "\n".join(lines)
 
 
@@ -93,7 +96,7 @@ def background_argv(prompt: str, session_id: str, model: str, effort: str, versi
                     budget: float | None, plugin_dir: Path | None, skills: list[dict]) -> list[str]:
     argv = ["npx", "-y", f"@anthropic-ai/claude-code@{version}"] if version else ["claude"]
     argv += ["-p", "--output-format", "stream-json", "--verbose", "--session-id", session_id,
-             "--permission-prompts", "none", *PERMISSIONS[permission],
+             "--permission-prompts", "none", *(PERMISSIONS[permission] if permission != "same" else []),
              "--append-system-prompt", unattended_note(skills)]
     if model:
         argv += ["--model", model]
@@ -102,7 +105,8 @@ def background_argv(prompt: str, session_id: str, model: str, effort: str, versi
     if budget:
         argv += ["--max-budget-usd", f"{budget:.2f}"]
     if plugin_dir:
-        argv += ["--plugin-dir", str(plugin_dir)]
+        # Restricted runs read snapshots directly, without invoking skill preprocessing or scripts.
+        argv += ["--plugin-dir" if permission == "same" else "--add-dir", str(plugin_dir)]
     return [*argv, "--", prompt]
 
 
@@ -162,7 +166,7 @@ def alive(pid: int | None) -> bool:
 
 
 def terminal_process(session_id: str) -> bool | None:
-    """Find this user's terminal wrapper; None means process inspection is unavailable."""
+    """Whether this user's terminal wrapper of `session_id` is running; None when processes cannot be inspected."""
     proc = Path('/proc')
     if not proc.is_dir():
         return None

@@ -87,7 +87,7 @@ def judge_agent(model: str) -> tuple[str, str]:
 
 
 def usage_tokens(usage: dict, *, cached_separate: bool) -> int | None:
-    """Count input and output tokens, including cache tokens only when reported separately."""
+    """Input and output tokens of `usage`, cache tokens included when reported separately; None without any."""
     if not isinstance(usage, dict):
         return None
     keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens") if cached_separate else ("input_tokens", "output_tokens")
