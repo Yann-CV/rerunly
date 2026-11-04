@@ -10,13 +10,15 @@ from datetime import datetime
 from pathlib import Path
 
 from . import background
+from .security import access_token
 
 REFRESH_MS = 60_000
 
 
-def _get(url: str, method: str = "GET", timeout: float = 2) -> dict | None:
+def _get(url: str, method: str = "GET", timeout: float = 2, *, token: str = "") -> dict | None:
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=timeout) as r:  # noqa: S310 - its own local server
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method=method), timeout=timeout) as r:  # noqa: S310 - its own local server
             return json.loads(r.read())
     except (OSError, ValueError):
         return None
@@ -44,8 +46,9 @@ def run_tray(db_path: Path, port: int, host: str = "127.0.0.1") -> None:
     from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
     base = f"http://{host}:{port}"
+    token = access_token(db_path)
     # a dashboard already serving this port (e.g. `rerunly --reload`) is reused
-    server = None if _get(f"{base}/api/settings") is not None else _start_server(db_path, host, port)
+    server = None if _get(f"{base}/api/settings", token=token) is not None else _start_server(db_path, host, port)
     background.write_pid()
 
     app = QApplication([])
@@ -68,7 +71,7 @@ def run_tray(db_path: Path, port: int, host: str = "127.0.0.1") -> None:
     def refresh():
         """Today's spend in the menu and tooltip; also keeps the checkbox in step with the Setup page."""
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-        data = _get(f"{base}/api/prompts?limit=1&since={urllib.parse.quote(midnight.isoformat())}")
+        data = _get(f"{base}/api/prompts?limit=1&since={urllib.parse.quote(midnight.isoformat())}", token=token)
         if data is None:
             text = "Dashboard not reachable"
         else:
@@ -83,7 +86,7 @@ def run_tray(db_path: Path, port: int, host: str = "127.0.0.1") -> None:
         import_action.setText("Importing…")
 
         def work():
-            _get(f"{base}/api/ingest", method="POST", timeout=600)
+            _get(f"{base}/api/ingest", method="POST", timeout=600, token=token)
             QTimer.singleShot(0, app, done)  # back on the Qt thread
 
         def done():

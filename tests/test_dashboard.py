@@ -676,8 +676,8 @@ def test_overview_repeated_prompt(projects, tmp_path, monkeypatch):
 
 def test_static_files_are_revalidated(tmp_path):
     client = TestClient(create_app(tmp_path / "db.sqlite", background=False))
-    for path in ("/", "/static/app.js"):
-        assert client.get(path).headers["cache-control"] == "no-cache"
+    assert client.get("/").headers["cache-control"] == "no-store"
+    assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
 
 
 def test_autostart_entry(tmp_path, monkeypatch):

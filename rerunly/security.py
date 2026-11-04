@@ -1,10 +1,9 @@
 """Who may reach the dashboard. It can read history and start agents, so requests are checked here.
 
-Loopback connections must come from this user (Linux) and from the dashboard's own pages. Connections arriving
-on any other interface must also present the access token, because they have no operating-system identity to check.
+Loopback connections must come from this user (Linux) and from the dashboard's own pages.
+The local login separately requires a password session or a private machine-client bearer token.
 """
 
-import hmac
 import ipaddress
 import os
 import secrets
@@ -14,10 +13,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
-TOKEN_COOKIE = "rerunly_token"  # noqa: S105 - the cookie's name
 PROC_NET = Path("/proc/net")
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
        "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
@@ -72,11 +70,12 @@ def peer_is_this_user(scope: Mapping) -> bool:
 
 
 def token_path(db_path: Path) -> Path:
-    return db_path.parent / "access-token"
+    # Use a new credential: old browser access links must not become machine-client back doors.
+    return db_path.resolve().parent / "machine-token"
 
 
 def access_token(db_path: Path) -> str:
-    """The token for non-loopback access, created once and readable by this user only."""
+    """A private bearer token for the tray, import hook and telemetry; never a browser login."""
     path = token_path(db_path)
     try:
         return path.read_text().strip()
@@ -93,14 +92,19 @@ def access_token(db_path: Path) -> str:
     return token
 
 
-def _authorized_remote(request: Request, db_path: Path) -> bool:
-    token = access_token(db_path)
-    scheme, _, value = request.headers.get("authorization", "").partition(" ")
-    candidates = [request.cookies.get(TOKEN_COOKIE, ""), value if scheme.lower() == "bearer" else ""]
-    return any(hmac.compare_digest(c.encode(), token.encode()) for c in candidates if c)
+def access_header_file(db_path: Path) -> Path:
+    """curl reads this private header file so the machine token never appears in process arguments."""
+    from .processes import write_atomic
+    path = db_path.resolve().parent / "machine-token-header"
+    header = f"Authorization: Bearer {access_token(db_path)}\n"
+    if not path.exists() or path.read_text() != header:
+        write_atomic(path, header, mode=0o600)
+    else:
+        path.chmod(0o600)
+    return path
 
 
-def _reject_request(request: Request, db_path: Path):
+def _reject_request(request: Request):
     """The response refusing this request, or None to serve it."""
     host = request.headers.get("host", "")
     parsed_host = urlsplit("//" + host)
@@ -115,14 +119,6 @@ def _reject_request(request: Request, db_path: Path):
             return JSONResponse({"detail": "Invalid host for a local dashboard"}, 403)
         if not peer_is_this_user(request.scope):
             return JSONResponse({"detail": "This dashboard belongs to another local user"}, 403)
-    elif _ip(listener_host) and not _authorized_remote(request, db_path):
-        supplied = request.query_params.get("token", "")
-        if request.method == "GET" and supplied and hmac.compare_digest(supplied.encode(), access_token(db_path).encode()):
-            # The access link: keep the token out of the address bar and history.
-            response = RedirectResponse(request.scope.get("root_path", "") + request.url.path.removeprefix(request.scope.get("root_path", "")), 303)
-            response.set_cookie(TOKEN_COOKIE, supplied, httponly=True, samesite="strict")
-            return response
-        return JSONResponse({"detail": "Open this dashboard with the access link printed when the server started."}, 401)
     origin = request.headers.get("origin")
     if origin:
         parsed_origin = urlsplit(origin)
@@ -138,21 +134,22 @@ def _reject_request(request: Request, db_path: Path):
     return None
 
 
-def protect(app: FastAPI, db_path: Path) -> None:
-    """Reject other users, other sites and DNS rebinding; require the token away from loopback.
-
-    Local CLI clients and the telemetry hook send no Origin or Fetch Metadata."""
+def protect(app: FastAPI, login=None) -> None:
+    """Check the network boundary before allowing login or access to protected pages."""
 
     @app.middleware("http")
     async def protect_dashboard(request: Request, call_next):
         try:
-            rejected = _reject_request(request, db_path)
+            rejected = _reject_request(request)
         except ValueError:
             return JSONResponse({"detail": "Invalid request host or origin"}, 400)
+        rejected = rejected or (login.reject(request) if login else None)
         response = rejected or await call_next(request)
         response.headers.setdefault("Content-Security-Policy", CSP)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
 

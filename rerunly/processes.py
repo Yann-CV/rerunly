@@ -21,11 +21,14 @@ def run(argv: list[str], *, cwd=None, input: str | None = None, timeout: float) 
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
-def write_atomic(path, text: str) -> None:
-    """Replace a file's contents all at once, following a symlink and keeping its mode."""
+def write_atomic(path, text: str, *, mode: int | None = None) -> None:
+    """Replace contents atomically, following symlinks and preserving the mode unless explicitly private."""
     target = path.resolve()
     temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    fd = os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, target.stat().st_mode & 0o777 if target.exists() else 0o600)
+    fd = os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+                 mode if mode is not None else target.stat().st_mode & 0o777 if target.exists() else 0o600)
+    if mode is not None:
+        os.fchmod(fd, mode)
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write(text)

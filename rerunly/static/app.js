@@ -22,6 +22,15 @@ addEventListener("unhandledrejection", (e) => { if (e.reason instanceof StaleNav
 const EXAMPLES = location.pathname.startsWith("/examples");
 const BASE = EXAMPLES ? "/examples" : "";
 
+function redirectToLogin(response) {
+  if (response.status === 401) {
+    app.replaceChildren();
+    document.getElementById("usage-panel").hidden = true;
+    location.replace("/login" + location.hash);
+    throw new StaleNavigation();
+  }
+}
+
 let queueBadgeRequest = 0;
 
 function showQueueCount(count) {
@@ -36,6 +45,7 @@ async function refreshQueueCount() {
   const request = ++queueBadgeRequest;
   try {
     const response = await fetch(BASE + "/api/reruns/queue/count");
+    redirectToLogin(response);
     if (!response.ok) return;
     const data = await response.json();
     if (request === queueBadgeRequest) showQueueCount(data.queued);
@@ -50,6 +60,7 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
+  redirectToLogin(res);
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   const data = await res.json();
   if (queueRequest === queueBadgeRequest) {
@@ -4703,6 +4714,23 @@ if (!EXAMPLES) document.getElementById("refresh").onclick = async (e) => {
   e.target.disabled = true;
   try { await api("/api/ingest", { method: "POST" }); await route(); } finally { e.target.disabled = false; }
 };
+if (!EXAMPLES) {
+  const signOut = document.getElementById("sign-out");
+  signOut.hidden = false;
+  signOut.onclick = async () => {
+    signOut.disabled = true;
+    try {
+      await api("/auth/logout", {method: "POST"});
+      app.replaceChildren();
+      document.getElementById("usage-panel").hidden = true;
+      location.replace("/login");
+    } catch (error) {
+      if (!(error instanceof StaleNavigation)) alert("Could not sign out. Please try again.");
+      signOut.disabled = false;
+    }
+  };
+}
+window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
 setInterval(() => { if (!document.hidden) refreshQueueCount(); }, 60000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshQueueCount(); });
 window.addEventListener("hashchange", route);

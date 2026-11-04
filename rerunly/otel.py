@@ -77,11 +77,27 @@ def store(conn: sqlite3.Connection, payload: dict) -> int:
     return len(rows)
 
 
-def telemetry_env(port: int) -> dict[str, str]:
+def telemetry_env(port: int, token: str = "", headers: str = "") -> dict[str, str]:
     """Claude Code settings `env` entries sending log events to this dashboard."""
-    return {
+    values = {
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/json",
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": f"http://127.0.0.1:{port}/v1/logs",
     }
+    if token:
+        extra = [item for item in headers.split(",") if item.strip() and item.partition("=")[0].strip().lower() != "authorization"]
+        values["OTEL_EXPORTER_OTLP_LOGS_HEADERS"] = ",".join(["Authorization=Bearer%20" + token, *extra])
+    return values
+
+
+HEADERS_KEY = "OTEL_EXPORTER_OTLP_LOGS_HEADERS"
+
+
+def redacted(env: dict[str, str]) -> dict[str, str]:
+    """`env` safe to show in a page: header values are credentials (the machine token, or another collector's key),
+    so only their names are kept."""
+    if HEADERS_KEY not in env:
+        return dict(env)
+    names = [item.partition("=")[0].strip() for item in env[HEADERS_KEY].split(",") if item.strip()]
+    return {**env, HEADERS_KEY: ",".join(f"{name}=<hidden>" for name in names)}

@@ -14,6 +14,7 @@ Options (each refreshes only some screenshots):
     --compare-only           the comparison page and judge result
     --rerun-comparison-only  the all-reruns comparison
     --rerun-detail-only      the rerun details page
+    --login-only             local password creation and sign-in previews
 
 Requires Chrome, Chromium, or `uv run --with playwright playwright install chromium`.
 No transcripts are imported, agents launched, or agent settings changed.
@@ -28,12 +29,13 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rerunly.server import create_app
-from rerunly import db
+from rerunly import auth, db, security
 
 
 def main():
@@ -44,8 +46,18 @@ def main():
         app = FastAPI()
         app.mount("/examples", create_app(database, background=False, examples=True))
         app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parents[1] / "rerunly/static"))
+        login_preview = not sys.argv[1:] or "--readme-only" in sys.argv or "--login-only" in sys.argv
+        if login_preview:
+            # Protect only this isolated example app; never use the user's account or history.
+            login = auth.LocalLogin(database)
+            login.routes(app)
+            security.protect(app, login)
+
+            @app.get("/")
+            def example_home():
+                return RedirectResponse("/examples/", 303)
         server = uvicorn.Server(uvicorn.Config(
-            app, host="127.0.0.1", port=0, log_level="warning",
+            app, host="127.0.0.1", port=0, log_level="warning", proxy_headers=False,
         ))
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
@@ -65,6 +77,33 @@ def main():
                     device_scale_factor=1, color_scheme="light", locale="en-US", timezone_id="UTC")
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
+
+                if login_preview:
+                    login_url = f"http://127.0.0.1:{port}/login"
+                    password = "illustrative password for documentation"
+                    page.goto(login_url)
+                    page.get_by_role("heading", name="Create your password").wait_for()
+                    page.locator(".login-card").screenshot(path=str(output / "login-setup.png"))
+                    page.get_by_label("Password", exact=True).fill(password)
+                    page.get_by_label("Confirm password").fill(password)
+                    page.get_by_role("button", name="Create password", exact=True).click()
+                    page.get_by_role("heading", name="Save your recovery code").wait_for()
+                    page.locator(".login-card").screenshot(path=str(output / "login-recovery.png"))
+                    page.get_by_role("button", name="I've saved my code").click()
+                    page.wait_for_url(base)
+                    page.request.post(f"http://127.0.0.1:{port}/auth/logout")
+                    page.goto(login_url)
+                    page.get_by_role("heading", name="Welcome back").wait_for()
+                    page.locator(".login-card").screenshot(path=str(output / "login.png"))
+                    print("Captured login-setup, login-recovery and login from the isolated example app")
+                    if "--login-only" in sys.argv:
+                        if errors:
+                            raise RuntimeError("Browser errors: " + "; ".join(errors))
+                        browser.close()
+                        return
+                    page.get_by_label("Password", exact=True).fill(password)
+                    page.get_by_role("button", name="Sign in").click()
+                    page.wait_for_url(base)
 
                 def capture(name, route, *, focus=None, dark=False):
                     page.emulate_media(color_scheme="dark" if dark else "light", reduced_motion="reduce")

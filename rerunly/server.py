@@ -15,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import background as bg, db, judge, live_limits, model_access, model_checks, otel, processes, replay, runner, security, statusline, usage_forecast
+from . import auth, background as bg, db, judge, live_limits, model_access, model_checks, otel, processes, replay, runner, security, statusline, usage_forecast
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT, claude_home, invalid_settings
 from .estimates import estimate_rerun
 from .ingest import apply_curation, apply_rules, drop_failed_rerun, drop_prompts, ingest, session_texts
@@ -264,12 +264,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             threading.Thread(target=loop, daemon=True).start()
             if not examples:
                 threading.Thread(target=checks.loop, daemon=True).start()
-        yield
-        stop.set()
-        checks.cancel.set()
+        try:
+            yield
+        finally:
+            stop.set()
+            checks.cancel.set()
+            if login:
+                login.clear_sessions()
 
     app = FastAPI(title="Rerunly examples" if examples else "Rerunly", lifespan=lifespan)
-    security.protect(app, db_path)
+    login = auth.LocalLogin(db_path) if not examples else None
+    if login:
+        login.routes(app)
+    security.protect(app, login)
     app.mount("/static", FreshStaticFiles(directory=STATIC), name="static")
     if examples:
         @app.middleware("http")
@@ -330,7 +337,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     # ---- setup: connecting local coding agents ---------------------------
 
     def hook_command() -> str:
-        return f"curl -s -m 2 -X POST http://127.0.0.1:{port}/api/ingest >/dev/null 2>&1 || true # {HOOK_MARKER}"
+        header = security.access_header_file(db_path)
+        return f"curl -s -m 2 --header {shlex.quote('@' + str(header))} -X POST http://127.0.0.1:{port}/api/ingest >/dev/null 2>&1 || true # {HOOK_MARKER}"
+
+    def telemetry_values(headers: str = "") -> dict[str, str]:
+        return otel.telemetry_env(port, security.access_token(db_path) if not examples else "", headers)
 
     def read_claude_settings() -> dict:
         if CLAUDE_SETTINGS.exists():
@@ -341,13 +352,40 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
         if CLAUDE_SETTINGS.exists():
             shutil.copy(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_suffix(".json.bak"))
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        processes.write_atomic(CLAUDE_SETTINGS, json.dumps(data, indent=2) + "\n")
+        private = "OTEL_EXPORTER_OTLP_LOGS_HEADERS" in data.get("env", {})
+        processes.write_atomic(CLAUDE_SETTINGS, json.dumps(data, indent=2) + "\n", mode=0o600 if private else None)
 
     def is_ours(hook) -> bool:
         return any(m in json.dumps(hook) for m in (HOOK_MARKER, *LEGACY_HOOK_MARKERS))
 
     def hook_installed(cs: dict) -> bool:
         return any(is_ours(h) for h in cs.get("hooks", {}).get("Stop", []))
+
+    def upgrade_local_integrations() -> None:
+        # Existing installations must authenticate too, without removing unrelated hooks or settings.
+        cs = read_claude_settings()
+        changed = False
+        for group in cs.get("hooks", {}).get("Stop", []):
+            for hook in group.get("hooks", []):
+                if hook.get("type") == "command" and is_ours(hook) and "/api/ingest" in hook.get("command", ""):
+                    command = hook_command()
+                    if hook["command"] != command:
+                        hook["command"] = command
+                        changed = True
+        env = cs.get("env", {})
+        if env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") == otel.telemetry_env(port)["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"]:
+            wanted_headers = telemetry_values(env.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS", ""))["OTEL_EXPORTER_OTLP_LOGS_HEADERS"]
+            if env.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS") != wanted_headers:
+                env["OTEL_EXPORTER_OTLP_LOGS_HEADERS"] = wanted_headers
+                changed = True
+        if changed:
+            write_claude_settings(cs)
+
+    if not examples:
+        try:
+            upgrade_local_integrations()
+        except (OSError, ValueError, AttributeError, TypeError):
+            print("[rerunly] Could not upgrade local integrations. Check Claude Code settings, then re-enable the hook and telemetry in Setup.")
 
     @app.get("/api/models")
     def available_models():
@@ -437,7 +475,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
                 "updates": "hook-and-polling" if agent_id == "claude-code" else "polling",
                 "reported_cost": agent_id == "claude-code",
             })
-        wanted, env = otel.telemetry_env(port), cs.get("env") or {}
+        env = cs.get("env") or {}
+        wanted = telemetry_values(env.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS", ""))
         events = c.execute(
             "SELECT COUNT(*) n, SUM(prompt_id IN (SELECT id FROM prompts)) matched, MAX(timestamp) last FROM otel_requests"
         ).fetchone()
@@ -446,9 +485,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
             "auto_ingest_interval": settings["auto_ingest_interval"],
             "telemetry": {
                 "configured": all(env.get(k) == v for k, v in wanted.items()),
-                "env": wanted,
+                # never the machine token itself: a browser session must not turn into a credential that outlives it
+                "env": otel.redacted(wanted),
                 # values the user already set to something else (another collector, another port)
-                "conflicts": {k: env[k] for k in wanted if k in env and env[k] != wanted[k]},
+                "conflicts": otel.redacted({k: env[k] for k in wanted if k in env and env[k] != wanted[k]}),
                 "events": events["n"],
                 "matched_events": events["matched"] or 0,
                 "last_event_at": events["last"],
@@ -524,11 +564,15 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, port: int = DEFAULT_PORT, backgr
     def setup_telemetry(enable: bool = Body(..., embed=True)):
         cs = read_claude_settings()
         env = cs.setdefault("env", {})
-        for key, value in otel.telemetry_env(port).items():
+        values = telemetry_values(env.get("OTEL_EXPORTER_OTLP_LOGS_HEADERS", ""))
+        for key, value in values.items():
             if enable:
                 env[key] = value
             elif env.get(key) == value:
-                env.pop(key)
+                if key == "OTEL_EXPORTER_OTLP_LOGS_HEADERS" and "," in value:
+                    env[key] = value.split(",", 1)[1]
+                else:
+                    env.pop(key)
         if not env:
             cs.pop("env")
         write_claude_settings(cs)

@@ -100,7 +100,8 @@ up automatically from official provider pages, with your overrides taking preced
 <td valign="top">
 
 ### 🔒 Your history stays local
-**No Rerunly account or cloud upload.** Imported history lives in a local SQLite file and a
+**No cloud account or cloud upload.** A single local password protects your dashboard.
+Imported history lives in a local SQLite file and a
 local dashboard. The chart library is bundled, so displaying charts does not contact a CDN. Reruns, optional model checks and LLM judging use your installed, authenticated agents;
 **reruns and judging send prompts and answers to the selected agent's model provider**
 ([details](#before-you-rerun-or-judge)). Automatic price lookups send no prompts and can be disabled.
@@ -122,21 +123,22 @@ uv sync
 uv run rerunly start   # runs in the background, with a status bar icon
 ```
 
-Open <http://127.0.0.1:8765> and go to **Setup**:
+Open <http://127.0.0.1:8765>, **Create your password** (at least 12 characters), save the
+private recovery code, then go to **Setup**. There is one local account, with no username, email or registration. Existing
+installations keep their history and ask you to create a password on the first visit after updating.
 
 1. Under **Agents**, open **Details** for each linked agent to check its **Transcript directory**.
    Use **Save path** to change it, or **Remove** / **Add agent** to manage connections.
 2. **Import now**: load your available history from supported agents.
 3. **Start at login** *(optional)*: keep the dashboard running automatically.
 
-For a foreground dashboard without the tray, use `uv run rerunly`. The dashboard is local by
-default and has no login. On Linux, other users on the machine and connections whose socket
-owner cannot be verified are refused. Forwarded headers are ignored, so they cannot change the
-identity used by this check. If you bind it to a non-loopback interface with `serve --host`,
-network connections must use the access link printed
-at startup (or the token in `access-token`, next to the database, as a bearer token). That
-traffic is unencrypted HTTP and the token controls your history and reruns, so use it on trusted networks
-or behind an encrypted tunnel. macOS has no per-user check, so other accounts there can still reach the local port.
+For a foreground dashboard without the tray, use `uv run rerunly`. Every browser must sign in,
+including browsers on the same machine. On Linux, other operating-system users and connections
+whose socket owner cannot be verified are also refused. Forwarded headers are ignored. macOS
+has no per-user socket check, but the password still protects the dashboard.
+If you bind to a non-loopback interface with `serve --host`, create the password locally first,
+then use the same sign-in page remotely. The built-in server uses unencrypted HTTP; use an
+encrypted tunnel or HTTPS for network access.
 History import needs no installed agent or API key when transcript files are already available. Running tasks or
 judges requires an installed, authenticated Claude Code or Codex CLI; selecting a pinned
 CLI release also requires Node.js and `npx`. Reruns can change your files and use your agent
@@ -146,6 +148,49 @@ New history is imported automatically. For integration-specific setup, including
 and reported costs, see [Supported agents](#-supported-agents).
 
 That's it. Go do some work, then come back and see what it cost.
+
+### Your local login
+
+- Create the password from the dashboard on the machine running Rerunly. Remote visitors
+  cannot claim an unconfigured account. You can also create it from the local terminal below.
+- Sign in with that password. Closing Rerunly signs out every browser; restarting it always
+  requires signing in again, including after a crash or code reload. The password stays saved.
+  Cookies are limited to the browser session, with a maximum server-side session lifetime of
+  12 hours. **Sign out** in the top bar revokes the current browser's session; background imports and
+  already running agents continue. Passwords are stored as salted scrypt hashes in the local
+  database; browser session tokens are stored as hashes too.
+- To change the password, run `uv run rerunly password`. An existing account requires its
+  **current password**, followed by the new password and confirmation. Having a browser session,
+  a machine token or access to the terminal does not authorize this operation.
+- Forgotten-password recovery uses `uv run rerunly password --recover` and requires the
+  **previously saved recovery code**. Initial setup shows a randomly generated code once;
+  only its hash is stored. Save it in a password manager or somewhere outside this machine.
+  Each successful password change or recovery signs out all browsers and issues a replacement
+  code; previous codes stop working. Failed attempts share the account's rate limit.
+- For an existing account without a recovery code, or to replace a lost code while you still
+  know the password, run `uv run rerunly recovery-code`. It requires the current password,
+  invalidates old recovery codes and signs out all browsers. There is no unauthenticated force
+  reset. Without the password or a saved recovery code, Rerunly cannot recover the account.
+  For a custom database, put `--db /path/to/dashboard.db` before the command.
+- These checks protect Rerunly's password-management commands. Someone with administrator
+  privileges, write access to its code/database, or control of the same operating-system account
+  can bypass a local app's protections. Use separate OS accounts and restrictive file permissions
+  when sharing a machine. The dashboard password does not encrypt the history database.
+- The tray, installed import hook and cost telemetry use a private machine bearer token from
+  `machine-token`, next to the database. Existing Rerunly hooks and telemetry settings are upgraded
+  automatically; restart existing Claude sessions to pick up the new telemetry header. Settings
+  containing that header and the hook's `machine-token-header` file are private to your user.
+  Old `access-token` credentials and browser links using `?token=…` no longer grant access.
+  Keep machine tokens private: they
+  grant API access. The Setup page never displays them: header values show as `<hidden>`. Resetting the password revokes browser sessions, while local integrations
+  retain their machine token.
+
+<p><img src="docs/screenshots/login-setup.png" alt="Create a password for Rerunly's single local account" width="360"> <img src="docs/screenshots/login.png" alt="Sign in to Rerunly with the local account password" width="360"></p>
+
+<p><img src="docs/screenshots/login-recovery.png" alt="Save the private recovery code shown once after creating the example account" width="360"></p>
+
+These login previews use the isolated example app, with no personal history or credentials.
+Refresh them with `uv run python docs/capture_screenshots.py --login-only`.
 
 ## 🖼️ A tour
 
@@ -1056,6 +1101,15 @@ uv run ruff check .
 uv run pyright
 ```
 
-CI runs these checks on every pull request.
+Linting (Ruff, Pyright and basic file checks) is also set up with
+[pre-commit](https://pre-commit.com):
+
+```bash
+uv run pre-commit install           # once: lint the staged files before each commit
+uv run pre-commit run --all-files   # lint everything on demand
+```
+
+CI runs the same pre-commit hooks and the tests (Python 3.11 and 3.13) on every
+pull request and on pushes to `main`.
 
 <p align="center"><sub>Built for people who tune their agents like they tune their code.</sub></p>

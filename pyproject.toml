@@ -19,6 +19,7 @@ dev = [
     "playwright>=1.64.1",
     "ruff>=0.17.3",
     "pyright>=1.1.414",
+    "pre-commit>=4",
 ]
 # status bar icon (`rerunly tray`); Qt talks to the desktop's StatusNotifier tray over D-Bus
 tray = ["PySide6-Essentials>=6.7"]
@@ -36,6 +37,7 @@ packages = ["rerunly"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["require_login: exercise the real local authentication gate"]
 filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]  # such as an unclosed database
 
 [tool.ruff]

@@ -214,24 +214,27 @@ def test_tray_server_never_trusts_forwarded_headers(tmp_path, monkeypatch):
     assert tray._start_server(tmp_path / "t.db", "127.0.0.1", 8765).config.proxy_headers is False
 
 
-def test_network_access_needs_the_token(tmp_path, monkeypatch):
+@pytest.mark.require_login
+def test_network_access_needs_password_or_machine_bearer(tmp_path, monkeypatch):
     import os
     import stat
+    from rerunly import auth
     security, client = _scope_app(monkeypatch, tmp_path, "192.0.2.10")
     client.follow_redirects = False
-    assert client.get("/").status_code == 401
-    assert client.get("/static/app.js").status_code == 401
+    assert client.get("/").status_code == 303
+    assert client.get("/login").status_code == 200
     assert client.get("/api/projects", headers={"Authorization": "Bearer wrong"}).status_code == 401
-    assert client.get("/?token=wrong").status_code == 401
+    assert client.get("/api/projects", params={"token": "wrong"}).status_code == 401
     token = security.access_token(tmp_path / "t.db")
-    assert stat.S_IMODE(os.stat(tmp_path / "access-token").st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(tmp_path / "machine-token").st_mode) == 0o600
     assert client.get("/api/projects", headers={"Authorization": f"Bearer {token}"}).status_code == 200
     assert client.post("/api/ingest", params={"token": token}).status_code == 401  # the link only opens the page
     opened = client.get("/", params={"token": token})
-    assert opened.status_code == 303 and opened.headers["location"] == "/"
-    cookie = opened.headers["set-cookie"].lower()
-    assert "httponly" in cookie and "samesite=strict" in cookie
-    assert client.get("/").status_code == 200  # the cookie now identifies this browser
+    assert opened.status_code == 303 and opened.headers["location"] == "/login"
+    assert "set-cookie" not in opened.headers
+    auth.set_password(tmp_path / "t.db", "private local password")
+    assert client.post("/auth/login", json={"password": "private local password"}).status_code == 200
+    assert client.get("/").status_code == 200
     assert security.access_token(tmp_path / "t.db") == token
 
 
@@ -473,18 +476,19 @@ def test_terminal_watcher_stops_searching_once_it_found_the_transcript(tmp_path,
 
 # ---- the command line, and how background runs end ---------------------------------------------------
 
-def test_cli_prints_the_access_link_only_when_reachable_from_the_network(tmp_path, monkeypatch, capsys):
+def test_cli_prints_login_instructions_without_access_tokens(tmp_path, monkeypatch, capsys):
     import sys
     from rerunly import cli, server
     monkeypatch.setattr(server, "serve", lambda *a, **k: None)
     monkeypatch.setattr(cli, "migrate_legacy_data", lambda: False)
     monkeypatch.setattr(sys, "argv", ["rerunly", "--db", str(tmp_path / "d.db"), "serve"])
     cli.main()
-    assert "token=" not in capsys.readouterr().out and not (tmp_path / "access-token").exists()
+    assert "token=" not in capsys.readouterr().out and not (tmp_path / "machine-token").exists()
     monkeypatch.setattr(sys, "argv", ["rerunly", "--db", str(tmp_path / "d.db"), "serve", "--host", "0.0.0.0", "--port", "9000"])
     cli.main()
     out = capsys.readouterr().out
-    assert f":9000/?token={(tmp_path / 'access-token').read_text()}" in out and "unencrypted" in out
+    assert ":9000/login" in out and "unencrypted" in out and "token=" not in out
+    assert not (tmp_path / "machine-token").exists()
 
 
 @pytest.mark.parametrize("line, status, blocked", [

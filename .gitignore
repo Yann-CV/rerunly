@@ -152,6 +152,11 @@ activemq-data/
 # Environments
 .env
 .envrc
+# Local Rerunly machine credentials (when using a database inside a checkout)
+access-token
+access-token-header
+machine-token
+machine-token-header
 .venv
 env/
 venv/

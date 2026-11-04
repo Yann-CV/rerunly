@@ -9,6 +9,19 @@ from pathlib import Path
 from .config import DATA_DIR, DEFAULT_SETTINGS
 
 SCHEMA = """
+-- Exactly one local account. Passwords and browser session tokens are stored only as hashes.
+CREATE TABLE IF NOT EXISTS login_account (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    blocked_until REAL NOT NULL DEFAULT 0,
+    recovery_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS login_sessions (
+    token_hash TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS model_check_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
 -- Only local usage readings and token counts, never authentication data.
 CREATE TABLE IF NOT EXISTS usage_observations (
@@ -309,6 +322,7 @@ def tighten_permissions(db_path: Path) -> None:
 # Columns added after the first release: (table, column, type). Appended at the end of the
 # table, so inserts listing values in table order keep working.
 ADDED_COLUMNS = [
+    ("login_account", "recovery_hash", "TEXT"),
     ("run_ratings", "duration_ms", "INTEGER"), ("run_ratings", "total_tokens", "INTEGER"),
     ("judge_rating_history", "duration_ms", "INTEGER"), ("judge_rating_history", "total_tokens", "INTEGER"),
     ("run_ratings", "origin", "TEXT NOT NULL DEFAULT 'unknown'"),
