@@ -117,7 +117,7 @@ Requires **Python 3.11+**, **uv** and **Git**. The status bar icon and start-at-
 integration target Linux desktops; the foreground web dashboard can run without the tray.
 
 ```bash
-git clone https://github.com/goldener-data/rerunly.git
+git clone https://github.com/Yann-CV/rerunly.git
 cd rerunly
 uv sync
 uv run rerunly start   # runs in the background, with a status bar icon
