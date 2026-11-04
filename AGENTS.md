@@ -17,6 +17,9 @@ Read `README.md` for supported behavior and setup instructions before making cha
 - Use Python 3.11+ and `uv sync` to install dependencies.
 - Run `uv run rerunly --reload` for local development.
 - Run relevant tests with `uv run pytest`, optionally specifying a test file.
+  Run `uv run playwright install chromium` once for the browser tests.
+- Run `uv run ruff check .` and `uv run pyright`, or all linting at once with
+  `uv run pre-commit run --all-files`; CI enforces these hooks with the tests.
 - Keep changes focused and follow the surrounding code's conventions.
 - Add or update tests when changing behavior, and report what was verified.
 - Preserve unrelated changes already present in the working tree.

@@ -61,10 +61,29 @@ def agent_models(priced: list[str], used: list[str]) -> list[dict]:
     aliases = [{"id": a, "label": f"{a} (the latest {a.capitalize()})", "kind": "alias", "used": False, **claude} for a in model_aliases()]
     ids = sorted({m for m in [*priced, *used] if MODEL_RE.match(m) and m.startswith("claude-")}, key=_model_order)
     levels = codex_efforts()
-    codex = dict.fromkeys([*codex_models(), *(m for m in used if m.startswith(("gpt-", "o3", "o4")) and not m.startswith("gpt-oss"))])
+    codex = dict.fromkeys([*codex_models(), *(m for m in used if is_codex_model(m))])
     return (aliases + [{"id": m, "label": m, "kind": "model", "used": m in used, **claude} for m in ids]
             + [{"id": CODEX_PREFIX + m, "label": f"Codex · {m}", "kind": "codex", "used": m in used, "agent": "codex",
                 "efforts": levels.get(m, ([], None))[0] or list(CODEX_EFFORTS), "default_effort": levels.get(m, ([], None))[1]} for m in codex])
+
+
+def claude_permission_args(permission: str, *, background: bool = False) -> list[str]:
+    """Claude Code options for `permission`; unattended (`background`) runs expose only file tools and
+    captured skill instructions.
+
+    Denying approval prompts alone does not revoke saved allow rules or disable hooks and MCP tools.
+    Restricted mode ignores personal/project settings; the tool list also prevents command execution
+    and delegation from reintroducing file writes in a read-only run.
+    """
+    mode = "acceptEdits" if permission == "edits" else "default"
+    args = ["--permission-mode", mode]
+    if background:
+        tools = ["Read", "Glob", "Grep"]
+        if permission == "edits":
+            tools += ["Edit", "Write", "NotebookEdit"]
+        args += ["--restricted", "--tools", ",".join(tools), "--strict-mcp-config",
+                 "--disallowedTools", "mcp__*", "--settings", '{"disableAllHooks":true}']
+    return args
 
 
 def claude_argv(prompt: str, session_id: str, model: str = "", effort: str = "", version: str = "",
@@ -81,11 +100,18 @@ def claude_argv(prompt: str, session_id: str, model: str = "", effort: str = "",
         argv += ["--plugin-dir", plugin_dir]
     if note:
         argv += ["--append-system-prompt", note]
-    return [*argv, prompt]
+    return [*argv, "--", prompt]
+
+
+def with_options(argv: list[str], options: list[str]) -> list[str]:
+    """`argv` with more options, kept ahead of the prompt that ends it and of the `--` protecting that prompt."""
+    head, prompt = argv[:-1], argv[-1]
+    separator = [head.pop()] if head and head[-1] == "--" else []
+    return [*head, *options, *separator, prompt]
 
 
 def terminal_run_argv(argv: list[str], keep_open: bool = False) -> list[str]:
-    """Optionally wait for Enter after the agent exits, preserving its exit status.
+    """`argv`, or with `keep_open` a wrapper waiting for Enter after the agent exits and keeping its exit status.
 
     Pass the command as positional arguments: prompts never become shell code.
     """
@@ -146,7 +172,7 @@ def _codex_cache() -> list[dict]:
 
 
 def codex_models():
-    """Include account-visible cached models, without making authenticated network calls."""
+    """Codex models to pick: the known ones, then those Codex's local cache lists for the account (no network call)."""
     models = _codex_cache()
     return tuple(dict.fromkeys([*CODEX_MODELS, *(m["slug"] for m in models if m.get("visibility") == "list" and MODEL_RE.fullmatch(m.get("slug", "")))]))
 
@@ -161,12 +187,18 @@ def codex_efforts() -> dict[str, tuple[list[str], str | None]]:
     return found
 
 
+def is_codex_model(model: str) -> bool:
+    """Whether Codex runs `model`: the one place deciding it for reruns, judges and the model picker."""
+    return model.startswith(CODEX_PREFIX) or (model.startswith(("gpt-", "o3", "o4")) and not model.startswith("gpt-oss"))
+
+
 def uses_codex(model: str, harness: str) -> bool:
-    return model.startswith(CODEX_PREFIX) or (model.startswith("gpt-") and not model.startswith("gpt-oss")) or (not model and harness == "Codex")
+    return is_codex_model(model) or (not model and harness == "Codex")
 
 
 def original_permission_args(harness: str, permissions: dict) -> tuple[list[str], bool]:
-    """Translate recorded permissions; never invent defaults for missing metadata."""
+    """The recorded permissions as options of `harness`, and whether they can ask for approval; never
+    invent defaults for missing metadata."""
     import json
     if harness == "Claude Code":
         mode = permissions.get("permission_mode")

@@ -7,7 +7,6 @@ Removing puts the user's own statusline back."""
 import json
 import shlex
 from datetime import datetime, timezone
-from pathlib import Path
 
 from .config import DATA_DIR
 
@@ -37,7 +36,7 @@ def install(settings: dict, on: bool = True) -> dict:
     _, script, original_file = _paths()
     current = settings.get("statusLine")
     if on and not installed(settings):
-        DIR.mkdir(parents=True, exist_ok=True)
+        DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         original_file.write_text(json.dumps(current))
         if current and current.get("command"):
             script.write_text(current["command"] + "\n")

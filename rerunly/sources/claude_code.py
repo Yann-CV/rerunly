@@ -1,3 +1,5 @@
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportOptionalMemberAccess=false, reportOperatorIssue=false
+# Transcripts are untyped JSON written by other programs: a missing field is handled where it matters.
 """Read Claude Code transcripts from ~/.claude/projects.
 
 Layout:

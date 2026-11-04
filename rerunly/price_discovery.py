@@ -39,10 +39,10 @@ class PricingTables(HTMLParser):
             self.cell.append(data)
 
     def handle_endtag(self, tag):
-        if tag in ("th", "td") and self.cell is not None:
+        if tag in ("th", "td") and self.cell is not None and self.row is not None:
             self.row.append(" ".join(" ".join(self.cell).split()))
             self.cell = None
-        elif tag == "tr" and self.row is not None:
+        elif tag == "tr" and self.row is not None and self.rows is not None:
             self.rows.append(self.row)
             self.row = None
         elif tag == "table" and self.rows is not None:
@@ -99,15 +99,15 @@ def parse_catalog(html, provider):
                 values.append(float(match[1]))
             if len(values) == 3 and all(math.isfinite(v) and v >= 0 for v in values):
                 # The first full token table is standard/short-context. Later tables show other tiers.
-                models.setdefault(model, dict(zip(("input", "output", "cache_read"), values)))
+                models.setdefault(model, dict(zip(("input", "output", "cache_read"), values, strict=True)))
     if not models:
         raise ValueError("No supported token-price table found; existing estimates kept")
     return models
 
 
 def fetch_catalog(provider):
-    request = urllib.request.Request(SOURCES[provider], headers={"User-Agent": "Rerunly/0.1 pricing lookup"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+    request = urllib.request.Request(SOURCES[provider], headers={"User-Agent": "Rerunly/0.1 pricing lookup"})  # noqa: S310 - fixed https URLs
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
         raw = response.read(4_000_001)
     if len(raw) > 4_000_000:
         raise ValueError("Pricing page exceeded size limit")

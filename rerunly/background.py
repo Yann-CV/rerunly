@@ -16,7 +16,8 @@ ICON = Path(__file__).parent / "static" / "icon.svg"
 
 
 def tray_command(db_path: Path, port: int) -> list[str]:
-    """Absolute paths only: the login session has neither this shell's PATH nor its working directory."""
+    """The command starting the tray, with absolute paths only: the login session has neither this shell's PATH
+    nor its working directory."""
     return [sys.executable, "-m", "rerunly", "--db", str(Path(db_path).resolve()), "tray", "--port", str(port)]
 
 
@@ -67,7 +68,7 @@ def running_pid() -> int | None:
 
 
 def write_pid() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
 
@@ -80,7 +81,7 @@ def start(db_path: Path, port: int) -> int:
     """Launch the tray (and its server) detached from this terminal; returns its pid."""
     if pid := running_pid():
         return pid
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     with LOG_FILE.open("ab") as log:
         proc = subprocess.Popen(
             tray_command(db_path, port), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

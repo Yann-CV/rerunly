@@ -7,6 +7,7 @@ log; its final `result` line gives the answer, the cost and the denied actions, 
 """
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -16,14 +17,14 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .replay import claude_permission_args
+
 # the plugin carrying the skills as they ran: skill `x` is loaded as `rerunly-pinned:x`
 PINNED_PLUGIN = "rerunly-pinned"
 STATUS_LINE = "RERUN STATUS:"
 PERMISSIONS = {
-    # anything beyond reading is denied, and reported
-    "ask": [],
-    # file edits are allowed; commands and the rest are denied, and reported
-    "edits": ["--permission-mode", "acceptEdits"],
+    "ask": claude_permission_args("ask", background=True),
+    "edits": claude_permission_args("edits", background=True),
 }
 
 
@@ -40,21 +41,29 @@ def unattended_note(skills: list[dict]) -> str:
         f"or `{STATUS_LINE} blocked: <what you needed>` otherwise.",
     ]
     for k in skills:
-        lines.append(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with.")
+        if Path(k["pinned"]).is_absolute():
+            lines.append(f"For skill `{k['skill']}`, read the instructions at `{k['pinned']}` with a file-reading tool: it is the version this task ran with.")
+        else:
+            lines.append(f"To use the skill `{k['skill']}`, use `{k['pinned']}` instead: it is the version this task ran with.")
     return "\n".join(lines)
 
 
 def _skill_name(skill: str) -> str:
-    return skill.split(":")[-1]
+    name = skill.split(":")[-1]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in (".", ".."):
+        raise ValueError(f"Cannot restore skill with an unsafe name: {skill!r}")
+    return name
 
 
 def build_skills_plugin(folder: Path, versions: list[dict]) -> list[dict]:
     """A plugin in `folder` with each skill version: all its files from its git commit, or its SKILL.md
     snapshot otherwise. Returns, per skill, its pinned name and where it was restored from."""
+    names = [_skill_name(v["skill"]) for v in versions]
+    if len(names) != len(set(names)):
+        raise ValueError("Cannot restore multiple skills with the same name")
     restored = []
     skills_dir = folder / "skills"
-    for v in versions:
-        name = _skill_name(v["skill"])
+    for v, name in zip(versions, names, strict=True):
         target = skills_dir / name
         target.mkdir(parents=True, exist_ok=True)
         source = "snapshot"
@@ -87,7 +96,7 @@ def background_argv(prompt: str, session_id: str, model: str, effort: str, versi
                     budget: float | None, plugin_dir: Path | None, skills: list[dict]) -> list[str]:
     argv = ["npx", "-y", f"@anthropic-ai/claude-code@{version}"] if version else ["claude"]
     argv += ["-p", "--output-format", "stream-json", "--verbose", "--session-id", session_id,
-             "--permission-prompts", "none", *PERMISSIONS[permission],
+             "--permission-prompts", "none", *(PERMISSIONS[permission] if permission != "same" else []),
              "--append-system-prompt", unattended_note(skills)]
     if model:
         argv += ["--model", model]
@@ -96,8 +105,9 @@ def background_argv(prompt: str, session_id: str, model: str, effort: str, versi
     if budget:
         argv += ["--max-budget-usd", f"{budget:.2f}"]
     if plugin_dir:
-        argv += ["--plugin-dir", str(plugin_dir)]
-    return [*argv, prompt]
+        # Restricted runs read snapshots directly, without invoking skill preprocessing or scripts.
+        argv += ["--plugin-dir" if permission == "same" else "--add-dir", str(plugin_dir)]
+    return [*argv, "--", prompt]
 
 
 def outcome(log: Path) -> dict | None:
@@ -156,7 +166,7 @@ def alive(pid: int | None) -> bool:
 
 
 def terminal_process(session_id: str) -> bool | None:
-    """Find this user's terminal wrapper; None means process inspection is unavailable."""
+    """Whether this user's terminal wrapper of `session_id` is running; None when processes cannot be inspected."""
     proc = Path('/proc')
     if not proc.is_dir():
         return None
@@ -182,23 +192,35 @@ def start(cwd: str, argv: list[str], log: Path, on_exit, timeout: float | None =
     """Run `argv` in the background, its output to `log`; `on_exit()` once it ends. Returns its pid."""
     log.parent.mkdir(parents=True, exist_ok=True)
     out = log.open("w")
-    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    except BaseException:
+        out.close()
+        raise
 
     def wait():
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Stop the process group, including commands the agent spawned.
-            import signal
-            os.killpg(proc.pid, signal.SIGTERM)
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-            out.write(json.dumps({"type": "error", "message": "Rerun exceeded its time limit."}) + "\n")
-        out.close()
-        on_exit()
+                # A process can exit between wait() timing out and signalling its group.
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
+                out.write(json.dumps({"type": "error", "message": "Rerun exceeded its time limit."}) + "\n")
+        finally:
+            out.close()
+            on_exit()
 
     threading.Thread(target=wait, daemon=True).start()
     return proc.pid

@@ -152,6 +152,11 @@ activemq-data/
 # Environments
 .env
 .envrc
+# Local Rerunly machine credentials (when using a database inside a checkout)
+access-token
+access-token-header
+machine-token
+machine-token-header
 .venv
 env/
 venv/
@@ -218,3 +223,45 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI coding-agent configuration, caches, and local state (at any directory depth)
+# Keep standalone instructions such as AGENTS.md, CLAUDE.md, and GEMINI.md trackable.
+# Do not ignore .github/: it contains CI and may contain shared Copilot instructions.
+
+# CLI agents and shared agent folders
+.agent/
+.agents/
+.claude/
+.codex/
+.gemini/
+.opencode/
+.amp/
+.crush/
+.factory/
+.goose/
+.openhands/
+.serena/
+
+# AI editors, extensions, and their rule folders
+.amazonq/
+.augment/
+.cline/
+.clinerules/
+.codeium/
+.continue/
+.copilot/
+.cursor/
+.junie/
+.kilocode/
+.kilocoderules/
+.kiro/
+.qodo/
+.roo/
+.roorules/
+.trae/
+.windsurf/
+
+# Aider's cache directories and local conversation/input histories
+.aider*/
+.aider.chat.history.md
+.aider.input.history

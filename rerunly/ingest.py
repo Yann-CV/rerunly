@@ -84,7 +84,8 @@ def _insert_prompt(conn: sqlite3.Connection, p: PromptRecord, source: str, setti
 
 
 def _store_skill_version(conn: sqlite3.Connection, run, used_at: str) -> str:
-    """Keep the skill's snapshot; find what restores it once, or again while it was not committed."""
+    """Store the skill's snapshot and return its hash; what restores it is resolved once, or again while it was
+    not committed."""
     h = body_hash(run.body)
     row = conn.execute("SELECT git_state, origin FROM skill_versions WHERE hash = ?", (h,)).fetchone()
     if row and (row[1] != "git" or row[0] == "committed"):
@@ -107,7 +108,9 @@ def drop_prompts(conn: sqlite3.Connection, ids: list[str]) -> None:
     for table in PROMPT_TABLES:
         conn.executemany(f"DELETE FROM {table} WHERE prompt_id = ?", [(i,) for i in ids])
     conn.executemany("DELETE FROM rerun_reference WHERE prompt_id = ? OR reference_id = ?", [(i, i) for i in ids])
-    conn.executemany("DELETE FROM run_ratings WHERE base_id = ? OR other_id = ?", [(i, i) for i in ids])
+    for table in ("run_ratings", "judge_rating_history", "judge_feedback"):
+        conn.executemany(f"DELETE FROM {table} WHERE base_id = ? OR other_id = ?", [(i, i) for i in ids])
+    conn.executemany("DELETE FROM replay_queue WHERE other_prompt_id = ?", [(i,) for i in ids])
     conn.executemany("DELETE FROM prompts WHERE id = ?", [(i,) for i in ids])
 
 
@@ -284,7 +287,8 @@ def sources_from_settings(settings: dict) -> list:
 
 
 def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
-    """Return counts of scanned and updated sessions."""
+    """Import the sessions that changed (all of them with `force`, or when prices changed): the counts of scanned
+    and updated sessions."""
     settings = get_settings(conn)
     known = {r["path"]: r["signature"] for r in conn.execute("SELECT path, signature FROM sessions")}
     missing_permissions = {r[0] for r in conn.execute("SELECT s.path FROM sessions s JOIN prompts p ON p.session_id=s.id WHERE p.permissions IS NULL")}
@@ -312,13 +316,13 @@ def ingest(conn: sqlite3.Connection, force: bool = False) -> dict:
     if discover_prices(conn, models, settings):
         settings = get_settings(conn)
         # Reparse old sessions too: aggregate DB rows cannot reconstruct all cache TTL usage.
-        for source, key, signature in candidates:
+        for source, key, _signature in candidates:
             if key not in loaded:
                 session = source.load(key)
                 if session is not None:
                     loaded[key] = session
     updated = 0
-    for source, key, signature in candidates:
+    for _source, key, signature in candidates:
         session = loaded.get(key)
         if session is None:
             continue

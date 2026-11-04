@@ -90,6 +90,7 @@ class Source(Protocol):
 
     def sessions(self) -> Iterable[tuple[str, str]]:
         """Yield (session_key, change_signature) for every session available."""
+        ...
 
     def load(self, session_key: str) -> SessionRecord | None:
         """Parse one session."""

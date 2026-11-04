@@ -12,3 +12,21 @@ def isolate_codex_history(monkeypatch, tmp_path):
     from rerunly import live_limits
     monkeypatch.setattr(live_limits, "claude_code", lambda: None)
     monkeypatch.setattr(live_limits, "codex", lambda: None)
+    from rerunly import server
+    monkeypatch.setattr(server, "CLAUDE_SETTINGS", tmp_path / "claude-settings.json")
+
+
+@pytest.fixture(autouse=True)
+def authenticated_dashboard_for_feature_tests(request, monkeypatch):
+    """Feature tests exercise an already signed-in dashboard; authentication tests use the real gate."""
+    if not request.node.get_closest_marker("require_login"):
+        from rerunly.auth import LocalLogin
+        monkeypatch.setattr(LocalLogin, "reject", lambda self, request: None)
+
+
+@pytest.fixture(autouse=True)
+def close_test_connections():
+    """Connections a test opens itself; the app closes its own, and a leak now fails the run."""
+    from rerunly import db
+    with db.connection_scope():
+        yield

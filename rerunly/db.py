@@ -1,10 +1,27 @@
+import contextvars
 import json
+import os
 import sqlite3
+import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
-from .config import DEFAULT_SETTINGS
+from .config import DATA_DIR, DEFAULT_SETTINGS
 
 SCHEMA = """
+-- Exactly one local account. Passwords and browser session tokens are stored only as hashes.
+CREATE TABLE IF NOT EXISTS login_account (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    blocked_until REAL NOT NULL DEFAULT 0,
+    recovery_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS login_sessions (
+    token_hash TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS model_check_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
 -- Only local usage readings and token counts, never authentication data.
 CREATE TABLE IF NOT EXISTS usage_observations (
@@ -232,18 +249,80 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # SQLite otherwise creates a new database using the process umask, often 0644.
+    # Preserve permissions of existing databases, including deliberately shared ones.
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
     conn = sqlite3.connect(path, check_same_thread=False)
+    opened = _scope_connections.get()
+    if opened is not None:
+        opened.append(conn)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    if conn.execute("PRAGMA user_version").fetchone()[0] != _schema_version():
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.execute(f"PRAGMA user_version = {_schema_version()}")
     return conn
+
+
+_scope_connections: contextvars.ContextVar[list | None] = contextvars.ContextVar("rerunly_connections", default=None)
+
+
+@contextmanager
+def connection_scope():
+    """Close every connection opened inside: one request, or one pass of a background thread."""
+    opened = []
+    token = _scope_connections.set(opened)
+    try:
+        yield
+    finally:
+        _scope_connections.reset(token)
+        for conn in opened:
+            conn.close()
+
+
+class ConnectionScope:
+    """ASGI wrapper giving each request its connection scope."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        with connection_scope():
+            await self.app(scope, receive, send)
+
+
+def _schema_version() -> int:
+    """Changes by itself with the schema, so a new table or column can never be forgotten."""
+    return zlib.crc32((SCHEMA + repr(ADDED_COLUMNS)).encode()) & 0x7FFFFFFF
+
+
+def tighten_permissions(db_path: Path) -> None:
+    """Prompts and answers belong to this user: close Rerunly's own folder to everyone else.
+
+    Installations made before new files became private may still be readable by others. A database
+    placed elsewhere with `--db` keeps the permissions it was given."""
+    if db_path.resolve().parent != DATA_DIR.resolve():
+        return
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for path in (DATA_DIR, *DATA_DIR.iterdir()):
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            path.chmod(mode & 0o700)
 
 
 # Columns added after the first release: (table, column, type). Appended at the end of the
 # table, so inserts listing values in table order keep working.
 ADDED_COLUMNS = [
+    ("login_account", "recovery_hash", "TEXT"),
     ("run_ratings", "duration_ms", "INTEGER"), ("run_ratings", "total_tokens", "INTEGER"),
     ("judge_rating_history", "duration_ms", "INTEGER"), ("judge_rating_history", "total_tokens", "INTEGER"),
     ("run_ratings", "origin", "TEXT NOT NULL DEFAULT 'unknown'"),
@@ -284,8 +363,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
-def _sql_list(values: list[str]) -> str:
-    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+def _sql_list(values) -> str:
+    """SQL literals for a view, which cannot take parameters. Values SQLite would refuse are left out, so an old
+    bad setting cannot break every page."""
+    usable = [v for v in values if isinstance(v, str) and "\x00" not in v] if isinstance(values, list) else []
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in usable)
 
 
 def create_prompt_view(conn: sqlite3.Connection, prefer_official: bool, settings: dict | None = None) -> None:

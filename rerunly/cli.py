@@ -4,6 +4,7 @@ from pathlib import Path
 from . import db
 from .config import DEFAULT_DB_PATH, DEFAULT_PORT, DATA_DIR, migrate_legacy_data
 from .ingest import ingest
+from .security import is_loopback_host
 
 
 def main() -> None:
@@ -13,6 +14,9 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help=f"SQLite database (default: {DEFAULT_DB_PATH})")
     parser.add_argument("--reload", action="store_true", help="restart the server when its Python code changes (UI changes only need a page refresh)")
     sub = parser.add_subparsers(dest="cmd")
+    p_password = sub.add_parser("password", help="create or change the local password (requires the current password for an existing account)")
+    p_password.add_argument("--recover", action="store_true", help="recover using a previously saved recovery code instead of the current password")
+    sub.add_parser("recovery-code", help="generate a replacement recovery code (requires the current password)")
 
     p_serve = sub.add_parser("serve", help="run the dashboard (default)")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -31,6 +35,29 @@ def main() -> None:
         p.add_argument("--port", type=int, default=DEFAULT_PORT)
 
     args = parser.parse_args()
+    if args.cmd in ("password", "recovery-code"):
+        from getpass import getpass
+        from .auth import has_account, issue_recovery_code, set_password
+        try:
+            if args.cmd == "recovery-code":
+                code = issue_recovery_code(args.db, getpass("Current password: "))
+            else:
+                proof = {}
+                if args.recover:
+                    proof["recovery_code"] = getpass("Saved recovery code: ")
+                elif has_account(args.db):
+                    proof["current_password"] = getpass("Current password: ")
+                password = getpass("New local password (at least 12 characters): ")
+                if password != getpass("Confirm password: "):
+                    parser.error("The passwords do not match.")
+                code = set_password(args.db, password, **proof).recovery_code
+        except ValueError as error:
+            parser.error(str(error))
+        print("Account security updated. All browser sessions have been signed out.")
+        print("Save this recovery code in a password manager or somewhere outside this machine. It is shown only once:")
+        print(code)
+        print("Previous recovery codes no longer work.")
+        return
     port = getattr(args, "port", DEFAULT_PORT)
     from . import background
 
@@ -61,6 +88,9 @@ def main() -> None:
 
     host = getattr(args, "host", "127.0.0.1")
     print(f"Rerunly on http://{host}:{port}  (db: {args.db}){'  [reloading on code changes]' if args.reload else ''}")
+    if not is_loopback_host(host):
+        print(f"Reachable from the network, over unencrypted HTTP. Sign in at http://<this-machine>:{port}/login using your local password.")
+        print("Create the password locally first. Use an encrypted tunnel or HTTPS for network access.")
     serve(args.db, host, port, reload=args.reload)
 
 

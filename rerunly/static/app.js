@@ -22,6 +22,15 @@ addEventListener("unhandledrejection", (e) => { if (e.reason instanceof StaleNav
 const EXAMPLES = location.pathname.startsWith("/examples");
 const BASE = EXAMPLES ? "/examples" : "";
 
+function redirectToLogin(response) {
+  if (response.status === 401) {
+    app.replaceChildren();
+    document.getElementById("usage-panel").hidden = true;
+    location.replace("/login" + location.hash);
+    throw new StaleNavigation();
+  }
+}
+
 let queueBadgeRequest = 0;
 
 function showQueueCount(count) {
@@ -36,6 +45,7 @@ async function refreshQueueCount() {
   const request = ++queueBadgeRequest;
   try {
     const response = await fetch(BASE + "/api/reruns/queue/count");
+    redirectToLogin(response);
     if (!response.ok) return;
     const data = await response.json();
     if (request === queueBadgeRequest) showQueueCount(data.queued);
@@ -50,6 +60,7 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
+  redirectToLogin(res);
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   const data = await res.json();
   if (queueRequest === queueBadgeRequest) {
@@ -133,8 +144,6 @@ function tagLegend(active) {
     ? `<button type="button" class="chip cat-${cat}" data-cat="${cat}" aria-pressed="${active.size === 0 || active.has(cat)}" title="${esc(help)}">${label}</button>`
     : `<span class="chip cat-${cat}" title="${esc(help)}"><a>${label}</a></span>`).join("")}</div>`;
 }
-
-// ---- keyword rules -----------------------------------------------------------
 
 // ---- keyword rule editor: one row per rule, each with its own color ------------------
 
@@ -1240,6 +1249,9 @@ function usageRow(name, r, extra = "") {
 // ---- run it again: what ran a prompt, and the command repeating it ----------------------
 
 const shellQuote = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
+// Transcript values reach a command the user pastes: quote them unless plainly harmless, and keep comments on one line.
+const shellWord = (v) => (/^[\w.+-]+$/.test(String(v)) ? String(v) : shellQuote(v));
+const shellComment = (v) => String(v).replace(/[\r\n]+/g, " ");
 
 /** Where a skill version comes from, in words. */
 function skillOrigin(k) {
@@ -1255,7 +1267,7 @@ function skillOrigin(k) {
   }
 }
 
-/** Shell lines repeating the run with Claude Code: the same folder, skill versions, release and model. */
+/** Shell lines repeating the run with its agent (Claude Code or Codex): the same folder, skill versions, release, model, effort and permissions. */
 function rerunCommand(p) {
   const r = p.rerun, model = r.requested_model || Object.keys(p.models || {})[0] || "";
   const lines = [];
@@ -1263,18 +1275,18 @@ function rerunCommand(p) {
   const undo = [];
   for (const k of r.skills) {
     if (k.origin === "git" && k.git_state === "committed") {
-      lines.push(`# ${k.skill} as it ran (commit ${k.git_commit.slice(0, 7)}): this replaces the skill's files, commit or stash your changes first`,
-        `git -C ${shellQuote(k.git_repo)} checkout ${k.git_commit} -- ${shellQuote(k.git_path)}`);
+      lines.push(`# ${shellComment(k.skill)} as it ran (commit ${shellComment(k.git_commit.slice(0, 7))}): this replaces the skill's files, commit or stash your changes first`,
+        `git -C ${shellQuote(k.git_repo)} checkout ${shellWord(k.git_commit)} -- ${shellQuote(k.git_path)}`);
       undo.push(`git -C ${shellQuote(k.git_repo)} checkout HEAD -- ${shellQuote(k.git_path)}`);
     } else if (k.origin === "bundled") {
-      lines.push(`# ${k.skill}: built into Claude Code ${k.bundled_version}, comes with the release below`);
+      lines.push(`# ${shellComment(k.skill)}: built into Claude Code ${shellComment(k.bundled_version)}, comes with the release below`);
     } else {
-      lines.push(`# ${k.skill}: put the downloaded SKILL.md (as it ran) back in ${k.base_dir}`);
+      lines.push(`# ${shellComment(k.skill)}: put the downloaded SKILL.md (as it ran) back in ${shellComment(k.base_dir)}`);
     }
   }
-  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${r.harness_version}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${r.harness_version}` : "claude");
+  const agent = r.harness === "Codex" ? (r.harness_version ? `npx @openai/codex@${shellWord(r.harness_version)}` : "codex") : (r.harness_version ? `npx @anthropic-ai/claude-code@${shellWord(r.harness_version)}` : "claude");
   const permissions = (r.permission_args || []).map(shellQuote).join(" ");
-  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${r.effort}`) : ""}${permissions ? ` ${permissions}` : ""} ${shellQuote(p.text)}`);
+  lines.push(`${agent}${model ? ` --model ${shellQuote(model)}` : ""}${r.effort ? (r.harness === "Codex" ? ` -c ${shellQuote(`model_reasoning_effort="${r.effort}"`)}` : ` --effort ${shellWord(r.effort)}`) : ""}${permissions ? ` ${permissions}` : ""}${String(p.text).startsWith("-") ? " --" : ""} ${shellQuote(p.text)}`);
   if (undo.length) lines.push("# afterwards, back to the current skills:", ...undo);
   return lines.join("\n");
 }
@@ -1387,7 +1399,7 @@ function bindSectionHelp(root) {
   document.addEventListener('pointerdown', (event) => { if (!event.target.closest('.section-help')) hide(); }, {signal: sectionHelpEvents.signal});
 }
 
-/** Plan a fresh run with current usage and a separate consumption forecast. */
+/** The rerun form of a prompt page: model, effort, release, mode and permissions, with the estimated usage and its forecast. */
 function replayHtml(p, models, defaultJudge = "") {
   const r = p.rerun;
   const isExample = p.source === "rerunly-examples";
@@ -2031,7 +2043,6 @@ function fmtAgo(iso) {
   return fmtDate(iso);
 }
 
-/** Cost of the latest runs against the earlier ones: arrow + words, never color alone. */
 /** Median cost of the last runs (up to 3) against the ones before, in percent; null under 4 runs. */
 function trendPct(spark) {
   if (spark.length < 4) return null;
@@ -2041,6 +2052,7 @@ function trendPct(spark) {
   return before ? Math.round(((recent - before) / before) * 100) : null;
 }
 
+/** Cost of the latest runs against the earlier ones: arrow + words, never color alone. */
 function trendBadge(spark) {
   const pct = trendPct(spark);
   if (pct == null) return "";
@@ -3372,7 +3384,6 @@ function homeHighlights(o) {
       ru && `${fmtCost(ru.avg_cost_usd)} per run · ${fmtCost(ru.cost_usd)} total · last ${esc(fmtAgo(ru.last_at))}`);
 }
 
-/** The most used tag of each category, with its two runners-up. */
 /** The top tags of each category, by number of prompts or, with `by: "cost"`, by total cost (shown first, in large). */
 function homeTopTags(o, { by = "prompts" } = {}) {
   const byCost = by === "cost";
@@ -4703,6 +4714,23 @@ if (!EXAMPLES) document.getElementById("refresh").onclick = async (e) => {
   e.target.disabled = true;
   try { await api("/api/ingest", { method: "POST" }); await route(); } finally { e.target.disabled = false; }
 };
+if (!EXAMPLES) {
+  const signOut = document.getElementById("sign-out");
+  signOut.hidden = false;
+  signOut.onclick = async () => {
+    signOut.disabled = true;
+    try {
+      await api("/auth/logout", {method: "POST"});
+      app.replaceChildren();
+      document.getElementById("usage-panel").hidden = true;
+      location.replace("/login");
+    } catch (error) {
+      if (!(error instanceof StaleNavigation)) alert("Could not sign out. Please try again.");
+      signOut.disabled = false;
+    }
+  };
+}
+window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
 setInterval(() => { if (!document.hidden) refreshQueueCount(); }, 60000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshQueueCount(); });
 window.addEventListener("hashchange", route);
