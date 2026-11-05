@@ -141,7 +141,8 @@ then use the same sign-in page remotely. The built-in server uses unencrypted HT
 encrypted tunnel or HTTPS for network access.
 History import needs no installed agent or API key when transcript files are already available. Running tasks or
 judges requires an installed, authenticated Claude Code or Codex CLI; selecting a pinned
-CLI release also requires Node.js and `npx`. Reruns can change your files and use your agent
+CLI release also requires Node.js and `npx`. Claude Code and Codex reruns also look in `~/.local/bin`
+when the desktop session’s `PATH` does not include that directory. Reruns can change your files and use your agent
 quota: read [Before you rerun or judge](#before-you-rerun-or-judge) first.
 
 New history is imported automatically. For integration-specific setup, including hooks

@@ -90,7 +90,7 @@ def claude_argv(prompt: str, session_id: str, model: str = "", effort: str = "",
                 plugin_dir: str = "", note: str = "") -> list[str]:
     """Claude Code started on `prompt`: the installed one, or release `version` through npx; with the skills
     restored in `plugin_dir` and `note` appended to its system prompt."""
-    argv = ["npx", "-y", f"@anthropic-ai/claude-code@{version}"] if version else ["claude"]
+    argv = ["npx", "-y", f"@anthropic-ai/claude-code@{version}"] if version else [agent_executable("claude")]
     argv += ["--session-id", session_id]
     if model:
         argv += ["--model", model]
@@ -228,10 +228,18 @@ def original_permission_args(harness: str, permissions: dict) -> tuple[list[str]
     return args, approval != "never"
 
 
+def agent_executable(name: str) -> str:
+    """Find a user install even when the desktop session omits ~/.local/bin."""
+    if shutil.which(name):
+        return name
+    local = shutil.which(str(Path.home() / ".local/bin" / name))
+    return local or name
+
+
 def codex_argv(prompt: str, session_id: str, model: str = "", effort: str = "", version: str = "",
                background: bool = False, permission: str = "ask", note: str = "", original_permissions: dict | None = None) -> list[str]:
     import json
-    argv = ["npx", "-y", f"@openai/codex@{version}"] if version else ["codex"]
+    argv = ["npx", "-y", f"@openai/codex@{version}"] if version else [agent_executable("codex")]
     if background:
         argv += ["exec", "--json"]
     argv += original_permission_args("Codex", original_permissions)[0] if original_permissions is not None else [
