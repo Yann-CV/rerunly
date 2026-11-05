@@ -348,3 +348,48 @@ def test_judge_token_counts_include_separate_claude_cache():
     assert judge.usage_tokens({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 7}, cached_separate=True) == 42
     assert judge.usage_tokens({}, cached_separate=True) is None
     assert judge.usage_tokens(None, cached_separate=False) is None
+
+
+def test_codex_rerun_finds_user_install_outside_path(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    executable = tmp_path / ".local/bin/codex"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    for background in (False, True):
+        assert replay.codex_argv("prompt", "id", background=background)[0] == str(executable)
+    assert replay.codex_argv("prompt", "id", version="0.164.0")[0] == "npx"
+
+
+def test_codex_rerun_prefers_path_install(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    assert replay.codex_argv("prompt", "id")[0] == "codex"
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize("installation", ["local", "path", "missing", "not-executable"])
+def test_agent_rerun_executable_lookup(tmp_path, monkeypatch, agent, installation):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    path_bin = tmp_path / "bin"
+    path_bin.mkdir()
+    monkeypatch.setenv("PATH", str(path_bin))
+    local = tmp_path / ".local/bin" / agent
+    local.parent.mkdir(parents=True)
+    if installation != "missing":
+        local.write_text("#!/bin/sh\nexit 0\n")
+        local.chmod(0o644 if installation == "not-executable" else 0o755)
+    if installation == "path":
+        executable = path_bin / agent
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    build = replay.claude_argv if agent == "claude" else replay.codex_argv
+    argv = build("prompt", "id")
+    assert argv[0] == (str(local) if installation == "local" else agent)
+    assert build("prompt", "id", version="1.2.3")[:3] == [
+        "npx", "-y", ("@anthropic-ai/claude-code" if agent == "claude" else "@openai/codex") + "@1.2.3"]
