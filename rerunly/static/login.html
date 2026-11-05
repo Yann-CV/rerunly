@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Rerunly</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/login.js" defer></script>
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="login-brand"><img src="/static/icon.svg" width="40" height="40" alt="">Rerunly</div>
+    <p class="login-eyebrow">Your local dashboard</p>
+    <h1 id="login-title">Sign in</h1>
+    <p id="login-description" class="muted">Checking your local account…</p>
+    <form id="login-form" hidden>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <div id="confirm-field" hidden>
+        <label for="confirm-password">Confirm password</label>
+        <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password">
+      </div>
+      <p id="login-error" class="status-warn" role="alert" hidden></p>
+      <button class="btn primary" id="login-submit" type="submit">Sign in</button>
+    </form>
+    <section id="recovery-panel" hidden aria-labelledby="recovery-title">
+      <h2 id="recovery-title">Your private recovery code</h2>
+      <label for="recovery-code">Recovery code</label>
+      <textarea id="recovery-code" readonly rows="3" spellcheck="false" autocomplete="off"></textarea>
+      <button class="btn" id="copy-recovery" type="button">Copy recovery code</button>
+      <p class="muted">Keep it in a password manager or somewhere outside this machine. Anyone with this code can reset your password.</p>
+      <button class="btn primary" id="recovery-done" type="button">I've saved my code</button>
+    </section>
+    <p class="login-help muted" id="login-help">One account, stored on this machine. No email or online account.</p>
+    <noscript>Enable JavaScript to sign in.</noscript>
+  </main>
+</body>
+</html>
